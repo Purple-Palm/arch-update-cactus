@@ -1,0 +1,11 @@
+[Unit]
+Description=Arch Update by Cactus: look for a newer version every hour
+
+[Timer]
+OnStartupSec=2min
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

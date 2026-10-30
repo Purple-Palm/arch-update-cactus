@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """arch-update-auto: run arch-update in the plain terminal and answer its routine questions.
 
-The logic lives in ~/.local/lib/arch-update-auto/engine.py (shared with the
+The logic lives in lib/engine.py next to this program (shared with the
 full-screen arch-update-ui). Risky or unrecognised questions are handed back to
 you (bell + notification); Ctrl+] switches to manual mode. Closing the window
 never interrupts pacman. Every run is logged to
@@ -23,9 +23,14 @@ import sys
 import termios
 import tty
 
-sys.path.insert(0, os.path.expanduser("~/.local/lib/arch-update-auto"))
-import engine  # noqa: E402
-from engine import C_BOLD, C_DIM, C_GRN, C_RED, C_YEL, say  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
+try:
+    import engine  # noqa: E402
+    from engine import C_BOLD, C_DIM, C_GRN, C_RED, C_YEL, say  # noqa: E402
+except Exception as e:      # no python-pexpect, a damaged file…: run the plain upstream updater instead
+    print(f"arch-update-auto: не загрузился движок апдейтера: {e!r}")
+    print("Если не хватает pexpect: sudo pacman -S --needed python-pexpect\nЗапускаю обычный arch-update…\n")
+    os.execvp("arch-update", ["arch-update"])
 
 
 def print_summary(res):

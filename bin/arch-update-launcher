@@ -1,10 +1,72 @@
-#!/bin/bash
-# arch-update-launcher: opens the full-screen Arch Update UI (by Cactus) in its own Konsole.
-# The tray icon, the panel button and the notification's "Run" all come here via
-# ~/.local/share/applications/arch-update.desktop. Falls back to the plain updater.
-ui="$HOME/.local/bin/arch-update-ui"
-if [ -x "$ui" ]; then
-	exec konsole --separate --fullscreen --profile ArchUpdate --hide-menubar --hide-tabbar --hide-toolbars \
-		-p tabtitle="Arch Update" -e "$ui" "$@"
+#!/usr/bin/env bash
+# arch-update-launcher: opens the full-screen Arch Update UI (by Cactus) in its own terminal window.
+# The tray icon, its notification's "Run" and the menu entry all come here (share/arch-update.desktop.in).
+# First it installs a newer tested version of the updater if there is one (arch-update-cactus-sync).
+#
+#   arch-update-launcher [--demo]     start the UI (arguments are passed to arch-update-ui)
+#   arch-update-launcher --terminal   print the terminal that would be used (exit 1: none found)
+#
+# Terminal: $ARCH_UPDATE_TERMINAL if set, else Konsole (with our profile), else the first one
+# installed from TERMINALS. The UI paints its own colours, so any of them looks the same.
+BIN=$(dirname "$(realpath "$0")")
+TERMINALS=(konsole kitty alacritty foot wezterm ptyxis gnome-terminal kgx xfce4-terminal mate-terminal
+	lxterminal tilix terminator xterm)
+BG='#0b0e17' FG='#c9d1e3' TITLE='Arch Update'
+
+pick_terminal() {
+	local t
+	for t in ${ARCH_UPDATE_TERMINAL-} "${TERMINALS[@]}"; do
+		command -v "$t" >/dev/null && { echo "$t"; return 0; }
+	done
+	return 1
+}
+
+# Print the command line that runs "$@" full-screen in terminal $1, one word per line.
+terminal_cmd() {
+	local t=$1
+	shift
+	case $t in
+	konsole) printf '%s\n' konsole --separate --fullscreen --profile ArchUpdate --hide-menubar --hide-tabbar \
+		--hide-toolbars -p "tabtitle=$TITLE" -e "$@" ;;
+	kitty) printf '%s\n' kitty --class arch-update --title "$TITLE" --start-as fullscreen -o "background=$BG" \
+		-o "foreground=$FG" -o window_padding_width=20 -o font_size=13 "$@" ;;
+	alacritty) printf '%s\n' alacritty --class arch-update --title "$TITLE" -o 'window.startup_mode="Fullscreen"' \
+		-o "colors.primary.background=\"$BG\"" -o "colors.primary.foreground=\"$FG\"" \
+		-o 'window.padding={x=20,y=20}' -o font.size=13 -e "$@" ;;
+	foot) printf '%s\n' foot --fullscreen --title "$TITLE" --app-id arch-update -o "colors.background=${BG#\#}" \
+		-o "colors.foreground=${FG#\#}" -o pad=20x20 "$@" ;;
+	wezterm) printf '%s\n' wezterm start --class arch-update -- "$@" ;;
+	ptyxis) printf '%s\n' ptyxis --new-window --fullscreen -x "$*" ;;
+	gnome-terminal) printf '%s\n' gnome-terminal --full-screen --hide-menubar --title "$TITLE" -- "$@" ;;
+	kgx) printf '%s\n' kgx --title "$TITLE" -e "$@" ;;
+	xfce4-terminal) printf '%s\n' xfce4-terminal --fullscreen --hide-menubar --hide-toolbar --hide-scrollbar \
+		--title "$TITLE" -x "$@" ;;
+	mate-terminal) printf '%s\n' mate-terminal --full-screen --hide-menubar --title "$TITLE" -x "$@" ;;
+	xterm) printf '%s\n' xterm -fullscreen -bg "$BG" -fg "$FG" -fa Hack -fs 13 -T "$TITLE" -e "$@" ;;
+	*) printf '%s\n' "$t" -e "$@" ;;
+	esac
+}
+
+if [[ ${1-} == --terminal ]]; then
+	pick_terminal
+	exit
 fi
-exec konsole --hide-menubar -e "$HOME/.local/bin/arch-update-auto"
+
+# A newer tested version? Install it, then start that version of this launcher.
+if [[ -z ${ARCH_UPDATE_SYNCED-} ]]; then
+	"$BIN/arch-update-cactus-sync" --quick
+	if [[ $? -eq 10 ]]; then
+		export ARCH_UPDATE_SYNCED=1
+		exec "$BIN/arch-update-launcher" "$@"
+	fi
+fi
+
+term=$(pick_terminal) || {
+	notify-send -a Arch-Update "Arch Update" "Не найден терминал. Переустанови: ~/.local/share/arch-update-cactus/install.sh" \
+		2>/dev/null
+	exit 1
+}
+prog=$BIN/arch-update-ui
+[[ -x $prog ]] || prog=$BIN/arch-update-auto
+mapfile -t cmd < <(terminal_cmd "$term" "$prog" "$@")
+exec "${cmd[@]}"

@@ -4,6 +4,8 @@ Runs the real arch-update in a pty and answers its routine questions (RULES).
 Risky or unknown questions are handed to the user through the active View.
 Everything is logged per run; after the run the system is checked (/boot,
 initramfs, DKMS, Secure Boot signature) and a structured result is returned.
+The checks find out what this machine has (kernels, mkinitcpio presets, DKMS,
+sbctl) and skip what it does not have: the same code runs on every machine.
 """
 import datetime
 import glob
@@ -11,6 +13,7 @@ import json
 import os
 import re
 import select
+import shlex
 import shutil
 import signal
 import subprocess
@@ -46,9 +49,10 @@ RULES = [
     ("pacman предлагает пропустить пакеты", r"skip the above packages? for this upgrade\? \[[YyNn]/[YyNn]\]$", HANDOVER, None),
     ("скачанный пакет повреждён", r"Do you want to delete it\? \[Y/n\]$", HANDOVER, None),
     ("pacman хочет удалить пакеты", r"Do you want to remove these packages\? \[Y/n\]$", HANDOVER, None),
-    ("запрос пароля", r"(?:\[sudo\] password for \S+|[Pp]assword|[Pp]assphrase[^:]*):$", HANDOVER, None),
+    ("запрос пароля", r"(?:\[sudo\] password for \S+|[Pp]assword[^:\n]*|[Pp]assphrase[^:\n]*):$", HANDOVER, None),
     # pacman: routine
     ("pacman proceed", r"Proceed with (?:installation|download)\? \[Y/n\]$", YES, None),
+    ("flatpak proceed", r"Proceed with these changes to the [^?]+\? \[Y/n\]$", YES, None),
     ("replace package", r"Replace \S+ with \S+\? \[Y/n\]$", YES, None),
     ("import PGP key", r"Import(?: PGP key .*)?\? \[Y/n\]$", YES, None),
     ("choose provider", r"Enter a number \(default=\d+\):?$", ENTER, None),
@@ -56,8 +60,13 @@ RULES = [
     # yay
     ("yay proceed", r"Proceed with install\? \[Y/n\]$", YES, None),
     ("yay remove make deps", r"Remove make dependencies after install\? \[y/N\]$", YES, None),
+    # paru: no review, the same trust in AUR updates as yay's "Diffs to show?" -> default
+    ("paru review", r"Proceed to review\? \[Y/n\]$", YES, None),
+    ("paru accept changes", r"Accept changes\? \[Y/n\]$", YES, None),
 ]
-RULES = [(label, re.compile(rx), action, note) for label, rx, action, note in RULES]
+# paru and flatpak end their questions with ':' ("[Y/n]: "), pacman and yay don't
+RULES = [(label, re.compile(rx[:-1] + ":?$" if rx.endswith(r"\]$") else rx), action, note)
+         for label, rx, action, note in RULES]
 
 QUIT_PROMPT = re.compile(r'Press "enter" to quit$')
 # yay menus print the question above and wait on a bare "==>" line.
@@ -65,23 +74,30 @@ YAY_MENU = re.compile(r"Packages to cleanBuild\?|Diffs to show\?|PKGBUILDs to ed
                       r"|Enter a number \(default=\d+\)")
 # Something that looks like a question nobody taught us about.
 UNKNOWN_PROMPT = re.compile(
-    r"(?:\[[YyNn]/[YyNn]\]|\?|==>|\((?:[YyNn]|yes|no)(?:/[^)]*)?\))$"
+    r"(?:\[[^\]\n]*[/-][^\]\n]*\]|\?|==>|\((?:[YyNn]|yes|no)(?:/[^)]*)?\)):?$"
     r"|(?i:(?:enter|select|choose|password|passphrase|user ?name|login|answer|input)[^\n]*:)$"
 )
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>78]")
 FAILURE_MARKERS = re.compile(r"Initcpio image generation FAILED|error: command failed to execute correctly"
-                             r"|An error has occurred during the update process", re.I)
+                             r"|An error has occurred during the update process"
+                             r"|invalid or corrupted package \(PGP signature\)|is unknown trust|is marginal trust", re.I)
+KEYRING_TROUBLE = re.compile(r"PGP signature|unknown trust|marginal trust", re.I)
 
 SETTLE = 0.3        # seconds of silence before we treat the current line as a question
 UNKNOWN_IDLE = 12   # seconds of silence on a question-looking line before handing over
+STALL_IDLE = 120    # seconds of silence on any prompt-ish line (ends in : ? ] >) before handing over anyway
 KEEP_LOGS = 30
 PACMAN_LOCK = "/var/lib/pacman/db.lck"
+MODULES_DIR = "/usr/lib/modules"          # one directory per installed kernel, with a "pkgbase" file
+PRESET_DIR = "/etc/mkinitcpio.d"
 STATE_DIR = os.path.expanduser("~/.local/state/arch-update-auto")
 REBOOT_PKGS = re.compile(
     r"^(linux(?:-lts|-zen|-hardened)?|linux-firmware.*|nvidia.*|lib32-nvidia-utils|opencl-nvidia|"
-    r"amd-ucode|intel-ucode|systemd|glibc|mesa|lib32-mesa|plasma-workspace|kwin|qt6-base|wayland)$"
+    r"amd-ucode|intel-ucode|systemd|glibc|mesa|lib32-mesa|plasma-workspace|kwin|qt6-base|wayland|"
+    r"gnome-shell|mutter|gdm|xorg-server|xfwm4|xfce4-session|sway|hyprland|wlroots\S*|sof-firmware|alsa-ucm-conf)$"
 )
-KERNEL_GPU_PKGS = re.compile(r"^(linux(?:-lts|-zen|-hardened)?|nvidia\S*|lib32-nvidia\S*)$")
+PKG_ARCH = r"(?:x86_64(?:_v[234])?|aarch64|armv7h|i686|pentium4|riscv64|any)"   # end of a package file name
+NVIDIA_PKGS = re.compile(r"^(?:lib32-)?nvidia\S*$")
 C_DIM, C_YEL, C_GRN, C_RED, C_BOLD, C_OFF = "\033[2m", "\033[33m", "\033[32m", "\033[31m", "\033[1m", "\033[0m"
 
 TERM_OK = True    # the terminal window is still there
@@ -115,6 +131,54 @@ def pacman_busy():
     return os.path.exists(PACMAN_LOCK) and bool(run(["pgrep", "-x", "pacman"]).strip())
 
 
+def kernel_packages():
+    """{package: kernel version} of the installed kernels (linux, linux-lts, linux-aarch64 …)."""
+    kernels = {}
+    for f in glob.glob(os.path.join(MODULES_DIR, "*", "pkgbase")):
+        try:
+            with open(f) as fh:
+                kernels[fh.read().strip()] = os.path.basename(os.path.dirname(f))
+        except OSError:
+            pass
+    return kernels
+
+
+def preset_files(pkg):
+    """Boot files mkinitcpio makes for kernel package `pkg` from its preset:
+    [("kernel" | "image" | "uki", path)]. Empty when the machine boots some other way
+    (booster, dracut, depthcharge kernel partitions): then there is nothing we can check."""
+    preset = os.path.join(PRESET_DIR, f"{pkg}.preset")
+    if not os.path.exists(preset):
+        return []
+    out = run(["bash", "-c", 'source "$1" >/dev/null 2>&1 || exit; for p in "${PRESETS[@]}"; do '
+                             'k=${p}_kver i=${p}_image u=${p}_uki; echo "kernel ${!k:-$ALL_kver}"; '
+                             'echo "image ${!i}"; echo "uki ${!u}"; done', "preset", preset], timeout=10)
+    files = []
+    for line in out.splitlines():
+        kind, _, path = line.partition(" ")
+        if path.startswith("/") and (kind, path) not in files:
+            files.append((kind, path))
+    return files
+
+
+def dkms_built():
+    """{module: {kernel versions it is installed for}} from `dkms status` (empty without DKMS)."""
+    built = {}
+    for line in run(["dkms", "status"]).splitlines():
+        left, _, state = line.rpartition(":")
+        parts = [p.strip() for p in left.split(",")]
+        if len(parts) < 3:
+            continue
+        if "/" in parts[0]:                     # "nvidia/615.78, 7.2.11-arch1-1, x86_64: installed"
+            module, kver = parts[0].split("/")[0], parts[1]
+        else:                                   # older dkms: "nvidia, 615.78, 7.2.11-arch1-1, x86_64: installed"
+            module, kver = parts[0], parts[2] if len(parts) > 3 else parts[1]
+        mods = built.setdefault(module, set())
+        if state.strip().startswith("installed"):
+            mods.add(kver)
+    return built
+
+
 def installed_versions():
     return dict(line.split(" ", 1) for line in run(["pacman", "-Q"]).splitlines() if " " in line)
 
@@ -128,8 +192,88 @@ def strip_ansi(text):
 
 
 def child_env():
-    # English prompts for RULES; GIT_TERMINAL_PROMPT=0: a vanished AUR git source fails instead of asking
-    return dict(os.environ, LANGUAGE="en", LC_MESSAGES="C.UTF-8", GIT_TERMINAL_PROMPT="0")
+    # English prompts for RULES, "10.38 MiB" (not "10,38") for the progress parser whatever the
+    # machine's locale (LC_ALL would override both, so it becomes LANG); GIT_TERMINAL_PROMPT=0: a
+    # vanished AUR git source fails instead of asking; PARU_PAGER: paru prints instead of opening less
+    env = dict(os.environ, LANGUAGE="en", LC_MESSAGES="C.UTF-8", LC_NUMERIC="C.UTF-8", GIT_TERMINAL_PROMPT="0",
+               PARU_PAGER="cat")
+    lc_all = env.pop("LC_ALL", None)
+    if lc_all:
+        env.setdefault("LANG", lc_all)
+    return env
+
+
+def elevation_command():
+    """What arch-update elevates with (its PrivilegeElevationCommand, sudo by default)."""
+    conf = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                        "arch-update", "arch-update.conf")
+    try:
+        with open(conf) as f:
+            for line in f:
+                m = re.match(r"\s*PrivilegeElevationCommand\s*=\s*(\S+)", line)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    return "sudo"
+
+
+def sudo_asks_password():
+    try:
+        return subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=10).returncode != 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def battery():
+    """(percent, discharging) of a laptop battery, None on a desktop."""
+    for d in glob.glob("/sys/class/power_supply/*"):
+        try:
+            with open(os.path.join(d, "type")) as f:
+                if f.read().strip() != "Battery":
+                    continue
+            with open(os.path.join(d, "capacity")) as f:
+                cap = int(f.read().strip())
+            with open(os.path.join(d, "status")) as f:
+                return cap, f.read().strip() == "Discharging"
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def can_inhibit():
+    try:
+        return subprocess.run(["systemd-inhibit", "--what=sleep:shutdown:idle", "--mode=block", "true"],
+                              capture_output=True, timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def secure_boot_on():
+    try:
+        with open("/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c", "rb") as f:
+            return f.read()[-1:] == b"\x01"
+    except OSError:
+        return False
+
+
+def unmounted_boot():
+    """Boot partitions from fstab (/boot, /efi, /boot/efi) that are not mounted: pacman would
+    write the new kernel into an empty directory and the machine would boot the old one."""
+    missing = []
+    for target in run(["findmnt", "--fstab", "-n", "-o", "TARGET"]).split():
+        if target in ("/boot", "/efi", "/boot/efi"):
+            try:
+                os.listdir(target)          # wakes up an automount
+            except OSError:
+                pass
+            if not os.path.ismount(target):
+                missing.append(target)
+    return missing
+
+
+def failed_units():
+    return [l.split()[0] for l in run(["systemctl", "--failed", "--plain", "--no-legend"]).splitlines() if l.strip()]
 
 
 def check_updates(timeout=90):
@@ -152,7 +296,8 @@ def check_updates(timeout=90):
         m = re.match(r"^\s*(\S+)\s+(\S+)\s+->\s+(\S+)", line)
         if m:
             section.append(m.groups())
-    failed = rc == 124 or bool(re.search(r"Cannot fetch updates|Unable to retrieve|timed out", text))
+    # arch-update -l exits 0 with updates and 7 without; anything else (127: not installed) is a failure
+    failed = rc not in (0, 7) or bool(re.search(r"Cannot fetch updates|Unable to retrieve|timed out", text))
     return repo, aur, failed
 
 
@@ -377,7 +522,7 @@ class Progress:
         if m:
             self.aur_total += int(m.group(1))
             return None
-        m = re.match(r"^(\S+)-[^-\s]+-[^-\s]+-(?:x86_64|any)$", s)
+        m = re.match(rf"^(\S+)-[^-\s]+-[^-\s]+-{PKG_ARCH}$", s)
         if m and self.stage == "download":       # pacman 7 prints one such line when a file starts
             name = m.group(1)
             if name not in self.seen_dl:
@@ -398,7 +543,7 @@ class Progress:
             if name in self.seen_dl or name == "Total":
                 return None
             self.seen_dl.add(name)
-            return "скачан " + re.sub(r"-[^-]+-[^-]+-(x86_64|any)$", "", name)
+            return "скачан " + re.sub(rf"-[^-]+-[^-]+-{PKG_ARCH}$", "", name)
         if s.startswith(":: Running pre-transaction hooks"):
             return "подготовка"
         if s.startswith(":: Processing package changes"):
@@ -457,6 +602,8 @@ class Progress:
         if s.startswith("==> ") or s.startswith(":: "):
             return s[4:] if s.startswith("==> ") else s[3:]
         if re.match(r"^(error|warning):", s):
+            return s
+        if re.match(r"^(?:sudo|doas|su): |^Sorry, try again|.*account is locked|.*left to unlock", s):
             return s
         return None
 
@@ -639,6 +786,7 @@ class Responder:
         self.forced = False       # Ctrl+] pressed: Ctrl+C reaches the program even mid-transaction
         self.safe_only = False    # window closed during a manual run: never confirm anything for the user
         self.handover_why = ""
+        self.secret = False       # the question handed over asks for a password: never show or log the answer
 
     def feed(self, data):
         text = data.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
@@ -685,6 +833,14 @@ class Responder:
             return ("yay menu (default)", ENTER, None)
         for label, rx, action, note in RULES:
             if rx.search(line):
+                recent = "\n".join(last_lines(self.tail, 4))
+                if label == "запрос пароля":
+                    if re.search(r"account is locked|left to unlock", recent):
+                        label = "после неверных паролей вход заблокирован на несколько минут — подожди или Ctrl+C"
+                    elif "Sorry, try again" in recent:
+                        label = "пароль не подошёл — попробуй ещё раз (раскладка?)"
+                elif label == "скачанный пакет повреждён" and KEYRING_TROUBLE.search(recent):
+                    label = "подпись пакета не проверилась — похоже, устарел keyring"
                 if action == NEWS:
                     if self.saw_new_news and self.stop_on_news:
                         self.reading_news = True
@@ -739,6 +895,7 @@ class Responder:
         self.user_typed, self.typed = False, b""
         self.handover_line = self.current_line()
         self.handover_why = why
+        self.secret = bool(re.search(r"(?i)pass(?:word|phrase)|пароль|\bPIN\b", self.handover_line))
         LOG.event("ТЕБЕ", f"{why}: «{self.handover_line}»")
         VIEW.handover(why, self.handover_line)
         notify("Arch-Update ждёт твоего ответа", f"{why}\n{self.handover_line}", urgent=True)
@@ -765,8 +922,7 @@ class Responder:
                 self.typed += data
                 self.child.send(data)
             if self.mode == "handover" and (b"\r" in data or b"\n" in data):
-                shown = "•••" if self.handover_why == "запрос пароля" else \
-                    self.typed.decode("utf-8", "replace").strip()
+                shown = "•••" if self.secret else self.typed.decode("utf-8", "replace").strip()
                 LOG.event("ТЫ", f"ответил: «{shown}»")
                 self.mode = "auto"
                 self.tail = ""
@@ -793,7 +949,7 @@ def detached_answer(line):
 
 # ───────────────────────────── checks ─────────────────────────────
 
-def system_checks(before, exitstatus, responder, pacman_log_offset):
+def system_checks(before, exitstatus, responder, pacman_log_offset, failed_before=()):
     """Post-update checks. Returns a dict; also logs, appends pacman.log excerpt and notifies."""
     after = installed_versions()
     changed = sorted(p for p, v in after.items() if before.get(p) not in (None, v))
@@ -813,56 +969,79 @@ def system_checks(before, exitstatus, responder, pacman_log_offset):
         ok.append("pacman завершился штатно")
     for f in sorted(responder.failures):
         (warnings if "update process" in f else problems).append(f"в выводе: «{f}»")
+    if any(KEYRING_TROUBLE.search(f) for f in responder.failures):
+        keyring = "archlinuxarm-keyring" if before.get("archlinuxarm-keyring") else "archlinux-keyring"
+        problems.append(f"похоже, устарел keyring: sudo pacman -Sy {keyring} && sudo pacman -Su, потом обнови снова")
+    for t in unmounted_boot():
+        problems.append(f"{t} не смонтирован — ядро могло записаться не туда, НЕ перезагружайся")
 
-    kernel_files = [l.split()[-1] for l in run(["pacman", "-Ql", "linux"]).splitlines()
-                    if re.search(r"/usr/lib/modules/[^/]+/vmlinuz$", l)]
-    kver = kernel_files[0].split("/")[4] if kernel_files else None
-    boot_ok = True
-    for f in ("/boot/vmlinuz-linux", "/boot/initramfs-linux.img"):
-        if not os.path.exists(f):
-            boot_ok = False
-            problems.append(f"нет {f} — НЕ перезагружайся, система не загрузится")
-    img = "/boot/initramfs-linux.img"
-    if os.path.exists(img):
-        try:
-            r = subprocess.run(["lsinitcpio", img], capture_output=True, text=True, timeout=120)
-            img_ok = r.returncode == 0 and (not kver or f"usr/lib/modules/{kver}/" in r.stdout)
-        except (OSError, subprocess.SubprocessError):
-            img_ok = False
-        if not img_ok:
-            boot_ok = False
-            problems.append(f"{img} пустой, обрезан или собран не под ядро {kver} — НЕ перезагружайся "
-                            "(сначала: sudo mkinitcpio -P)")
-    if boot_ok:
-        ok.append("ядро и initramfs на месте")
-    if kver:
-        dkms = run(["dkms", "status"])
-        if "nvidia" in dkms and not re.search(rf"nvidia/\S+, {re.escape(kver)}, \S+: installed", dkms):
-            problems.append(f"драйвер NVIDIA не собран под ядро {kver} — НЕ перезагружайся")
-        elif "nvidia" in dkms:
-            ok.append("драйвер NVIDIA собран под ядро")
-        if os.uname().release != kver:
-            warnings.append(f"установлено новое ядро {kver} (сейчас работает {os.uname().release})")
-    sb = run(["sudo", "-n", "sbctl", "verify"])
-    if sb and "/boot/vmlinuz-linux is signed" not in sb:
-        problems.append("ядро /boot/vmlinuz-linux не подписано для Secure Boot — НЕ перезагружайся")
-    elif sb:
+    kernels = kernel_packages()
+    boot_files, checked = [], 0
+    for pkg, kver in sorted(kernels.items()):
+        files = preset_files(pkg)
+        if not files:
+            LOG.event("ЗАГРУЗКА", f"{pkg}: нет пресета mkinitcpio — файлы загрузки не проверяю")
+            continue
+        checked += 1
+        for kind, f in files:
+            boot_files.append(f)
+            try:
+                size = os.stat(f).st_size
+            except OSError:
+                problems.append(f"нет {f} — НЕ перезагружайся, система не загрузится")
+                continue
+            if size == 0:
+                problems.append(f"{f} пустой — НЕ перезагружайся (сначала: sudo mkinitcpio -P)")
+            elif kind == "image" and os.access(f, os.R_OK):      # root-only images can't be looked into
+                try:
+                    r = subprocess.run(["lsinitcpio", f], capture_output=True, text=True, timeout=120)
+                    img_ok = r.returncode == 0 and f"usr/lib/modules/{kver}/" in r.stdout
+                except (OSError, subprocess.SubprocessError):
+                    img_ok = False
+                if not img_ok:
+                    problems.append(f"{f} обрезан или собран не под ядро {kver} — НЕ перезагружайся "
+                                    "(сначала: sudo mkinitcpio -P)")
+    if checked and not any("НЕ перезагружайся" in p for p in problems):
+        ok.append("ядро и initramfs на месте" if len(kernels) == 1 else f"ядра и initramfs на месте ({checked})")
+    built = dkms_built()
+    for module, kvers in sorted(built.items()):
+        if not kvers:
+            continue                            # added to DKMS but never built anywhere: not ours to judge
+        missing = [k for k in kernels.values() if k not in kvers]
+        name = "драйвер NVIDIA" if module == "nvidia" else f"модуль DKMS {module}"
+        if missing:
+            problems.append(f"{name} не собран под ядро {', '.join(missing)} — НЕ перезагружайся")
+        else:
+            ok.append(f"{name} собран под ядро")
+    if kernels and not os.path.isdir(os.path.join(MODULES_DIR, os.uname().release)):
+        warnings.append(f"ядро обновилось (сейчас работает {os.uname().release}) — перезагрузись, когда будет удобно")
+    # -n: never asks for a password; no sbctl or Secure Boot off → nothing to check
+    sb = run(["sudo", "-n", "sbctl", "verify"]) if secure_boot_on() else ""
+    unsigned = [f for f in boot_files if f"{f} is not signed" in sb]
+    if unsigned:
+        problems.append(f"{', '.join(unsigned)} не подписан(ы) для Secure Boot — НЕ перезагружайся")
+    elif any(f"{f} is signed" in sb for f in boot_files):
         ok.append("подпись Secure Boot в порядке")
 
-    reboot = [p for p in changed + added if REBOOT_PKGS.match(p)]
-    if reboot or "reboot" in responder.notes:
+    reboot = [p for p in changed + added if REBOOT_PKGS.match(p) or p in kernels]
+    if reboot:
         warnings.append("перезагрузись, когда будет удобно (обновились: " + ", ".join(reboot[:8]) + ")")
+    elif "reboot" in responder.notes:       # arch-update's own guess; the kernel check above is ours
+        LOG.event("ЯДРО", "arch-update предлагал перезагрузку — ядро не менялось, пропускаю")
     if "pacnew" in responder.notes or run(["pacdiff", "-o"]).strip():
         warnings.append("есть .pacnew файлы — разберём вместе (pacdiff -o покажет список)")
     if "orphans" in responder.notes:
         warnings.append("есть пакеты-сироты — не удалял, посмотреть: pacman -Qdtq")
     if "services" in responder.notes:
         warnings.append("arch-update предлагал перезапустить сервисы — пропущено, перезагрузка это решит")
-    failed = [l for l in run(["systemctl", "--failed", "--plain", "--no-legend"]).splitlines() if l.strip()]
-    if failed:
-        warnings.append("упавшие сервисы: " + ", ".join(l.split()[0] for l in failed))
+    failed = failed_units()
+    new_failed = [u for u in failed if u not in failed_before]
+    if new_failed:
+        warnings.append("упавшие сервисы: " + ", ".join(new_failed))
     else:
-        ok.append("упавших сервисов нет")
+        ok.append("упавших сервисов нет" if not failed else "новых упавших сервисов нет")
+    if failed_before:
+        LOG.event("СЕРВИСЫ", "не работали ещё до обновления: " + ", ".join(failed_before))
 
     if LOG.broken:
         warnings.append("журнал обновления неполный: не удалось писать на диск (место в /home?)")
@@ -1022,15 +1201,22 @@ def pump(child, responder, auto):
             pending = False
             responder.answer(*decision)
         elif idle >= UNKNOWN_IDLE:
-            pending = False
             line = responder.current_line()
             if responder.waiting() and UNKNOWN_PROMPT.search(line):
+                pending = False
                 responder.answer("незнакомый вопрос", HANDOVER, None)
+            elif not responder.waiting() or not re.search(r"[:?\]>]\s*$", line):
+                pending = False                 # output just paused (a build step, a progress line)
+            elif idle >= STALL_IDLE and not pacman_busy():
+                pending = False
+                responder.answer("программа, похоже, ждёт ввода", HANDOVER, None)
 
 
-def run_update(view, manual=False, stop_on_news=True, cmd=None, summary=True, dims=None, on_spawn=None):
+def run_update(view, manual=False, stop_on_news=True, cmd=None, summary=True, dims=None, on_spawn=None,
+               demo=False):
     """Run arch-update with the given view. Caller sets up the terminal (raw mode etc.).
     on_spawn(child) is called right after the child starts (e.g. to forward window resizes).
+    demo=True: cmd is a simulation; nothing about the real system is prepared or guarded.
     Returns (exitstatus, result-dict-or-None, responder)."""
     global LOG, VIEW, RUNNING
     VIEW = view
@@ -1046,11 +1232,32 @@ def run_update(view, manual=False, stop_on_news=True, cmd=None, summary=True, di
     except OSError:
         pacman_log_offset = 0
     before = installed_versions()
+    failed_before = failed_units()
     if terminal_hung_up(view):      # closed while we were preparing (pacman -Q can take a moment)
         LOG.event("ОКНО", "окно закрыто до запуска — обновление не начинаю")
         return None, None, None
+    argv = shlex.split(cmd)
+    if not demo:
+        missing = unmounted_boot()
+        if missing:
+            why = f"{', '.join(missing)} не смонтирован — обновление не начинаю (ядро записалось бы не туда)"
+            LOG.event("ПРОБЛЕМА", why)
+            notify("Обновление не начато", why, urgent=True)
+            return None, {"changed": [], "added": [], "removed": [], "problems": [why], "warnings": [], "ok": [],
+                          "verdict": 2, "log": LOG.path, "exitstatus": None}, None
+        if elevation_command() == "sudo" and sudo_asks_password():
+            # The password once, at the start, while the user is watching: sudo forgets it after
+            # 5 minutes, and a long run asks again for the AUR step, the cache cleanup… The loop
+            # keeps this terminal's ticket fresh and dies with the run (same session, SIGHUP).
+            LOG.event("SUDO", "sudo спрашивает пароль: спрошу один раз в начале")
+            argv = ["sh", "-c", 'sudo -v || exit 1; (while sleep 50; do sudo -n -v || exit; done) '
+                                '</dev/null >/dev/null 2>&1 & exec "$@"', "sh"] + argv
+        if battery() and can_inhibit():
+            # a laptop must not fall asleep or power off in the middle of a pacman transaction
+            argv = ["systemd-inhibit", "--what=sleep:shutdown:idle", "--mode=block", "--who=Arch-Update",
+                    "--why=обновление системы"] + argv
     cols, rows = dims or shutil.get_terminal_size((120, 40))
-    child = pexpect.spawn(cmd, env=child_env(), dimensions=(rows, cols), echo=True)
+    child = pexpect.spawn(argv[0], argv[1:], env=child_env(), dimensions=(rows, cols), echo=True)
     RUNNING = True
     if on_spawn:
         on_spawn(child)
@@ -1086,5 +1293,5 @@ def run_update(view, manual=False, stop_on_news=True, cmd=None, summary=True, di
     RUNNING = False
     status = child.exitstatus if child.exitstatus is not None else child.signalstatus
     LOG.event("КОНЕЦ", f"arch-update завершился, код {status}")
-    result = system_checks(before, status, responder, pacman_log_offset) if summary else None
+    result = system_checks(before, status, responder, pacman_log_offset, failed_before) if summary else None
     return status, result, responder

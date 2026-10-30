@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Arch-Update
+Comment=Обновить систему: окно с новостями и выбором автоответов
+Comment[ru]=Обновить систему: окно с новостями и выбором автоответов
+Icon=arch-update-blue
+Type=Application
+Terminal=false
+Exec="@LAUNCHER@"
+Categories=Utility

@@ -1,6 +1,7 @@
 #!/bin/bash
 # Simulated arch-update run for `arch-update-ui --demo`. Prints what arch-update,
 # pacman and yay print (same prompts, progress redraws, timing). Changes nothing.
+export LC_NUMERIC=C        # "4.6 MiB" in any locale, as pacman prints it for the engine
 b="\e[1m"; g="\e[1;32m"; bl="\e[1;34m"; o="\e[0m"
 ask() { read -rp $"$(echo -e "${bl}->${o}${b} $1${o} ")" _; }
 main() { echo -e "${g}==>${o}${b} $1${o}"; }

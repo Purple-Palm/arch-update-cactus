@@ -1,0 +1,50 @@
+# Every push and pull request is tested in a clean Arch Linux container. A push to main that
+# passes is fast-forwarded to "stable" — the branch every installed machine pulls from — so
+# an untested or broken version never reaches the machines.
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed git python python-pexpect python-pyte shellcheck
+      - uses: actions/checkout@v4
+      - name: Lint shell scripts
+        run: shellcheck install.sh bin/arch-update-launcher bin/arch-update-cactus-sync
+      - name: Self-test
+        run: ./install.sh --check
+      - name: Engine tests and headless runs at laptop and desktop terminal sizes
+        run: |
+          useradd -m tester
+          chown -R tester: .
+          su tester -c 'python3 tests/test_engine.py && python3 tests/run.py'
+
+  promote:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fast-forward stable to the tested commit
+        run: |
+          if git fetch -q origin stable && ! git merge-base --is-ancestor FETCH_HEAD "$GITHUB_SHA"; then
+            echo "stable is already past this commit; nothing to do"
+            exit 0
+          fi
+          git push origin "$GITHUB_SHA:refs/heads/stable"

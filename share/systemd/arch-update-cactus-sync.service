@@ -1,0 +1,7 @@
+[Unit]
+Description=Arch Update by Cactus: install the newest tested version
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/arch-update-cactus-sync
+Nice=10
