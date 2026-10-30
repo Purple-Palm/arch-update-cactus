@@ -11,6 +11,9 @@ machine installed from the former "stable" branch follows the tag.
   python3 tests/test_sync.py
 Promote runs CI's promote step, cut out of .github/workflows/test.yml, against the same kind of
 stand-in: it creates the tag, only ever moves it forward, and never overwrites a tag it cannot read.
+Install does a first install on a clean HOME the way the README does (install.sh piped into bash,
+cloning the tag from the stand-in), with stubs for pacman, sudo, arch-update and the rest; it is
+skipped as root, which install.sh refuses.
 Needs git; the UI self-test inside needs python-pexpect.
 """
 import os
@@ -25,6 +28,23 @@ GIT_ID = ["-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "in
 
 def git(cwd, *args):
     return subprocess.run(["git", *GIT_ID, *args], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+
+def stand_in_for_github(tmp):
+    """A bare repository with this working tree as main and the tag stable on it (CI passed).
+    Returns (a checkout to push new versions from, the bare repository)."""
+    src, remote = os.path.join(tmp, "src"), os.path.join(tmp, "remote.git")
+    for f in git(ROOT, "ls-files", "-co", "--exclude-standard").splitlines():
+        if os.path.isfile(os.path.join(ROOT, f)):
+            os.makedirs(os.path.dirname(os.path.join(src, f)) or src, exist_ok=True)
+            shutil.copy2(os.path.join(ROOT, f), os.path.join(src, f))
+    git(src, "init", "-q")
+    git(src, "add", "-A")
+    git(src, "commit", "-qm", "v1")
+    git(tmp, "clone", "-q", "--bare", src, remote)
+    git(src, "remote", "add", "origin", remote)
+    git(src, "push", "-q", "origin", "HEAD:refs/tags/stable")
+    return src, remote
 
 
 def promote_step():
@@ -45,8 +65,6 @@ class Sync(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="arch-update-sync-test-")
         self.home = os.path.join(self.tmp, "home")
-        self.remote = os.path.join(self.tmp, "remote.git")
-        self.src = os.path.join(self.tmp, "src")
         self.dest = os.path.join(self.home, ".local/share/arch-update-cactus")
         self.state = os.path.join(self.home, ".local/state/arch-update-auto")
         # no user systemd and no desktop: install.sh skips the timer, nothing reaches the real session
@@ -54,17 +72,7 @@ class Sync(unittest.TestCase):
                     "GIT_CONFIG_NOSYSTEM": "1"}
         os.makedirs(self.home)
         # version 1 = this working tree as it is now
-        files = git(ROOT, "ls-files", "-co", "--exclude-standard").splitlines()
-        for f in files:
-            if os.path.isfile(os.path.join(ROOT, f)):
-                os.makedirs(os.path.dirname(os.path.join(self.src, f)) or self.src, exist_ok=True)
-                shutil.copy2(os.path.join(ROOT, f), os.path.join(self.src, f))
-        git(self.src, "init", "-q")
-        git(self.src, "add", "-A")
-        git(self.src, "commit", "-qm", "v1")
-        git(self.tmp, "clone", "-q", "--bare", self.src, self.remote)
-        git(self.src, "remote", "add", "origin", self.remote)
-        git(self.src, "push", "-q", "origin", "HEAD:refs/tags/stable")       # CI passed v1
+        self.src, self.remote = stand_in_for_github(self.tmp)
         # installed the way install.sh does it: a clone of the tag, its files linked, marked as checked
         git(self.tmp, "-c", "advice.detachedHead=false", "clone", "-q", "--branch", "stable",
             self.remote, self.dest)
@@ -271,6 +279,94 @@ class Promote(unittest.TestCase):
         status, out = self.promote(self.commits[0], readable=False)
         self.assertEqual(status, 1, out)
         self.assertEqual(self.tag(), self.commits[2])
+
+
+# An Arch machine where everything install.sh would install is already there; nothing is started.
+STUBS = {
+    "pacman": "exit 0", "sudo": "exit 0", "yay": "exit 0", "kitty": "exit 0", "setsid": "exit 0",
+    "fc-list": "echo 'Noto Sans'",
+    "systemctl": "exit 1",                  # no user systemd: no timers, nothing reaches a real session
+    "pgrep": "exit 1",
+    # like the real one: its files under XDG_CONFIG_HOME, and it refuses to overwrite either of them
+    "arch-update": 'config=${XDG_CONFIG_HOME:-$HOME/.config}\n'
+                   'echo "$*" >>"$HOME/arch-update.calls"\n'
+                   'case "$*" in\n'
+                   '--gen-config)\n'
+                   '\t[[ -f $config/arch-update/arch-update.conf ]] && { echo "ERROR: config already exists" >&2; exit 8; }\n'
+                   '\tmkdir -p "$config/arch-update"\n'
+                   '\tprintf "#KeepOldPackages=3\\n#AURHelper=paru\\n" >"$config/arch-update/arch-update.conf" ;;\n'
+                   '"--tray --enable")\n'
+                   '\t[[ -f $config/autostart/arch-update-tray.desktop ]] && { echo "ERROR: autostart already exists" >&2; exit 10; }\n'
+                   '\tmkdir -p "$config/autostart" && : >"$config/autostart/arch-update-tray.desktop" ;;\n'
+                   'esac',
+}
+
+
+class Install(unittest.TestCase):
+    def setUp(self):
+        if os.geteuid() == 0:
+            self.skipTest("install.sh refuses to run as root")
+        self.tmp = tempfile.mkdtemp(prefix="arch-update-install-test-")
+        self.home = os.path.join(self.tmp, "home")
+        os.makedirs(self.home)
+        _, remote = stand_in_for_github(self.tmp)
+        self.tag = git(remote, "rev-parse", "refs/tags/stable")
+        stubs = os.path.join(self.tmp, "stubs")
+        os.makedirs(stubs)
+        for name, body in STUBS.items():
+            with open(os.path.join(stubs, name), "w") as f:
+                f.write("#!/bin/bash\n" + body + "\n")
+            os.chmod(os.path.join(stubs, name), 0o755)
+        gitconfig = os.path.join(self.tmp, "gitconfig")          # GitHub is the stand-in
+        with open(gitconfig, "w") as f:
+            f.write(f'[url "{remote}"]\n\tinsteadOf = https://github.com/Purple-Palm/arch-update-cactus.git\n')
+        # only the stand-in: a URL it does not cover fails instead of reaching the real GitHub
+        self.env = {"HOME": self.home, "USER": "tester", "PATH": stubs + ":/usr/bin:/bin", "TERM": "dumb",
+                    "LANG": "C.UTF-8", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": gitconfig,
+                    "GIT_ALLOW_PROTOCOL": "file"}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def install(self, **env):
+        """The README one-liner: install.sh piped into bash. Returns (exit status, output)."""
+        with open(os.path.join(ROOT, "install.sh"), "rb") as f:
+            r = subprocess.run(["bash"], stdin=f, env=dict(self.env, **env), capture_output=True, timeout=300)
+        return r.returncode, (r.stdout + r.stderr).decode("utf-8", "replace")
+
+    def test_first_install_on_a_clean_machine(self):
+        status, out = self.install()
+        self.assertEqual(status, 0, out)
+        dest = os.path.join(self.home, ".local/share/arch-update-cactus")
+        self.assertEqual(git(dest, "rev-parse", "HEAD"), self.tag)
+        with open(os.path.join(self.home, ".local/state/arch-update-auto/sync.ok")) as f:
+            self.assertEqual(f.read().strip(), self.tag)
+        self.assertEqual(os.path.realpath(os.path.join(self.home, ".local/bin/arch-update-launcher")),
+                         os.path.realpath(os.path.join(dest, "bin/arch-update-launcher")))
+        self.assertTrue(os.path.isfile(os.path.join(self.home, ".local/share/applications/arch-update.desktop")))
+        with open(os.path.join(self.home, ".config/arch-update/arch-update.conf")) as f:
+            self.assertEqual(f.read(), "KeepOldPackages=2\nAURHelper=yay\n")
+        self.assertTrue(os.path.isfile(os.path.join(self.home, ".config/autostart/arch-update-tray.desktop")))
+        self.assertIn("готово", out)
+
+    def test_arch_update_config_is_found_under_xdg_config_home(self):
+        config = os.path.join(self.tmp, "xdg-config")
+        status, out = self.install(XDG_CONFIG_HOME=config)
+        self.assertEqual(status, 0, out)
+        with open(os.path.join(config, "arch-update/arch-update.conf")) as f:
+            self.assertEqual(f.read(), "KeepOldPackages=2\nAURHelper=yay\n")
+        self.assertTrue(os.path.isfile(os.path.join(config, "autostart/arch-update-tray.desktop")))
+        # installing again (a repair) finds both files and asks arch-update for neither
+        r = subprocess.run(["bash", os.path.join(self.home, ".local/share/arch-update-cactus/install.sh")],
+                           env=dict(self.env, XDG_CONFIG_HOME=config), stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=300)
+        out = (r.stdout + r.stderr).decode("utf-8", "replace")
+        self.assertEqual(r.returncode, 0, out)
+        self.assertNotIn("already exists", out)
+        with open(os.path.join(self.home, "arch-update.calls")) as f:
+            calls = f.read().splitlines()
+        self.assertEqual(calls.count("--gen-config"), 1, calls)
+        self.assertEqual(calls.count("--tray --enable"), 1, calls)
 
 
 if __name__ == "__main__":

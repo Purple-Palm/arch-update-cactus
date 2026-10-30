@@ -194,7 +194,8 @@ install_packages() {
 }
 
 setup_arch_update() {
-	local conf=$HOME/.config/arch-update/arch-update.conf helper
+	local config=${XDG_CONFIG_HOME:-$HOME/.config} helper   # where arch-update itself keeps its files
+	local conf=$config/arch-update/arch-update.conf
 	if [[ ! -f $conf ]]; then
 		arch-update --gen-config >/dev/null
 		# As on the main machine: two old versions stay in the package cache; yay for the AUR.
@@ -206,7 +207,7 @@ setup_arch_update() {
 	if grep -qE '^[[:space:]]*NoVersion' "$conf"; then
 		warn "в $conf включён NoVersion: без версий апдейтер не увидит список обновлений — закомментируй его"
 	fi
-	[[ -f $HOME/.config/autostart/arch-update-tray.desktop ]] || arch-update --tray --enable >/dev/null || true
+	[[ -f $config/autostart/arch-update-tray.desktop ]] || arch-update --tray --enable >/dev/null || true
 	systemctl --user enable --now --quiet arch-update.timer 2>/dev/null || true
 	# The tray picks the menu entry's file once, when it starts: one that started before our
 	# entry existed keeps opening the plain arch-update until it is restarted.
@@ -279,6 +280,7 @@ main() {
 		install_packages
 		self_check || die "самопроверка не прошла — установка остановлена"
 		install_files
+		mkdir -p "$STATE"                                   # a clean machine has no state yet
 		git -C "$ROOT" rev-parse HEAD >"$STATE/sync.ok"     # this version passed here
 		setup_arch_update
 		report
