@@ -98,6 +98,7 @@ class Machine(unittest.TestCase):
         engine.POWER_DIR = os.path.join(self.tmp, "power")
         os.makedirs(engine.PRESET_DIR)
         self.dkms = ""
+        self.sbctl = ""
         self.owners = {}
         real_run = engine.run
 
@@ -106,6 +107,8 @@ class Machine(unittest.TestCase):
                 return self.dkms
             if cmd[:2] == ["pacman", "-Qo"]:
                 return "".join(f"{f} is owned by {self.owners[f]} 1.0-1\n" for f in cmd[2:] if f in self.owners)
+            if cmd == ["sudo", "-n", "sbctl", "verify"]:
+                return self.sbctl
             if cmd[0] in ("sudo", "systemctl", "pacdiff", "pgrep", "findmnt"):
                 return ""
             return real_run(cmd, *a, **k)
@@ -143,6 +146,34 @@ class Machine(unittest.TestCase):
 
     def checks(self):
         return engine.system_checks({}, 0, types.SimpleNamespace(failures=set(), notes=set()), 0)
+
+    def patch(self, obj, name, value):
+        self.addCleanup(setattr, obj, name, getattr(obj, name))
+        setattr(obj, name, value)
+
+    def secure_boot_machine(self):
+        """Secure Boot on, sbctl installed, one kernel file for sbctl to verify."""
+        kernel = self.boot_file("vmlinuz-linux")
+        self.kernel("linux", "7.2.11-arch1-1", f'ALL_kver="{kernel}"\nPRESETS=(default)\n')
+        self.patch(engine, "secure_boot_on", lambda: True)
+        self.patch(engine.shutil, "which", lambda name: f"/usr/bin/{name}")
+        return kernel
+
+    def test_signed_boot_files_pass(self):
+        self.sbctl = f"✓ {self.secure_boot_machine()} is signed\n"
+        self.assertIn("подпись Secure Boot в порядке", self.checks()["ok"])
+
+    def test_an_unsigned_kernel_is_a_problem(self):
+        self.sbctl = f"✗ {self.secure_boot_machine()} is not signed\n"
+        r = self.checks()
+        self.assertTrue(any("не подписан" in p for p in r["problems"]), r["problems"])
+
+    def test_signatures_that_could_not_be_checked_are_said_out_loud(self):
+        # After the run on a machine whose sudo asks for a password, `sudo -n` finds no ticket (it went
+        # to the update's own terminal), so sbctl prints nothing: that must not pass as "all clear".
+        self.secure_boot_machine()
+        r = self.checks()
+        self.assertTrue(any("sbctl verify" in w for w in r["warnings"]), r["warnings"])
 
     def test_dkms_status_formats(self):
         self.dkms = ("nvidia/615.78, 7.2.11-arch1-1, x86_64: installed\n"

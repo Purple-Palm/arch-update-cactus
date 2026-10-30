@@ -1074,6 +1074,9 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
         problems.append(f"{', '.join(unsigned)} не подписан(ы) для Secure Boot — НЕ перезагружайся")
     elif any(f"{f} is signed" in sb for f in boot_files):
         ok.append("подпись Secure Boot в порядке")
+    elif boot_files and secure_boot_on() and shutil.which("sbctl"):
+        # a sudo that asks for a password gave its ticket to the update's terminal, not to us
+        warnings.append("подписи Secure Boot проверить не удалось — перед перезагрузкой: sudo sbctl verify")
 
     if is_chromebook() and {"alsa-ucm-conf", "sof-firmware"} & set(changed + added):
         warnings.append("обновились alsa-ucm-conf/sof-firmware: если пропал звук, снова запусти скрипт "
