@@ -1,6 +1,6 @@
-# Every push and pull request is tested in a clean Arch Linux container. A push to main that
-# passes is fast-forwarded to "stable" — the branch every installed machine pulls from — so
-# an untested or broken version never reaches the machines.
+# Every push and pull request is tested in a clean Arch Linux container. When a push to main
+# passes, the tag "stable" — what every installed machine pulls — moves to it, so an untested
+# or broken version never reaches the machines.
 name: test
 
 on:
@@ -43,16 +43,25 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Fast-forward stable to the tested commit
+      - name: Move the stable tag to the tested commit
         run: |
-          if git fetch -q origin stable; then
-            if git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+          # Where is the tag now? ls-remote exits 2 when it does not exist yet, else on any error.
+          if cur=$(git ls-remote --exit-code origin refs/tags/stable); then
+            cur=${cur%%[[:space:]]*}
+            git fetch -q origin refs/tags/stable
+            if git merge-base --is-ancestor "$GITHUB_SHA" "$cur"; then
               echo "stable already contains this commit (a newer push was promoted first)"
               exit 0
             fi
-            if ! git merge-base --is-ancestor FETCH_HEAD "$GITHUB_SHA"; then
+            if ! git merge-base --is-ancestor "$cur" "$GITHUB_SHA"; then
               echo "::error::main and stable have diverged (was main force-pushed?); the machines stay on stable"
               exit 1
             fi
+          elif [ $? -ne 2 ]; then
+            echo "::error::could not read the stable tag; not moving it"
+            exit 1
+          else
+            cur=
           fi
-          git push origin "$GITHUB_SHA:refs/heads/stable"
+          # A tag moves only by force; the lease makes it a compare-and-swap on the server.
+          git push --force-with-lease="refs/tags/stable:$cur" origin "$GITHUB_SHA:refs/tags/stable"

@@ -9,12 +9,13 @@
 #   install.sh --check     self-test of this checkout (used before a self-update is accepted)
 #   install.sh --uninstall remove the links, menu entry and timer (logs and settings stay)
 #
-# Everything lives in one git checkout, ~/.local/share/arch-update-cactus (branch "stable");
-# ~/.local/bin entries are symlinks into it, so a self-update replaces the whole thing at once.
+# Everything lives in one git checkout, ~/.local/share/arch-update-cactus, of the tag "stable"
+# (CI moves it to each tested commit of main); ~/.local/bin entries are symlinks into it, so a
+# self-update replaces the whole thing at once.
 set -euo pipefail
 
 REPO=Purple-Palm/arch-update-cactus
-BRANCH=stable
+TAG=stable
 DEST=$HOME/.local/share/arch-update-cactus
 DEST_REAL=$(realpath -m "$DEST")              # compared with this script's real path
 BIN=$HOME/.local/bin
@@ -47,11 +48,11 @@ bootstrap() {
 		{ sudo pacman -S --needed git; } </dev/tty
 	fi
 	if [[ -d $DEST/.git ]]; then
-		git -C "$DEST" fetch --quiet origin "$BRANCH"
+		git -C "$DEST" fetch --quiet origin "$TAG"
 		git -C "$DEST" reset --quiet --hard FETCH_HEAD
 	else
 		say "скачиваю Arch Update by Cactus в $DEST"
-		git clone --quiet --branch "$BRANCH" "https://github.com/$REPO.git" "$DEST"
+		git -c advice.detachedHead=false clone --quiet --branch "$TAG" "https://github.com/$REPO.git" "$DEST"
 	fi
 	if (exec </dev/tty) 2>/dev/null; then
 		exec bash "$DEST/install.sh" "$@" </dev/tty   # curl | bash took stdin: give the questions a keyboard back

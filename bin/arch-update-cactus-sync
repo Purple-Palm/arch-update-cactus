@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # arch-update-cactus-sync: bring this machine to the newest *tested* version of Arch Update by Cactus.
 #
-# GitHub CI moves the "stable" branch only after the tests pass, and every machine mirrors that
-# branch: fetch it, switch the checkout to it, run the new version's self-test here, refresh the
+# GitHub CI moves the tag "stable" only after the tests pass, and every machine mirrors that
+# tag: fetch it, switch the checkout to it, run the new version's self-test here, refresh the
 # installed files. sync.ok remembers the last version that passed on this machine. A version that
 # fails — or whose check was cut short by a shutdown — is replaced by that one again and left
 # alone for a day (sync.rejected).
@@ -19,7 +19,7 @@ STATE=$HOME/.local/state/arch-update-auto
 LOG=$STATE/sync.log
 OK=$STATE/sync.ok
 REJECTED=$STATE/sync.rejected
-BRANCH=stable
+TAG=stable
 mkdir -p "$STATE"
 
 log() {
@@ -101,7 +101,7 @@ if [[ $head != "$(cat "$OK" 2>/dev/null)" ]]; then
 fi
 
 # 3. Anything newer on GitHub? A public repository needs no credentials.
-if ! err=$(timeout "$wait" git -c credential.helper= fetch --quiet origin "$BRANCH" 2>&1); then
+if ! err=$(timeout "$wait" git -c credential.helper= fetch --quiet origin "$TAG" 2>&1); then
 	err=${err:-нет ответа за $wait с}
 	err=${err//$'\n'/ }
 	say "GitHub недоступен: $err"
@@ -114,7 +114,7 @@ if ! err=$(timeout "$wait" git -c credential.helper= fetch --quiet origin "$BRAN
 	exit 0
 fi
 rm -f "$STATE/sync.fetch-error"
-old=$(git rev-parse HEAD) new=$(git rev-parse FETCH_HEAD)
+old=$(git rev-parse HEAD) new=$(git rev-parse 'FETCH_HEAD^{commit}')   # the commit, also for an annotated tag
 if [[ $old == "$new" ]]; then
 	say "установлена последняя версия: ${new:0:7} $(git log -1 --format=%s)"
 	exit 0
