@@ -20,7 +20,7 @@ jobs:
     steps:
       - name: Install dependencies
         run: pacman -Syu --noconfirm --needed git python python-pexpect python-pyte shellcheck
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Lint shell scripts
         run: shellcheck install.sh bin/arch-update-launcher bin/arch-update-cactus-sync
       - name: No unfilled placeholders
@@ -40,7 +40,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Fast-forward stable to the tested commit
