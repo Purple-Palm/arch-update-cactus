@@ -22,7 +22,7 @@ jobs:
         run: pacman -Syu --noconfirm --needed git python python-pexpect python-pyte shellcheck
       - uses: actions/checkout@v7
       - name: Lint shell scripts
-        run: shellcheck install.sh bin/arch-update-launcher bin/arch-update-cactus-sync
+        run: shellcheck install.sh bin/arch-update-launcher bin/arch-update-cactus-sync lib/demo-update
       - name: No unfilled placeholders
         run: "! grep -n '@REPO@' install.sh README.md"
       - name: Self-test

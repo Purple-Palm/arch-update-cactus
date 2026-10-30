@@ -39,7 +39,7 @@ echo ":: Retrieving packages..."
 total=0
 for p in "${pkgs[@]}"; do
 	printf ' %s\n' "$p-1.0-2-x86_64"                     # pacman 7: a file starts downloading
-	for pct in 20 45 70 100; do
+	for _ in 1 2 3 4; do                                  # four redraws per file
 		total=$((total + 3))
 		printf ' Total (%2d/8)            %5.1f MiB  24.6 MiB/s 00:0%d [%-22s] %3d%%\r' \
 			$(( (total + 11) / 12 )) "$(awk "BEGIN{printf \"%.1f\", $total*1.54}")" $((RANDOM % 9)) \
