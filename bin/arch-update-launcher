@@ -1,0 +1,10 @@
+#!/bin/bash
+# arch-update-launcher: opens the full-screen Arch Update UI (by Cactus) in its own Konsole.
+# The tray icon, the panel button and the notification's "Run" all come here via
+# ~/.local/share/applications/arch-update.desktop. Falls back to the plain updater.
+ui="$HOME/.local/bin/arch-update-ui"
+if [ -x "$ui" ]; then
+	exec konsole --separate --fullscreen --profile ArchUpdate --hide-menubar --hide-tabbar --hide-toolbars \
+		-p tabtitle="Arch Update" -e "$ui" "$@"
+fi
+exec konsole --hide-menubar -e "$HOME/.local/bin/arch-update-auto"

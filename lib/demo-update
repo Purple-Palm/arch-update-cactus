@@ -1,0 +1,91 @@
+#!/bin/bash
+# Simulated arch-update run for `arch-update-ui --demo`. Prints what arch-update,
+# pacman and yay print (same prompts, progress redraws, timing). Changes nothing.
+b="\e[1m"; g="\e[1;32m"; bl="\e[1;34m"; o="\e[0m"
+ask() { read -rp $"$(echo -e "${bl}->${o}${b} $1${o} ")" _; }
+main() { echo -e "${g}==>${o}${b} $1${o}"; }
+bar() { # $1 label, $2 steps, $3 delay  — pacman order: each redraw is "text\r", the last one adds "\n"
+	local i n=$2 w=22
+	for ((i = 0; i <= n; i++)); do
+		local f=$((i * w / n))
+		local hashes="" dashes=""
+		((f > 0)) && hashes=$(printf '#%.0s' $(seq 1 $f))
+		((w - f > 0)) && dashes=$(printf -- '-%.0s' $(seq 1 $((w - f))))
+		printf '%-48s [%s%s] %3d%%\r' "$1" "$hashes" "$dashes" $((i * 100 / n))
+		sleep "$3"
+	done
+	printf '\n'
+}
+pkgs=(mesa linux-firmware qt6-base plasma-workspace kwin python-pip ffmpeg pipewire)
+
+main "Looking for updates..."; sleep 0.4; echo
+main "Packages:"
+for p in "${pkgs[@]}"; do echo -e "${b}$p${o}  1.0-1  ->  1.0-2"; done
+echo; main "AUR Packages:"; echo -e "${b}brave-bin${o}  1:1.97.59-1  ->  1:1.97.60-1"; echo
+ask "Proceed with update? [Y/n]"
+echo; echo -e "${bl}==>${o}${b} Arch News:${o}"
+echo "1 - Update to php >= 8.5.12 and/or php-legacy >= 8.3.36"; echo
+ask 'Select the news to read (e.g. 1 3 5), select 0 to read them all or press "enter" to proceed with update:'
+echo; main "Updating Packages..."; echo
+echo ":: Synchronizing package databases..."; sleep 0.3
+echo " core is up to date"; echo " extra is up to date"; echo " multilib is up to date"
+echo ":: Starting full system upgrade..."; sleep 0.4
+echo "resolving dependencies..."; echo "looking for conflicting packages..."; sleep 0.5; echo
+echo "Packages (8) ${pkgs[*]/%/-1.0-2}"; echo
+echo "Total Download Size:   148.25 MiB"; echo "Total Installed Size:  512.10 MiB"; echo "Net Upgrade Size:        3.20 MiB"; echo
+read -rp ":: Proceed with installation? [Y/n] " _
+echo ":: Retrieving packages..."
+total=0
+for p in "${pkgs[@]}"; do
+	printf ' %s\n' "$p-1.0-2-x86_64"                     # pacman 7: a file starts downloading
+	for pct in 20 45 70 100; do
+		total=$((total + 3))
+		printf ' Total (%2d/8)            %5.1f MiB  24.6 MiB/s 00:0%d [%-22s] %3d%%\r' \
+			$(( (total + 11) / 12 )) "$(awk "BEGIN{printf \"%.1f\", $total*1.54}")" $((RANDOM % 9)) \
+			"$(printf '#%.0s' $(seq 1 $((total * 22 / 96))) 2>/dev/null)" $((total * 100 / 96))
+		sleep 0.18
+	done
+done
+printf ' Total ( 8/8)            148.2 MiB  24.6 MiB/s 00:06 [######################] 100%%\r\n'
+for step in "checking keys in keyring" "checking package integrity" "loading package files" \
+	"checking for file conflicts" "checking available disk space"; do
+	bar "(8/8) $step" 6 0.04
+done
+echo ":: Running pre-transaction hooks..."; bar "(1/1) Removing old kernel modules..." 3 0.1
+echo ":: Processing package changes..."
+i=0
+for p in "${pkgs[@]}"; do
+	i=$((i + 1)); bar "($i/8) upgrading $p" 8 0.06
+	[ "$p" = kwin ] && read -rp ":: demo-theme and demo-theme-legacy are in conflict. Remove demo-theme-legacy? [y/N] " _
+done
+echo ":: Running post-transaction hooks..."
+hooks=("Creating system user accounts..." "Reloading system manager configuration..." "Restarting marked services..."
+	"Arming ConditionNeedsUpdate..." "Updating icon theme caches..." "Updating the desktop file MIME type cache..."
+	"Compiling GSettings XML schema files..." "Updating fontconfig cache..." "Probing GDK-Pixbuf loader modules..."
+	"Cleaning pacman cache (keep 2 versions, drop uninstalled packages)...")
+n=${#hooks[@]}; i=0
+for h in "${hooks[@]}"; do i=$((i + 1)); echo "($i/$n) $h"; sleep 0.45; done
+echo; main "Looking for orphan packages..."; echo "==> No orphan package found"; sleep 0.3
+echo; main "Updating AUR Packages..."; echo
+echo ":: Searching AUR for updates..."; sleep 0.4
+echo ":: 1 package to upgrade/install."; echo "1  aur/brave-bin  1:1.97.59-1 -> 1:1.97.60-1"
+echo '==> Packages to exclude: (eg: "1 2 3", "1-3", "^4" or repo name)'; read -rp "==> " _
+echo ":: (1/1) Downloaded PKGBUILD: brave-bin"
+echo "  1 brave-bin                                (Build Files Exist)"
+echo "==> Packages to cleanBuild?"; echo "==> [N]one [A]ll [Ab]ort [I]nstalled [No]tInstalled or (1 2 3, 1-3, ^4)"
+read -rp "==> " _
+echo "==> Making package: brave-bin 1:1.97.60-1 ($(date))"; sleep 0.5
+for s in "Checking runtime dependencies..." "Checking buildtime dependencies..." "Retrieving sources..." \
+	"Validating source files with sha256sums..." "Extracting sources..." "Starting package()..." \
+	"Tidying install..." "Checking for packaging issues..." "Creating package \"brave-bin\"..."; do
+	echo "==> $s"; sleep 0.7
+done
+echo "==> Finished making: brave-bin 1:1.97.60-1 ($(date))"
+echo "loading packages..."; echo "resolving dependencies..."; echo "Packages (1) brave-bin-1:1.97.60-1"
+echo ":: Processing package changes..."; bar "(1/1) upgrading brave-bin" 8 0.08
+echo ":: Running post-transaction hooks..."
+echo "(1/2) Arming ConditionNeedsUpdate..."; sleep 0.3; echo "(2/2) Updating the desktop file MIME type cache..."; sleep 0.3
+echo; main "Looking for old cached packages..."; echo "==> No old or uninstalled cached package found"; sleep 0.4
+echo; main "Looking for pacnew/pacsave files..."; echo "==> No pacnew/pacsave file found"; sleep 0.4
+echo; main "The update has been applied"; echo
+read -n1 -rsp "$(echo -e "${g}==>${o}${b} Press \"enter\" to quit ${o}")" _; echo

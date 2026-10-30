@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""arch-update-auto: run arch-update in the plain terminal and answer its routine questions.
+
+The logic lives in ~/.local/lib/arch-update-auto/engine.py (shared with the
+full-screen arch-update-ui). Risky or unrecognised questions are handed back to
+you (bell + notification); Ctrl+] switches to manual mode. Closing the window
+never interrupts pacman. Every run is logged to
+~/.local/state/arch-update-auto/logs/ (latest.log = newest).
+
+Environment:
+  ARCH_UPDATE_CMD          command to run (default: arch-update)
+  ARCH_UPDATE_AUTO_MODE    "auto" (default) or "manual" (only logging + checks)
+  ARCH_UPDATE_AUTO_NEWS    "stop" (default) hand over on [NEW] Arch news, "skip" to continue
+  ARCH_UPDATE_AUTO_SUMMARY "0" skips the post-update system checks
+  ARCH_UPDATE_AUTO_NOTIFY  "0" disables desktop notifications
+  ARCH_UPDATE_AUTO_LOGDIR  log directory
+"""
+import os
+import select
+import shutil
+import signal
+import sys
+import termios
+import tty
+
+sys.path.insert(0, os.path.expanduser("~/.local/lib/arch-update-auto"))
+import engine  # noqa: E402
+from engine import C_BOLD, C_DIM, C_GRN, C_RED, C_YEL, say  # noqa: E402
+
+
+def print_summary(res):
+    say(f"\n{C_BOLD}══════ Итог обновления ══════{engine.C_OFF}\n", "")
+    say(f"Обновлено: {len(res['changed'])}, установлено новых: {len(res['added'])}, "
+        f"удалено: {len(res['removed'])}\n", "")
+    for p in res["problems"]:
+        say(f"✗ {p}\n", C_RED)
+    for w in res["warnings"]:
+        say(f"⚠ {w}\n", C_YEL)
+    if res["verdict"] == 0:
+        say("✓ Всё прошло чисто, перезагрузка не нужна.\n", C_GRN)
+    elif res["verdict"] == 1:
+        say("✓ Обновление прошло нормально.\n", C_GRN)
+    say(f"Лог: {res['log']}\n", C_DIM)
+
+
+def wait_close(verdict, status):
+    try:
+        termios.tcflush(0, termios.TCIFLUSH)   # an Enter typed earlier must not skip the summary
+        if verdict == 0 and not status:
+            # Clean run: close by itself like MX; any key other than Enter keeps the window open.
+            cooked = termios.tcgetattr(0)
+            tty.setcbreak(0)
+            try:
+                key = None
+                for left in range(10, 0, -1):
+                    say(f"\rОкно закроется через {left:2d} с (Enter — закрыть сейчас, "
+                        f"любая другая клавиша — оставить). ", C_BOLD)
+                    if select.select([0], [], [], 1)[0]:
+                        key = os.read(0, 16)
+                        break
+            finally:
+                termios.tcsetattr(0, termios.TCSADRAIN, cooked)
+            if key and key.strip(b"\r\n"):
+                say("\nОставляю открытым. Нажми Enter, чтобы закрыть.", C_BOLD)
+                termios.tcflush(0, termios.TCIFLUSH)
+                sys.stdin.readline()
+        else:
+            say("\nНажми Enter, чтобы закрыть окно.", C_BOLD)
+            sys.stdin.readline()
+    except (termios.error, OSError, ValueError):
+        pass
+
+
+def main():
+    interactive = sys.stdin.isatty()
+    if interactive:
+        engine.shield_from_window_close()
+    manual = os.environ.get("ARCH_UPDATE_AUTO_MODE", "auto") == "manual"
+    stop_on_news = os.environ.get("ARCH_UPDATE_AUTO_NEWS", "stop") != "skip"
+    view = engine.TerminalView()
+    engine.VIEW = view
+    if manual:
+        say("[arch-update] обычный Arch-Update: на вопросы отвечаешь ты. Всё пишется в журнал, "
+            "в конце будет проверка системы.\n")
+    else:
+        say(f"{C_BOLD}[автоответчик]{engine.C_OFF}{C_DIM} отвечаю на стандартные вопросы сам; "
+            f"Ctrl+] — ручной режим.\n")
+
+    old_tty = None
+    if interactive:
+        old_tty = termios.tcgetattr(0)
+        tty.setraw(0)
+    child_holder = {}
+
+    def on_winch(*_):
+        child = child_holder.get("child")
+        if child:
+            try:
+                child.setwinsize(*reversed(shutil.get_terminal_size((120, 40))))
+            except (OSError, ValueError):
+                pass
+    if interactive:
+        signal.signal(signal.SIGWINCH, on_winch)
+    summary = os.environ.get("ARCH_UPDATE_AUTO_SUMMARY", "1") != "0"
+    try:
+        status, res, _ = engine.run_update(view, manual=manual, stop_on_news=stop_on_news, summary=summary,
+                                           on_spawn=lambda c: child_holder.update(child=c))
+    finally:
+        signal.signal(signal.SIGWINCH, signal.SIG_DFL)
+        if old_tty is not None and engine.TERM_OK:
+            try:
+                termios.tcsetattr(0, termios.TCSADRAIN, old_tty)
+            except termios.error:
+                pass
+    verdict = 0
+    if res:
+        print_summary(res)
+        verdict = res["verdict"]
+    if interactive and engine.TERM_OK:
+        wait_close(verdict, status)
+    sys.exit(2 if verdict == 2 else (status or 0))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,1692 @@
+#!/usr/bin/env python3
+"""arch-update-ui: full-screen, animated front-end for arch-update  (by Cactus)
+
+Splash with the gradient ARCH UPDATE title, update check + Arch news, an
+arrow-key menu, an in-app news reader, a compact live dashboard while the
+update runs (stages, progress, ETA learned from previous runs), a modal for
+questions that need a human, and a summary screen with the system checks.
+
+The update itself is run by the shared engine (~/.local/lib/arch-update-auto/
+engine.py): real arch-update in a pty, routine questions answered, risky ones
+handed to you, every run logged to ~/.local/state/arch-update-auto/logs/.
+
+  arch-update-ui           normal use (started by the tray icon / launcher)
+  arch-update-ui --demo    the whole show on a simulated update (changes nothing)
+"""
+import html
+import json
+import math
+import os
+import re
+import select
+import shutil
+import signal
+import sys
+import termios
+import textwrap
+import threading
+import time
+import traceback
+import tty
+import types
+import urllib.request
+
+sys.path.insert(0, os.path.expanduser("~/.local/lib/arch-update-auto"))
+import engine  # noqa: E402
+import games  # noqa: E402
+
+DEMO = "--demo" in sys.argv
+AUTOPLAY = DEMO and os.environ.get("ARCH_UPDATE_UI_AUTOPLAY") == "1"   # demo drives itself (screenshots)
+DEMO_CMD = os.path.expanduser("~/.local/lib/arch-update-auto/demo-update")
+FPS = 30
+
+# ───────────────────────────── colour ─────────────────────────────
+
+def hexrgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+BG = hexrgb("#0b0e17")
+PAL_ARCH = [hexrgb(c) for c in ("#1793d1", "#4f7bff", "#8b5cff", "#d65cff", "#ff5ca8", "#8b5cff", "#4f7bff")]
+PAL_RUN = [hexrgb(c) for c in ("#00f5c4", "#00d2ff", "#3d8bff", "#00d2ff")]
+PAL_OK = [hexrgb(c) for c in ("#3ddc84", "#00f5c4", "#7cffb2", "#00f5c4")]
+PAL_WARN = [hexrgb(c) for c in ("#ffb347", "#ffd166", "#ff9f43", "#ffd166")]
+PAL_BAD = [hexrgb(c) for c in ("#ff5c7a", "#ff8f5c", "#ff3d6e", "#ff8f5c")]
+TEXT = hexrgb("#c9d1e3")
+DIM = hexrgb("#6b7591")
+FAINT = hexrgb("#2a3147")
+GOOD = hexrgb("#3ddc84")
+WARN = hexrgb("#ffc457")
+BAD = hexrgb("#ff5c7a")
+PINK = hexrgb("#ff5ca8")
+
+
+PANEL = hexrgb("#141a2a")
+
+
+def lerp(a, b, t):
+    t = 0.0 if t < 0 else 1.0 if t > 1 else t
+    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+def grad(pal, x):
+    x = x % 1.0
+    n = len(pal)
+    p = x * n
+    i = int(p)
+    return lerp(pal[i % n], pal[(i + 1) % n], p - i)
+
+
+def shade(c, k):
+    return tuple(int(v * k) for v in c)
+
+
+def ease(t):
+    t = 0.0 if t < 0 else 1.0 if t > 1 else t
+    return 1 - (1 - t) ** 3
+
+
+def clamp01(t):
+    return 0.0 if t < 0 else 1.0 if t > 1 else t
+
+
+class Backdrop:
+    """Slowly drifting, twinkling star field plus a faint aurora along the bottom edge."""
+
+    def __init__(self, n=110, seed=7):
+        rnd = __import__("random").Random(seed)
+        self.stars = [(rnd.random(), rnd.random(), 0.004 + rnd.random() * 0.018, rnd.random() * 6.3,
+                       rnd.choice("···∙∙•✦") if rnd.random() < 0.97 else "✦") for _ in range(n)]
+
+    def draw(self, c, t, pal, fade=1.0):
+        # The background moves slowly: 6 updates per second look the same as 30 and keep almost
+        # every row unchanged between frames, so only a small diff is sent to the terminal.
+        t = math.floor(t * 6) / 6
+        fade = round(fade * 8) / 8
+        for sx, sy, speed, ph, ch in self.stars:
+            x = int(((sx - t * speed) % 1.0) * c.w)
+            y = int(sy * (c.h - 1))
+            tw = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(t * 1.7 + ph))
+            k = (0.10 if ch in "·∙" else 0.18) * tw * fade
+            c.put(x, y, ch, lerp(BG, grad(pal, sx + t * 0.02), k))
+        base = c.h - 3                                   # aurora: two soft sine ribbons
+        ribbons = "▁▂▃▄▅"
+        for x in range(c.w):
+            for j, (amp, fr, sp) in enumerate(((1.6, 0.045, 0.55), (1.1, 0.07, -0.4))):
+                v = math.sin(x * fr + t * sp + j * 2) * amp + math.sin(x * fr * 0.37 - t * 0.3) * 0.8
+                yy = base - int(round(v + 1.5)) - j
+                if 0 <= yy < c.h:
+                    k = (0.10 + 0.06 * math.sin(x * 0.05 + t)) * fade
+                    c.put(x, yy, ribbons[(int(v * 2) + 2) % 5], lerp(BG, grad(pal, x / c.w * 0.8 + t * 0.03 + j * 0.3), k))
+
+
+U = types.SimpleNamespace(grad=grad, lerp=lerp, shade=shade, PAL_ARCH=PAL_ARCH, PAL_RUN=PAL_RUN, TEXT=TEXT,
+                          DIM=DIM, FAINT=FAINT, BG=BG, PINK=PINK, GOOD=GOOD, PANEL=PANEL)
+BACKDROP = Backdrop()
+
+
+# ───────────────────────────── big font (ANSI Shadow) ─────────────────────────────
+
+GLYPHS = {
+    "A": [" █████╗ ", "██╔══██╗", "███████║", "██╔══██║", "██║  ██║", "╚═╝  ╚═╝"],
+    "R": ["██████╗ ", "██╔══██╗", "██████╔╝", "██╔══██╗", "██║  ██║", "╚═╝  ╚═╝"],
+    "C": [" ██████╗", "██╔════╝", "██║     ", "██║     ", "╚██████╗", " ╚═════╝"],
+    "H": ["██╗  ██╗", "██║  ██║", "███████║", "██╔══██║", "██║  ██║", "╚═╝  ╚═╝"],
+    "U": ["██╗   ██╗", "██║   ██║", "██║   ██║", "██║   ██║", "╚██████╔╝", " ╚═════╝ "],
+    "P": ["██████╗ ", "██╔══██╗", "██████╔╝", "██╔═══╝ ", "██║     ", "╚═╝     "],
+    "D": ["██████╗ ", "██╔══██╗", "██║  ██║", "██║  ██║", "██████╔╝", "╚═════╝ "],
+    "T": ["████████╗", "╚══██╔══╝", "   ██║   ", "   ██║   ", "   ██║   ", "   ╚═╝   "],
+    "E": ["███████╗", "██╔════╝", "█████╗  ", "██╔══╝  ", "███████╗", "╚══════╝"],
+    " ": ["   "] * 6,
+}
+CHECK = ["          ██╗", "         ██╔╝", "   ██╗  ██╔╝ ", "   ╚██╗██╔╝  ", "    ╚███╔╝   ", "     ╚══╝    "]
+CROSS = ["██╗  ██╗", "╚██╗██╔╝", " ╚███╔╝ ", " ██╔██╗ ", "██╔╝ ██╗", "╚═╝  ╚═╝"]
+BANG = ["██╗", "██║", "██║", "╚═╝", "██╗", "╚═╝"]
+SHADOW_CHARS = set("╔╗╚╝═║")
+
+
+def big_text(word):
+    """Returns (rows, letter_spans) for a word in the big font."""
+    rows = [""] * 6
+    spans = []
+    for ch in word:
+        g = GLYPHS[ch]
+        start = len(rows[0])
+        for i in range(6):
+            rows[i] += g[i]
+        spans.append((start, len(rows[0])))
+    return rows, spans
+
+
+# ───────────────────────────── canvas ─────────────────────────────
+
+class Canvas:
+    """A frame of cells; serialised with 24-bit colour, only changed rows are rewritten."""
+
+    def __init__(self, w, h):
+        self.w, self.h = w, h
+        self.clear()
+        self.prev = [None] * h
+
+    def clear(self):
+        self.ch = [[" "] * self.w for _ in range(self.h)]
+        self.fg = [[None] * self.w for _ in range(self.h)]
+        self.bg = [[None] * self.w for _ in range(self.h)]
+        self.bd = [[False] * self.w for _ in range(self.h)]
+
+    def put(self, x, y, text, fg=TEXT, bg=None, bold=False, alpha=1.0):
+        if y < 0 or y >= self.h:
+            return
+        if alpha < 1:
+            fg = lerp(BG, fg, alpha)
+            if bg:
+                bg = lerp(BG, bg, alpha)
+        for i, c in enumerate(text):
+            xx = x + i
+            if 0 <= xx < self.w:
+                self.ch[y][xx] = c
+                self.fg[y][xx] = fg
+                if bg is not None:
+                    self.bg[y][xx] = bg
+                self.bd[y][xx] = bold
+
+    def cput(self, y, text, fg=TEXT, **k):
+        self.put((self.w - len(text)) // 2, y, text, fg, **k)
+
+    def dim(self, k):
+        """Push everything drawn so far towards the background (behind a modal)."""
+        for y in range(self.h):
+            fr, br = self.fg[y], self.bg[y]
+            for x in range(self.w):
+                if fr[x]:
+                    fr[x] = lerp(fr[x], BG, k)
+                if br[x]:
+                    br[x] = lerp(br[x], BG, k)
+
+    def blank(self, x, y, w, h, color):
+        """Opaque rectangle: wipes whatever was drawn below (modals)."""
+        for yy in range(max(0, y), min(self.h, y + h)):
+            for xx in range(max(0, x), min(self.w, x + w)):
+                self.ch[yy][xx], self.fg[yy][xx], self.bg[yy][xx], self.bd[yy][xx] = " ", None, color, False
+
+    def fill_bg(self, x, y, w, color):
+        if 0 <= y < self.h:
+            for xx in range(max(0, x), min(self.w, x + w)):
+                self.bg[y][xx] = color
+
+    def rows(self):
+        out = []
+        for y in range(self.h):
+            parts, cur = [], (None, None, None)
+            for x in range(self.w):
+                key = (self.fg[y][x], self.bg[y][x], self.bd[y][x])
+                if key != cur:
+                    fg, bg, bd = key
+                    seq = "\x1b[0"
+                    if bd:
+                        seq += ";1"
+                    if fg:
+                        seq += ";38;2;%d;%d;%d" % fg
+                    if bg:
+                        seq += ";48;2;%d;%d;%d" % bg
+                    parts.append(seq + "m")
+                    cur = key
+                parts.append(self.ch[y][x])
+            out.append("".join(parts) + "\x1b[0m")
+        return out
+
+
+class Screen:
+    def __init__(self):
+        self.size = shutil.get_terminal_size((120, 40))
+        self.canvas = Canvas(*self.size)
+        self.alive = True
+
+    def resize(self):
+        self.size = shutil.get_terminal_size((120, 40))
+        self.canvas = Canvas(*self.size)
+
+    def enter(self):
+        self.write("\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[2J")
+
+    def leave(self):
+        self.write("\x1b[0m\x1b[2J\x1b[?7h\x1b[?25h\x1b[?1049l")
+
+    def write(self, s):
+        if not engine.TERM_OK:
+            return
+        data = memoryview(s.encode())
+        try:
+            while data:
+                data = data[os.write(1, data):]   # SIGWINCH can cut a blocked write short
+        except OSError:
+            engine.lost_terminal()
+
+    def flush(self):
+        c = self.canvas
+        rows = c.rows()
+        buf = ["\x1b[?2026h"]
+        for y, r in enumerate(rows):
+            if c.prev[y] != r:
+                buf.append(f"\x1b[{y + 1};1H{r}")
+                c.prev[y] = r
+        buf.append("\x1b[?2026l")
+        if len(buf) > 2:
+            self.write("".join(buf))
+        c.clear()
+
+
+# ───────────────────────────── input ─────────────────────────────
+
+KEYS = {b"\x1b[A": "up", b"\x1bOA": "up", b"\x1b[B": "down", b"\x1bOB": "down", b"\x1b[C": "right",
+        b"\x1bOC": "right", b"\x1b[D": "left", b"\x1bOD": "left", b"\x1b[5~": "pgup", b"\x1b[6~": "pgdn",
+        b"\x1b[H": "home", b"\x1b[F": "end", b"\x1bOH": "home", b"\x1bOF": "end", b"\x1b[1~": "home",
+        b"\x1b[4~": "end"}
+CTRL = {0x0d: "enter", 0x0a: "enter", 0x7f: "bs", 0x08: "bs", 0x1d: "ctrl]", 0x03: "ctrl-c", 0x20: "space",
+        0x09: "tab"}
+ESC_SEQ = re.compile(rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|O[ -~])")     # CSI ... final byte, or SS3 x
+
+
+def parse_keys(data):
+    keys, i = [], 0
+    while i < len(data):
+        b = data[i]
+        if b == 0x1b:
+            m = ESC_SEQ.match(data, i)
+            if m:                                   # known key, or unknown sequence: dropped, never 'esc'
+                if m.group() in KEYS:
+                    keys.append(KEYS[m.group()])
+                i = m.end()
+            elif i + 1 < len(data) and data[i + 1] != 0x1b:
+                i += 2                              # Alt+key: dropped
+            else:
+                keys.append("esc")                  # lone Esc
+                i += 1
+            continue
+        if b in CTRL:
+            keys.append(CTRL[b])
+            i += 1
+            continue
+        for n in (1, 2, 3, 4):                      # exactly one UTF-8 character
+            try:
+                keys.append(data[i:i + n].decode("utf-8"))
+                i += n
+                break
+            except UnicodeDecodeError:
+                pass
+        else:
+            i += 1                                  # invalid byte: dropped
+    return keys
+
+
+# ───────────────────────────── monitors ─────────────────────────────
+
+UI_STATE = os.path.join(engine.STATE_DIR, "ui.json")
+
+
+def ui_state():
+    try:
+        with open(UI_STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_ui_state(**kw):
+    d = ui_state()
+    d.update(kw)
+    try:
+        os.makedirs(engine.STATE_DIR, exist_ok=True)
+        with open(UI_STATE, "w") as f:
+            json.dump(d, f)
+    except OSError:
+        pass
+
+
+def konsole_pid():
+    """PID of the Konsole window we run in (an ancestor process named konsole)."""
+    pid = os.getpid()
+    for _ in range(8):
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+            with open(f"/proc/{ppid}/comm") as f:
+                if f.read().strip() == "konsole":
+                    return ppid
+            pid = ppid
+        except (OSError, ValueError, IndexError):
+            return None
+    return None
+
+
+def monitor_count():
+    try:
+        d = json.loads(engine.run(["kscreen-doctor", "-j"], timeout=5) or "{}")
+        return sum(1 for o in d.get("outputs", []) if o.get("enabled"))
+    except ValueError:
+        return 0
+
+
+def primary_output():
+    """KDE's primary monitor (priority 1 in kscreen)."""
+    try:
+        d = json.loads(engine.run(["kscreen-doctor", "-j"], timeout=5) or "{}")
+        outs = [o for o in d.get("outputs", []) if o.get("enabled")]
+        best = min(outs, key=lambda o: o.get("priority") or 99)
+        return best["name"]
+    except (ValueError, KeyError):
+        return None
+
+
+def active_output():
+    return engine.run(["qdbus6", "org.kde.KWin", "/KWin", "org.kde.KWin.activeOutputName"], timeout=3).strip()
+
+
+def kwin_move_window(pid, target=None, step=0):
+    """Send the window of process `pid` to the output named `target`, or `step` outputs
+    left (-1) / right (+1) in their left-to-right desk order. Uses a one-shot KWin script."""
+    js = """
+const ws = workspace.screens.slice().sort((a, b) => a.geometry.x - b.geometry.x || a.geometry.y - b.geometry.y);
+const target = %s, step = %d;
+for (const w of workspace.windowList()) {
+    if (w.pid !== %d) continue;
+    let t = null;
+    if (target) t = ws.find(s => s.name === target);
+    else {
+        const i = ws.findIndex(s => s.name === w.output.name), j = i + step;
+        if (i >= 0 && j >= 0 && j < ws.length) t = ws[j];
+    }
+    if (t && t.name !== w.output.name) workspace.sendClientToScreen(w, t);
+}
+""" % (json.dumps(target), step, pid)
+    path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), f"arch-update-ui-move-{os.getpid()}.js")
+    name = f"arch-update-ui-move-{os.getpid()}"
+    try:
+        with open(path, "w") as f:
+            f.write(js)
+        sid = engine.run(["qdbus6", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.loadScript", path, name],
+                         timeout=3).strip()
+        if sid.lstrip("-").isdigit() and int(sid) >= 0:
+            engine.run(["qdbus6", "org.kde.KWin", f"/Scripting/Script{sid}", "org.kde.kwin.Script.run"], timeout=3)
+            time.sleep(0.3)
+        engine.run(["qdbus6", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", name], timeout=3)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+# ───────────────────────────── data ─────────────────────────────
+
+def fetch(url, timeout=8):
+    req = urllib.request.Request(url, headers={"User-Agent": "arch-update-ui (by Cactus)"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def last_update_date():
+    try:
+        with open(os.path.expanduser("~/.local/state/arch-update/last_update_run")) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def get_news():
+    page = fetch("https://archlinux.org/news/")
+    items = re.findall(r'<td>(\d{4}-\d{2}-\d{2})</td>\s*<td class="wrap"><a href="(/news/[^"]+)"[^>]*>([^<]+)</a>',
+                       page)
+    last = last_update_date()
+    return [{"date": d, "url": "https://archlinux.org" + u, "title": html.unescape(t).strip(),
+             "new": bool(last) and d >= last, "body": None} for d, u, t in items[:6]]
+
+
+def html_to_text(s):
+    s = re.sub(r"(?is)<(script|style).*?</\1>", "", s)
+    s = re.sub(r"(?i)<br\s*/?>", "\n", s)
+    s = re.sub(r"(?i)<li[^>]*>", "\n  • ", s)
+    s = re.sub(r"(?i)</(p|div|pre|ul|ol|h\d)>", "\n\n", s)
+    s = re.sub(r"(?s)<[^>]+>", "", s)
+    s = html.unescape(s)
+    return re.sub(r"\n{3,}", "\n\n", s).strip()
+
+
+def get_article(url):
+    page = fetch(url)
+    m = re.search(r'<div class="article-content"[^>]*>(.*?)</div>\s*</div>', page, re.S)
+    info = re.search(r'<p class="article-info">([^<]+)</p>', page)
+    body = html_to_text(m.group(1)) if m else "Не удалось разобрать статью."
+    return (html.unescape(info.group(1)).strip() if info else ""), body
+
+
+MONTHS = ["янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
+
+
+def ru_date(d):
+    try:
+        y, m, dd = d.split("-")
+        return f"{int(dd)} {MONTHS[int(m) - 1]}"
+    except (ValueError, IndexError):
+        return d
+
+
+def fmt_dur(sec):
+    sec = int(round(sec))
+    if sec < 60:
+        return f"{max(sec, 1)} с"
+    m, s = divmod(sec, 60)
+    if m < 10:
+        return f"{m} мин {s:02d} с"
+    return f"{m} мин"
+
+
+def plural(n, one, few, many):
+    n10, n100 = n % 10, n % 100
+    if n10 == 1 and n100 != 11:
+        return one
+    if 2 <= n10 <= 4 and not 12 <= n100 <= 14:
+        return few
+    return many
+
+
+# ───────────────────────────── the app ─────────────────────────────
+
+class App:
+    def __init__(self):
+        self.s = Screen()
+        self.t0 = time.time()
+        self.state = "splash"
+        self.repo, self.aur, self.check_failed = None, None, False
+        self.news, self.news_err = None, None
+        self.menu_sel = 0
+        self.menu_t = None
+        self.news_sel = 0
+        self.article = None
+        self.scroll = 0
+        self.confirm = None
+        self.resized = False
+        self.quit = False
+        self.kpid = konsole_pid()
+        self.monitors = monitor_count() if self.kpid else 0
+        self.moving = False
+        self.toast_text, self.toast_t = "", 0.0
+        if self.monitors > 1:
+            threading.Thread(target=self._restore_monitor, daemon=True).start()
+        threading.Thread(target=self._load_updates, daemon=True).start()
+        threading.Thread(target=self._load_news, daemon=True).start()
+
+    # data loading
+    def _load_updates(self):
+        if DEMO:
+            time.sleep(1.4)
+            self.repo = [("mesa", "1:26.2.5-1", "1:26.2.6-1"), ("linux-firmware", "20260916-1", "20261014-1"),
+                         ("qt6-base", "6.12.0-3", "6.12.1-1"), ("plasma-workspace", "6.8.0-1", "6.8.1-1"),
+                         ("kwin", "6.8.0-1", "6.8.1-1"), ("python-pip", "26.2.2-1", "26.2.3-1"),
+                         ("ffmpeg", "2:9.0.2-2", "2:9.0.3-1"), ("pipewire", "1:1.6.9-1", "1:1.6.10-1")]
+            self.aur = [("brave-bin", "1:1.97.59-1", "1:1.97.60-1")]
+            return
+        repo, aur, failed = engine.check_updates()
+        self.repo, self.aur, self.check_failed = repo, aur, failed
+
+    def _restore_monitor(self):
+        """Open on the primary (central) monitor. Konsole's window may not exist yet when we start,
+        so the move is repeated a few times (it does nothing once the window is already there)."""
+        target = primary_output()
+        if not target:
+            return
+        for delay in (0.15, 0.5, 1.0, 2.0):
+            time.sleep(delay)
+            kwin_move_window(self.kpid, target=target)
+
+    def move_screen(self, direction):
+        """← / →: our window to the neighbouring monitor; remembered for next time."""
+        if self.monitors < 2 or self.moving:
+            return
+        self.moving = True
+
+        def work():
+            try:
+                before = active_output()
+                kwin_move_window(self.kpid, step=-1 if direction == "left" else 1)
+                time.sleep(0.5)
+                after = active_output()
+                if after and after != before:
+                    self.toast(f"монитор: {after}")
+                else:
+                    self.toast("это крайний монитор")
+            finally:
+                self.moving = False
+        threading.Thread(target=work, daemon=True).start()
+
+    def toast(self, text):
+        self.toast_text, self.toast_t = text, time.time()
+
+    def draw_toast(self):
+        if not self.toast_text:
+            return
+        age = time.time() - self.toast_t
+        if age > 2.2:
+            self.toast_text = ""
+            return
+        a = clamp01(age / 0.2) * clamp01((2.2 - age) / 0.6)
+        c, t = self.s.canvas, self.now()
+        text = f"  ◂  {self.toast_text}  ▸  "
+        x0, y = (c.w - len(text)) // 2, c.h - 4
+        for i, ch in enumerate(text):
+            c.put(x0 + i, y, ch, (255, 255, 255), bg=shade(grad(PAL_ARCH, i / len(text) * 0.6 - t * 0.2), 0.55),
+                  bold=True, alpha=a)
+
+    def hint(self, *parts):
+        """Footer with the ←→ monitor hint when there is more than one monitor."""
+        if self.monitors > 1:
+            last = parts[-1:] if parts and parts[-1] == "q выход" else ()
+            parts = parts[:len(parts) - len(last)] + ("←→ монитор",) + last
+        self.footer("   ".join(parts))
+
+    def _load_news(self):
+        try:
+            self.news = get_news()
+        except Exception as e:      # network down etc.
+            self.news, self.news_err = [], str(e)
+
+    def _load_article(self, item):
+        try:
+            item["info"], item["body"] = get_article(item["url"])
+        except Exception as e:
+            item["info"], item["body"] = "", f"Не удалось загрузить статью: {e}"
+
+    @property
+    def loaded(self):
+        return self.repo is not None and self.news is not None
+
+    @property
+    def count(self):
+        return len(self.repo or []) + len(self.aur or [])
+
+    @property
+    def kernel_gpu(self):
+        return [n for n, *_ in (self.repo or []) if engine.KERNEL_GPU_PKGS.match(n)]
+
+    def menu_items(self):
+        if self.count:
+            items = [("auto", "Обновить автоматически", "сам отвечу на вопросы, позову тебя только если важно"),
+                     ("manual", "Обычный Arch-Update", "отвечаешь на вопросы сам")]
+        else:
+            items = [("recheck", "Проверить ещё раз", "вдруг что-то вышло"),
+                     ("manual", "Обычный Arch-Update", "запустить как есть")]
+        if self.news:
+            items.append(("news", "Читать новости Arch", f"{len(self.news)} последних"))
+        items.append(("quit", "Выйти", ""))
+        return items
+
+    # ── drawing helpers
+    def now(self):
+        return time.time() - self.t0
+
+    def draw_title(self, top, t, pal=PAL_ARCH, reveal_t=None, blend=None, alpha=1.0):
+        c = self.s.canvas
+        word = "ARCH UPDATE" if c.w >= 92 else "ARCH"
+        rows, spans = big_text(word)
+        width = len(rows[0])
+        x0 = (c.w - width) // 2
+        for li, (a, b) in enumerate(spans):
+            if reveal_t is not None:
+                a_t = clamp01((reveal_t - 0.07 * li) / 0.35)
+                if a_t <= 0:
+                    continue
+                dy = -int(round((1 - ease(a_t)) * 2))
+            else:
+                a_t, dy = 1.0, 0
+            for ry in range(6):
+                seg = rows[ry][a:b]
+                for i, ch in enumerate(seg):
+                    if ch == " ":
+                        continue
+                    x = a + i
+                    pos = x / max(1, width) * 0.85 + ry * 0.035 - t * 0.12
+                    col = grad(pal, pos)
+                    if blend is not None:                      # transition wave to another palette
+                        k = blend(x0 + x, top + ry)
+                        col = lerp(col, grad(PAL_RUN, pos), k)
+                    if ch in SHADOW_CHARS:
+                        col = shade(col, 0.45)
+                    c.put(x0 + x, top + ry + dy, ch, col, bold=ch not in SHADOW_CHARS, alpha=a_t * alpha)
+        if word == "ARCH" and c.h > top + 8:
+            c.cput(top + 6, "U P D A T E", grad(pal, -t * 0.12), bold=True, alpha=alpha)
+        return top + 6
+
+    def byline(self, y, t, start):
+        c = self.s.canvas
+        text = "by Cactus"
+        x0 = (c.w - len(text)) // 2
+        for i, ch in enumerate(text):
+            a = clamp01((t - start - 0.06 * i) / 0.3)
+            if a > 0:
+                c.put(x0 + i, y, ch, grad(PAL_ARCH, 0.55 + i * 0.03 - t * 0.05), alpha=a * 0.9)
+
+    def spinner(self, t):
+        return "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(t * 12) % 10]
+
+    def footer(self, text):
+        c = self.s.canvas
+        c.cput(c.h - 2, text, DIM)
+
+    # ── screens
+    def draw_splash(self):
+        c, t = self.s.canvas, self.now()
+        BACKDROP.draw(c, t, PAL_ARCH, clamp01(t / 1.5))
+        top = max(1, c.h // 2 - 9)
+        y = self.draw_title(top, t, reveal_t=t)
+        self.byline(y + 1, t, 0.9)
+        y += 4
+        tasks = [("проверяю обновления", self.repo is not None,
+                  (f"найдено {self.count} {plural(self.count, 'обновление', 'обновления', 'обновлений')}"
+                   if self.count else ("не удалось проверить" if self.check_failed else "система актуальна"))
+                  if self.repo is not None else ""),
+                 ("загружаю новости Arch", self.news is not None,
+                  (f"{len(self.news)} новостей" if self.news else "нет связи с archlinux.org")
+                  if self.news is not None else "")]
+        for i, (label, done, result) in enumerate(tasks):
+            a = clamp01((t - 1.2 - i * 0.15) / 0.4)
+            if a <= 0:
+                continue
+            line = f"{'✓' if done else self.spinner(t + i)}  {result if done else label + '…'}"
+            col = GOOD if done else grad(PAL_ARCH, t * 0.3 + i * 0.2)
+            c.cput(y + i, line, col if done else col, alpha=a)
+        news_ready = self.news is not None or t > 5.0      # slow archlinux.org: news fills in on the menu
+        if self.repo is not None and news_ready and t > 2.0:
+            self.state, self.menu_t, self.from_splash = "menu", time.time(), True
+        elif self.repo is None and t > 15:
+            c.cput(c.h - 2, "проверка затянулась · Enter — обычный Arch-Update без проверки · q — выход", DIM)
+        elif t > 1.5:
+            self.hint("q выход")
+        self.draw_toast()
+
+    def menu_layout(self):
+        """Heights of the menu blocks, so the whole thing can be centred."""
+        c = self.s.canvas
+        W = min(c.w - 8, 96)
+        news_h = (2 + min(3, len(self.news))) if self.news else 2
+        if self.count:
+            ncol = max(1, W // 46) if W >= 92 else 1
+            pk = len(self.repo) + len(self.aur)
+            rows = min((pk + ncol - 1) // ncol, max(3, min(8, c.h - 32)))
+            upd_h = 1 + rows + (1 if pk > rows * ncol else 0) + (1 if self.check_failed else 0) + 1
+        else:
+            upd_h = 4
+        warn_h = 2 if self.kernel_gpu else 0
+        menu_h = 1 + 2 * len(self.menu_items())
+        return W, news_h, upd_h, warn_h, menu_h
+
+    def title_top(self):
+        c = self.s.canvas
+        W, news_h, upd_h, warn_h, menu_h = self.menu_layout()
+        total = 10 + news_h + upd_h + warn_h + menu_h
+        return max(1, (c.h - 3 - total) // 2)
+
+    def draw_menu(self):
+        c, t = self.s.canvas, self.now()
+        BACKDROP.draw(c, t, PAL_ARCH)
+        mt = time.time() - self.menu_t
+        W, news_h, upd_h, warn_h, menu_h = self.menu_layout()
+        x0 = (c.w - W) // 2
+        target = self.title_top()
+        top = target
+        if mt < 0.6 and getattr(self, "from_splash", False):      # glide up from the splash position
+            top = round(max(1, c.h // 2 - 9) + (target - max(1, c.h // 2 - 9)) * ease(mt / 0.6))
+        y = self.draw_title(top, t)
+        self.byline(y + 1, t, -1)
+        y = target + 10
+
+        def appear(i):
+            return clamp01((mt - 0.35 - i * 0.06) / 0.35)
+
+        # news
+        k = 0
+        if self.news:
+            a = appear(k); k += 1
+            c.put(x0, y, "НОВОСТИ ARCH", grad(PAL_ARCH, 0.1 - t * 0.05), bold=True, alpha=a)
+            c.put(x0 + 13, y, "─" * (W - 13), FAINT, alpha=a)
+            y += 1
+            for item in self.news[:3]:
+                a = appear(k); k += 1
+                date = ru_date(item["date"]).ljust(7)
+                title = item["title"]
+                room = W - 9 - (6 if item["new"] else 0)
+                if len(title) > room:
+                    title = title[:room - 1] + "…"
+                c.put(x0, y, "●", PINK if item["new"] else DIM, alpha=a)
+                c.put(x0 + 2, y, date, DIM, alpha=a)
+                c.put(x0 + 9, y, title, TEXT, alpha=a)
+                if item["new"]:
+                    c.put(x0 + W - 5, y, " NEW ", BG, bg=PINK, bold=True, alpha=a)
+                y += 1
+            y += 1
+        elif self.news_err:
+            c.put(x0, y, "новости недоступны (нет связи с archlinux.org)", DIM, alpha=appear(0))
+            y += 2
+        else:
+            c.put(x0, y, self.spinner(t) + "  загружаю новости Arch…", DIM, alpha=appear(0))
+            y += 2
+
+        # updates
+        a = appear(k); k += 1
+        label = f"ОБНОВЛЕНИЯ · {self.count}" if self.count else "ОБНОВЛЕНИЯ"
+        c.put(x0, y, label, grad(PAL_ARCH, 0.3 - t * 0.05), bold=True, alpha=a)
+        c.put(x0 + len(label) + 1, y, "─" * (W - len(label) - 1), FAINT, alpha=a)
+        y += 1
+        if not self.count:
+            a = appear(k); k += 1
+            msg = "Не удалось проверить обновления (нет сети или зеркало не отвечает)" if self.check_failed \
+                else "✓  Система актуальна"
+            c.cput(y + 1, msg, WARN if self.check_failed else GOOD, bold=True, alpha=a)
+            y += 3
+        else:
+            pkgs = [(n, o, nw, False) for n, o, nw in self.repo] + [(n, o, nw, True) for n, o, nw in self.aur]
+            colw = 46 if W >= 92 else W
+            ncol = max(1, W // colw)
+            max_rows = max(3, min(8, c.h - 32))
+            shown = pkgs[:max_rows * ncol]
+            for i, (n, o, nw, is_aur) in enumerate(shown):
+                a = appear(k + i // ncol)
+                cx, cy = x0 + (i % ncol) * colw, y + i // ncol
+                name = n if len(n) <= 24 else n[:23] + "…"
+                ver = nw if len(nw) <= colw - 28 else nw[:colw - 29] + "…"
+                c.put(cx, cy, "aur" if is_aur else " • ", PINK if is_aur else DIM, alpha=a)
+                c.put(cx + 4, cy, name, TEXT, bold=engine.KERNEL_GPU_PKGS.match(n) is not None, alpha=a)
+                c.put(cx + 5 + len(name), cy, ver, DIM, alpha=a)
+            rows_used = (len(shown) + ncol - 1) // ncol
+            k += rows_used
+            y += rows_used
+            if len(pkgs) > len(shown):
+                c.put(x0 + 4, y, f"+ ещё {len(pkgs) - len(shown)}", DIM, alpha=appear(k))
+                y += 1
+            if self.check_failed:
+                c.put(x0 + 4, y, "часть проверки не удалась — список может быть неполным", WARN, alpha=appear(k))
+                y += 1
+            y += 1
+        if self.kernel_gpu:
+            a = appear(k); k += 1
+            c.put(x0, y, "⚠", WARN, bold=True, alpha=a)
+            c.put(x0 + 2, y, "в обновлении ядро/NVIDIA: перед запуском сохрани работу — экран может подвиснуть",
+                  WARN, alpha=a)
+            y += 2
+
+        # menu: a gradient pill under the selected item
+        y += 1
+        items = self.menu_items()
+        mw = min(W, 60)
+        mx = (c.w - mw) // 2
+        for i, (key, title, sub) in enumerate(items):
+            a = appear(k + i)
+            sel = i == self.menu_sel
+            if sel:
+                for xx in range(mw):
+                    g = grad(PAL_ARCH, xx / mw * 0.6 - t * 0.1)
+                    c.fill_bg(mx + xx, y, 1, lerp(BG, shade(g, 0.5), a))
+                c.put(mx + 2, y, "▸ " + title, (255, 255, 255), bold=True, alpha=a)
+                if sub:
+                    c.put(mx + 4, y + 1, sub, DIM, alpha=a)
+            else:
+                c.put(mx + 4, y, title, TEXT, alpha=a * 0.9)
+                if sub:
+                    c.put(mx + 4, y + 1, sub, FAINT, alpha=a)
+            y += 2
+        self.hint("↑↓ выбор", "Enter запуск", "q выход")
+        self.draw_toast()
+        if self.confirm:
+            self.draw_modal("Ядро или драйвер NVIDIA",
+                            ["В этом обновлении: " + ", ".join(self.kernel_gpu[:4]),
+                             "Сохрани работу и закрой важные программы: пока собирается",
+                             "драйвер (DKMS), экран может подвиснуть. Не перезагружайся,",
+                             "пока не увидишь итог."], "Enter — продолжить    Esc — назад", PAL_WARN)
+
+    def draw_modal(self, title, lines, hint, pal, input_text=None):
+        c, t = self.s.canvas, self.now()
+        c.dim(0.72)
+        w = min(c.w - 6, max(52, max(len(l) for l in lines) + 8))
+        h = len(lines) + (5 if input_text is not None else 4)
+        x0, y0 = (c.w - w) // 2, (c.h - h) // 2
+        border = grad(pal, -t * 0.25)
+        c.blank(x0, y0, w, h, hexrgb("#121726"))
+        c.put(x0, y0, "╭" + "─" * (w - 2) + "╮", border, bg=hexrgb("#121726"))
+        c.put(x0, y0 + h - 1, "╰" + "─" * (w - 2) + "╯", border, bg=hexrgb("#121726"))
+        for yy in range(y0 + 1, y0 + h - 1):
+            c.put(x0, yy, "│", border, bg=hexrgb("#121726"))
+            c.put(x0 + w - 1, yy, "│", border, bg=hexrgb("#121726"))
+        c.put(x0 + 3, y0, f" {title} ", grad(pal, 0.2 - t * 0.2), bg=hexrgb("#121726"), bold=True)
+        for i, l in enumerate(lines):
+            c.put(x0 + 3, y0 + 1 + i, l, TEXT, bg=hexrgb("#121726"))
+        yy = y0 + 1 + len(lines)
+        if input_text is not None:
+            cur = "█" if int(t * 2) % 2 == 0 else " "
+            c.put(x0 + 3, yy + 1, "› " + input_text + cur, (255, 255, 255), bg=hexrgb("#121726"), bold=True)
+        c.put(x0 + 3, y0 + h - 2, hint, DIM, bg=hexrgb("#121726"))
+
+    def draw_news(self):
+        c, t = self.s.canvas, self.now()
+        W = min(c.w - 8, 100)
+        x0 = (c.w - W) // 2
+        if self.article is None:
+            c.cput(2, "НОВОСТИ ARCH", grad(PAL_ARCH, -t * 0.1), bold=True)
+            y = 4
+            for i, item in enumerate(self.news):
+                sel = i == self.news_sel
+                if sel:
+                    for xx in range(W):
+                        c.fill_bg(x0 + xx, y, 1, shade(grad(PAL_ARCH, xx / W * 0.5 - t * 0.1), 0.45))
+                tag = "  NEW" if item["new"] else ""
+                title = item["title"][:W - 14 - len(tag)]
+                c.put(x0 + 1, y, ("▸ " if sel else "  ") + ru_date(item["date"]).ljust(7) + title,
+                      (255, 255, 255) if sel else TEXT, bold=sel)
+                if tag:
+                    c.put(x0 + W - 5, y, tag.strip(), PINK, bold=True)
+                y += 2
+            self.hint("↑↓ выбор", "Enter читать", "Esc назад")
+            self.draw_toast()
+            return
+        item = self.article
+        c.cput(2, "НОВОСТИ ARCH", grad(PAL_ARCH, -t * 0.1), bold=True)
+        title_lines = textwrap.wrap(item["title"], max(10, W))
+        y = 4
+        for tl in title_lines:
+            c.cput(y, tl, grad(PAL_ARCH, 0.2 - t * 0.08), bold=True)
+            y += 1
+        if item.get("info"):
+            c.cput(y, item["info"], DIM)
+        y += 2
+        if item["body"] is None:
+            c.cput(y + 2, self.spinner(t) + "  загружаю статью…", grad(PAL_ARCH, t * 0.3))
+        else:
+            body = []
+            for para in item["body"].split("\n"):
+                body += textwrap.wrap(para, max(10, W)) or [""]
+            view_h = c.h - y - 4
+            self.scroll = max(0, min(self.scroll, len(body) - view_h))
+            for i, line in enumerate(body[self.scroll:self.scroll + view_h]):
+                c.put(x0, y + i, line, TEXT)
+            if len(body) > view_h:
+                c.put(x0 + W + 2, y, "▲" if self.scroll else " ", DIM)
+                c.put(x0 + W + 2, y + view_h - 1, "▼" if self.scroll + view_h < len(body) else " ", DIM)
+        self.hint("↑↓ прокрутка", "Esc назад")
+        self.draw_toast()
+
+    # ── input
+    def handle(self, key):
+        if key in ("left", "right") and not self.confirm:
+            self.move_screen(key)
+            return None
+        if self.state == "splash":
+            if key in ("q", "esc"):
+                self.quit = True
+            elif key == "enter" and self.repo is None and self.now() > 15:
+                return "manual"
+            return None
+        if self.state == "menu":
+            items = self.menu_items()
+            if self.confirm:
+                if key == "enter":
+                    if time.time() - self.confirm > 0.8:     # a fresh press after a pause is consent
+                        self.confirm = None
+                        return "auto"
+                    self.confirm = time.time()               # held/double Enter: keep waiting
+                if key in ("esc", "q"):
+                    self.confirm = None
+                return None
+            if key in ("up", "k"):
+                self.menu_sel = (self.menu_sel - 1) % len(items)
+            elif key in ("down", "j", "tab"):
+                self.menu_sel = (self.menu_sel + 1) % len(items)
+            elif len(key) == 1 and key in "123456789" and int(key) <= len(items):
+                self.menu_sel = int(key) - 1
+                return self.handle("enter")
+            elif key in ("q", "esc"):
+                return "quit"
+            elif key == "enter":
+                action = items[self.menu_sel][0]
+                if action == "auto" and self.kernel_gpu:
+                    self.confirm = time.time()
+                    return None
+                if action == "news":
+                    self.state, self.news_sel, self.article = "news", 0, None
+                    return None
+                if action == "recheck":
+                    self.repo, self.state, self.t0 = None, "splash", time.time() - 2.0
+                    threading.Thread(target=self._load_updates, daemon=True).start()
+                    return None
+                return action
+            return None
+        if self.state == "news":
+            if self.article is None:
+                if key in ("up", "k"):
+                    self.news_sel = (self.news_sel - 1) % len(self.news)
+                elif key in ("down", "j"):
+                    self.news_sel = (self.news_sel + 1) % len(self.news)
+                elif key == "enter":
+                    self.article, self.scroll = self.news[self.news_sel], 0
+                    if self.article["body"] is None:
+                        threading.Thread(target=self._load_article, args=(self.article,), daemon=True).start()
+                elif key in ("esc", "q"):
+                    self.state, self.menu_t = "menu", time.time() - 5
+            else:
+                if key in ("up", "k"):
+                    self.scroll = max(0, self.scroll - 1)
+                elif key in ("down", "j", "space"):
+                    self.scroll += 1
+                elif key == "pgup":
+                    self.scroll = max(0, self.scroll - 10)
+                elif key == "pgdn":
+                    self.scroll += 10
+                elif key in ("esc", "q", "enter"):
+                    self.article = None
+            return None
+        return None
+
+    def check_resize(self):
+        """Window size changed: new canvas (full redraw) for the new size."""
+        if self.resized:
+            self.resized = False
+            self.s.resize()
+            self.s.write("\x1b[2J")
+
+    def frame(self):
+        self.check_resize()
+        {"splash": self.draw_splash, "menu": self.draw_menu, "news": self.draw_news}[self.state]()
+        self.s.flush()
+
+    def loop(self):
+        """Splash/menu/news loop. Returns the chosen action."""
+        while not self.quit:
+            self.frame()
+            if AUTOPLAY and self.state == "menu" and time.time() - self.menu_t > 3.5:
+                return "auto"
+            r = select.select([0], [], [], 1 / FPS)[0]
+            if r:
+                try:
+                    data = os.read(0, 1024)
+                except OSError:
+                    data = b""
+                if not data:
+                    return "quit"
+                for key in parse_keys(data):
+                    action = self.handle(key)
+                    if action:
+                        return action
+        return "quit"
+
+
+# ───────────────────────────── transition + live view ─────────────────────────────
+
+class LiveView(engine.TerminalView):
+    """Engine view for the auto mode: a compact animated dashboard."""
+    animated = True
+
+    def __init__(self, app, demo=False):
+        super().__init__()
+        self.app = app
+        self.s = app.s
+        hist = engine.History()
+        if demo:
+            hist.d.update({"sec_per_pkg": 0.75, "hooks_sec": 4.6, "dl_bps": 24e6, "cleanup_sec": 2.0,
+                           "aur": {"brave-bin": 8.0}})
+        self.prog = engine.Progress(len(app.repo or []), app.aur or [], hist)
+        self.feed = []          # (time, text, kind)
+        self.raw_tail = b""
+        self.modal = None       # (why, line)
+        self.input = ""
+        self.raw = False
+        self.eta_shown = None
+        self.t_start = time.time()
+        self.last_frame = 0
+        self.demo = demo
+        self.answers = 0
+        self.lines = engine.Feed()
+        self.game = None          # running mini-game
+        self.hub = False          # game picker open
+        self.hub_sel = 0
+        self.update_done = False  # set when arch-update finished while a game is open
+        self.best = ui_state().get("best", {})
+
+    # engine hooks
+    def output(self, data, lines):
+        self.raw_tail = (self.raw_tail + data)[-120_000:]
+        if self.raw:
+            self.out(data)
+            return
+        lines = self.lines.push(data)
+        self.prog.feed_partial(self.lines.partial())
+        for line in lines:
+            msg = self.prog.feed_line(line)
+            if msg:
+                kind = "err" if re.match(r"^(error|warning)", msg, re.I) else "info"
+                self.push(msg, kind)
+
+    def push(self, text, kind="info"):
+        if self.feed and self.feed[-1][1] == text:
+            return
+        self.feed.append((time.time(), text, kind))
+        self.feed = self.feed[-40:]
+
+    def message(self, msg, color=engine.C_DIM):
+        if engine.LOG:
+            engine.LOG.text(msg)
+        if self.raw:
+            super().message(msg, color)
+        else:
+            text = " ".join(msg.replace("[автоответчик]", "").split())
+            if text:
+                self.push(text, "warn")
+
+    ANSWER_TEXT = {
+        "proceed with update": "подтвердил обновление",
+        "Arch news": "новости уже показаны — продолжаю",
+        "pacman proceed": "подтвердил установку",
+        "replace package": "подтвердил замену пакета",
+        "import PGP key": "импортировал ключ PGP",
+        "choose provider": "выбрал вариант по умолчанию",
+        "choose group members": "выбрал вариант по умолчанию",
+        "yay menu (default)": "yay: вариант по умолчанию",
+        "yay proceed": "подтвердил сборку",
+        "yay remove make deps": "сборочные зависимости уберу после сборки",
+        "clean package cache": "чищу кэш пакетов",
+        "remove orphan packages": "сирот не трогаю — посмотрим вместе",
+        "process pacnew files": ".pacnew оставляю на потом",
+        "reboot now": "перезагрузку не делаю",
+        "restart services": "сервисы не перезапускаю",
+        "remove unused flatpaks": "flatpak не трогаю",
+        "another arch-update is running": "уже идёт другое обновление — отменяю",
+    }
+
+    def answered(self, label, line, answer):
+        self.answers += 1
+        if label in ("press enter to quit", "press enter to continue"):
+            return
+        text = self.ANSWER_TEXT.get(label)
+        if not text:
+            q = line if len(line) < 56 else line[:53] + "…"
+            text = f"ответил «{answer}» — {q}"
+        self.push(text, "auto")
+
+    def handover(self, why, line):
+        if self.raw:
+            return super().handover(why, line)
+        self.modal, self.input = (why, line), ""
+        self.secret = why == "запрос пароля"
+        self.bell()
+
+    def handover_done(self):
+        self.modal, self.input = None, ""
+
+    def fallback(self, tb):
+        self.go_raw("внутренняя ошибка интерфейса — дальше обычный вывод:\n" + tb)
+
+    def go_raw(self, why):
+        if self.raw:
+            return
+        self.raw = True
+        self.s.leave()
+        self.s.write("\x1b[2J\x1b[H")
+        tail = self.raw_tail[-8000:]
+        self.out(tail)
+        super().message(f"\r\n[arch-update-ui] {why}\r\n", engine.C_YEL)
+
+    def key(self, data):
+        if self.raw:
+            return data
+        keys = parse_keys(data)
+        if "ctrl]" in keys:
+            self.go_raw("ручной режим: дальше полный вывод, отвечаешь сам.")
+            return b"\x1d"
+        if not self.modal and (self.game or self.hub):
+            for k in keys:
+                if k == "ctrl-c":
+                    return b"\x03"
+                self.game_key(k)
+            return None
+        if not self.modal:
+            for k in ("left", "right"):
+                if k in keys:
+                    self.app.move_screen(k)
+            if any(k in ("g", "G", "п", "П") for k in keys):
+                self.hub, self.hub_sel = True, 0
+                return None
+        if self.modal:
+            for k in keys:
+                if k == "enter":
+                    text, self.input = self.input, ""
+                    return text.encode() + b"\r"
+                if k == "bs":
+                    self.input = self.input[:-1]
+                elif k == "ctrl-c":
+                    return b"\x03"
+                elif k == "space":
+                    self.input += " "
+                elif len(k) == 1 and k.isprintable():
+                    self.input += k
+            return None
+        if "ctrl-c" in keys:
+            return b"\x03"
+        return None
+
+    # ── mini-games
+    def game_key(self, k):
+        if self.hub:
+            n = len(games.GAMES)
+            if k in ("up", "k", "w"):
+                self.hub_sel = (self.hub_sel - 1) % n
+            elif k in ("down", "j", "s", "tab"):
+                self.hub_sel = (self.hub_sel + 1) % n
+            elif len(k) == 1 and k in "123456789"[:n]:
+                self.hub_sel = int(k) - 1
+                self.game_key("enter")
+            elif k == "enter":
+                self.game, self.hub = games.GAMES[self.hub_sel](), False
+            elif k in ("esc", "q"):
+                self.hub = False
+            return
+        if k == "esc":
+            self.save_best()
+            self.game.paused = True if hasattr(self.game, "paused") and not self.game.over else self.game.paused
+            self.game, self.hub = None, False      # back to the dashboard (G starts a new game)
+            return
+        self.game.key(k)
+        if self.game.over:
+            self.save_best()
+
+    def save_best(self):
+        g = self.game
+        if g and g.score > self.best.get(g.name, 0):
+            self.best[g.name] = g.score
+            save_ui_state(best=self.best)
+
+    def play_after(self):
+        """arch-update finished while a game is open: let the player finish, then show the summary."""
+        self.update_done = True
+        while (self.game or self.hub) and engine.TERM_OK:
+            self.tick()
+            if select.select([0], [], [], 1 / FPS)[0]:
+                try:
+                    data = os.read(0, 1024)
+                except OSError:
+                    return
+                if not data:
+                    return
+                for k in parse_keys(data):
+                    self.game_key(k)
+        self.save_best()
+
+    def tick(self):
+        if self.raw or not engine.TERM_OK:
+            return
+        now = time.time()
+        if AUTOPLAY and not self.modal:          # demo showcase: play a little Tetris by itself
+            if not self.game and now - self.t_start > 4:
+                self.game = games.Tetris()
+            elif self.game and now - getattr(self, "auto_k", 0) > 0.3:
+                self.auto_k = now
+                self.game.key(__import__("random").choice(["left", "right", "up", "down", "down"]))
+        if self.game and not self.modal:
+            self.game.step(now)
+        if now - self.last_frame < 1 / FPS:
+            return
+        self.last_frame = now
+        self.app.check_resize()
+        self.draw()
+        self.s.flush()
+        if AUTOPLAY and self.modal:
+            self.modal_t = getattr(self, "modal_t", None) or now
+            if now - self.modal_t > 3.0 and engine.RESPONDER:
+                self.modal_t = None
+                engine.RESPONDER.user_input(b"n\r")
+
+    # drawing
+    def draw(self, fade=1.0):
+        c, t = self.s.canvas, time.time() - self.app.t0
+        t = math.floor(t * 10) / 10     # colour flows at 10 fps: most rows stay identical between frames
+        BACKDROP.draw(c, t, PAL_RUN, fade)
+        if self.game or self.hub:
+            self.draw_games(c, t)
+        else:
+            self.draw_dashboard(c, t, fade)
+        self.app.draw_toast()
+        if self.modal:
+            why, line = self.modal
+            lines = textwrap.wrap(line, max(10, min(c.w - 14, 76)), break_on_hyphens=False) or [line]
+            self.app.draw_modal("Нужен твой ответ", [why[:1].upper() + why[1:], ""] + lines,
+                                "Enter — отправить    Ctrl+] — полный вывод", PAL_WARN,
+                                input_text=("•" * len(self.input)) if getattr(self, "secret", False) else self.input)
+
+    def status_strip(self, c, t, y):
+        """One compact line with the update's state, shown above the games."""
+        p = self.prog
+        if self.update_done:
+            text = "✓  обновление завершено   ·   Esc — к итогу"
+            c.cput(y, text, GOOD, bold=True)
+            return
+        stage = {"start": "подготовка", "download": "загрузка", "install": "установка", "hooks": "хуки",
+                 "aur": "сборка AUR", "cleanup": "завершение"}.get(p.stage, "обновление")
+        frac = p.overall()
+        eta = f"осталось ≈ {fmt_dur(max(1, self.eta_shown or p.eta()))}"
+        bw = 24
+        text_l = f"ARCH UPDATE  ·  {stage}  "
+        text_r = f"  {int(frac * 100):3d}%  ·  {eta}"
+        x = (c.w - len(text_l) - bw - len(text_r)) // 2
+        for i, ch in enumerate(text_l):
+            c.put(x + i, y, ch, grad(PAL_RUN, i / 40 - t * 0.15), bold=i < 11)
+        x += len(text_l)
+        for i in range(bw):
+            c.put(x + i, y, "█" if i < frac * bw else "─", grad(PAL_RUN, i / bw * 0.7 - t * 0.25) if i < frac * bw
+                  else FAINT)
+        c.put(x + bw, y, text_r, TEXT)
+
+    def draw_games(self, c, t):
+        self.status_strip(c, t, 1)
+        if self.hub:
+            top = max(4, c.h // 2 - 9)
+            title = "МИНИ-ИГРЫ"
+            c.cput(top, " ".join(title), grad(PAL_ARCH, -t * 0.12), bold=True)
+            c.cput(top + 1, "обновление идёт дальше само — играй спокойно", DIM)
+            mw = 44
+            mx = (c.w - mw) // 2
+            y = top + 4
+            for i, G in enumerate(games.GAMES):
+                sel = i == self.hub_sel
+                best = self.best.get(G.name)
+                if sel:
+                    for xx in range(mw):
+                        c.fill_bg(mx + xx, y, 1, shade(grad(PAL_ARCH, xx / mw * 0.6 - t * 0.1), 0.5))
+                c.put(mx + 2, y, ("▸ " if sel else "  ") + f"{i + 1}  {G.title}", (255, 255, 255) if sel else TEXT,
+                      bold=sel)
+                if best:
+                    rec = f"рекорд {best}"
+                    c.put(mx + mw - len(rec) - 2, y, rec, DIM if not sel else (220, 220, 235))
+                y += 2
+            self.app.hint("↑↓ выбор", "Enter играть", "Esc назад")
+            return
+        g = self.game
+        g.scale = 1
+        for sc in (3, 2):        # largest scale that fits the screen (big monitors get big cells)
+            g.scale = sc
+            w_, h_ = g.size()
+            if w_ <= c.w - 6 and h_ <= c.h - 8:
+                break
+            g.scale = 1
+        gw, gh = g.size()
+        x0, y0 = (c.w - gw) // 2, max(3, (c.h - gh) // 2)
+        c.cput(y0 - 1, f"{g.title.upper()}   ·   очки {g.score}   ·   рекорд {max(g.score, self.best.get(g.name, 0))}",
+               grad(PAL_ARCH, 0.2 - t * 0.1), bold=True)
+        c.blank(x0, y0, gw, gh, None)      # the star field / aurora never shows through the board
+        g.draw(c, U, x0, y0, t)
+        self.app.footer(g.hints + "   ·   Esc — выйти из игры")
+
+    def draw_dashboard(self, c, t, fade=1.0):
+        W = min(c.w - 8, 84)
+        x0 = (c.w - W) // 2
+        p = self.prog
+        top = max(1, c.h // 2 - 13)
+
+        # header
+        head = "A R C H   U P D A T E"
+        hx = (c.w - len(head)) // 2
+        for i, ch in enumerate(head):
+            c.put(hx + i, top, ch, grad(PAL_RUN, i / len(head) * 0.7 - t * 0.15), bold=True, alpha=fade)
+        sub = "демо-режим · ничего не меняется" if self.demo else "обновление системы"
+        c.cput(top + 1, sub, DIM, alpha=fade)
+
+        # stages
+        stages = [("download", "Загрузка"), ("install", "Установка"), ("hooks", "Хуки")]
+        if p.aur_pkgs:
+            stages.append(("aur", "AUR"))
+        stages.append(("cleanup", "Завершение"))
+        order = engine.Progress.STAGES
+        cur = order.index(p.stage) if p.stage in order else -1
+        seg = W // len(stages)
+        y = top + 4
+        for i, (key, name) in enumerate(stages):
+            idx = order.index(key)
+            cx = x0 + i * seg + seg // 2
+            if idx < cur:
+                dot, col = "●", grad(PAL_RUN, i * 0.15)
+            elif idx == cur:
+                pulse = 0.55 + 0.45 * math.sin(t * 5)
+                dot, col = "◉", lerp(DIM, grad(PAL_RUN, i * 0.15 - t * 0.2), pulse)
+            else:
+                dot, col = "○", FAINT
+            if i < len(stages) - 1:
+                lc = grad(PAL_RUN, i * 0.15) if idx < cur else FAINT
+                c.put(cx + 2, y, "─" * (seg - 3), lc, alpha=fade)
+            c.put(cx, y, dot, col, bold=True, alpha=fade)
+            c.put(cx - len(name) // 2, y + 1, name, TEXT if idx == cur else (DIM if idx < cur else FAINT),
+                  bold=idx == cur, alpha=fade)
+
+        # stage line
+        y += 4
+        title = {"start": "Подготовка", "download": "Скачиваю пакеты", "install": "Устанавливаю пакеты",
+                 "hooks": "Выполняю хуки", "aur": "Собираю пакеты из AUR", "cleanup": "Наводим порядок",
+                 "end": "Готово"}.get(p.stage, "Обновление")
+        if p.stage == "aur" and p.building:
+            title = f"Собираю {p.building}"
+        c.put(x0, y, title, TEXT, bold=True, alpha=fade)
+        right = ""
+        if p.stage == "install" and p.total:
+            right = f"{p.done} / {p.total}"
+        elif p.stage == "hooks" and p.hooks_total:
+            right = f"{p.hooks_done} / {p.hooks_total}"
+        elif p.stage == "download" and p.dl_seen:
+            right = f"{int(p.dl_pct)}%"
+        elif p.stage == "aur" and p.aur_pkgs:
+            right = f"{p.aur_done} / {p.aur_count()}"
+        c.put(x0 + W - len(right), y, right, DIM, alpha=fade)
+
+        # progress bar (overall), sub-cell precision, flowing gradient
+        y += 2
+        frac = p.overall()
+        bw = W
+        filled = frac * bw
+        parts = " ▏▎▍▌▋▊▉█"
+        for i in range(bw):
+            col = grad(PAL_RUN, i / bw * 0.8 - t * 0.25)
+            if i < int(filled):
+                c.put(x0 + i, y, "█", col, alpha=fade)
+            elif i == int(filled):
+                c.put(x0 + i, y, parts[int((filled - i) * 8)], col, alpha=fade)
+            else:
+                c.put(x0 + i, y, "─", FAINT, alpha=fade)
+        pct = f"{int(frac * 100)}%"
+        c.put(x0 + W - len(pct), y + 1, pct, TEXT, bold=True, alpha=fade)
+
+        # eta
+        eta = p.eta()
+        if self.eta_shown is None:
+            self.eta_shown = eta
+        else:
+            self.eta_shown += (eta - self.eta_shown) * 0.08
+        elapsed = time.time() - self.t_start
+        el = f"прошло {int(elapsed // 60)}:{int(elapsed % 60):02d}"
+        if p.stage in ("start",) and elapsed < 3:
+            eta_txt = "оцениваю время…"
+        else:
+            eta_txt = f"осталось ≈ {fmt_dur(max(1, self.eta_shown))}"
+        c.put(x0, y + 1, eta_txt, grad(PAL_RUN, 0.3 - t * 0.1), alpha=fade)
+        c.put(x0 + len(eta_txt) + 3, y + 1, el, DIM, alpha=fade)
+
+        # activity feed: newest at the bottom, older lines fade out
+        y += 4
+        rows = max(4, min(9, c.h - y - 5))
+        items = self.feed[-rows:]
+        for i, (ts, text, kind) in enumerate(items):
+            age_rank = len(items) - 1 - i
+            k = 1.0 - age_rank / (rows + 1)
+            k *= clamp01((time.time() - ts) / 0.25) * 0.85 + 0.15
+            col = {"info": TEXT, "auto": hexrgb("#7cf5d6"), "warn": WARN, "err": BAD}[kind]
+            icon = {"info": "›", "auto": "✓", "warn": "!", "err": "✗"}[kind]
+            line = text if len(text) <= W - 4 else text[:W - 5] + "…"
+            yy = y + (rows - len(items)) + i
+            c.put(x0 + 1, yy, icon, col, alpha=fade * k)
+            c.put(x0 + 3, yy, line, col if age_rank == 0 else lerp(DIM, col, k), alpha=fade * k)
+
+        # invitation to play
+        inv = "▶  G — мини-игры, пока идёт обновление"
+        yy = min(c.h - 5, y + rows + 2)
+        ix = (c.w - len(inv)) // 2
+        pulse = 0.7 + 0.3 * math.sin(t * 2.2)
+        for i, ch in enumerate(inv):
+            c.put(ix + i, yy, ch, lerp(BG, grad(PAL_ARCH, i / len(inv) * 0.6 - t * 0.15), pulse), bold=True, alpha=fade)
+        hint = "Ctrl+] — полный вывод и ручной режим" + ("   ·   ←→ монитор" if self.app.monitors > 1 else "")
+        c.cput(c.h - 2, hint, FAINT, alpha=fade)
+
+
+def transition(app, view):
+    """The menu screen flows into the live view: a diagonal colour wave recolours the title
+    into the run palette and dissolves everything else, then the dashboard fades in."""
+    s, dur = app.s, 1.2
+    t0 = time.time()
+    while True:
+        k = (time.time() - t0) / dur
+        if k >= 1:
+            break
+        app.check_resize()
+        app.draw_menu()
+        c, t = s.canvas, app.now()
+        front = ease(k) * (c.h + 24) - 12
+        top = app.title_top()
+        for y in range(c.h):
+            for x in range(c.w):
+                b = clamp01((front - y - (x / c.w) * 12) / 6)
+                if b <= 0:
+                    continue
+                if c.bg[y][x]:
+                    c.bg[y][x] = lerp(c.bg[y][x], BG, b)
+                if c.fg[y][x] is None:
+                    continue
+                if top <= y < top + 6 and c.ch[y][x] != " ":
+                    target = grad(PAL_RUN, x / c.w * 0.85 - t * 0.12)
+                    if c.ch[y][x] in SHADOW_CHARS:
+                        target = shade(target, 0.45)
+                    c.fg[y][x] = lerp(c.fg[y][x], target, b)
+                else:
+                    c.fg[y][x] = lerp(c.fg[y][x], BG, b)
+        for x in range(c.w):                       # glowing edge riding the wave
+            yy = int(front - (x / c.w) * 12)
+            if 0 <= yy < c.h and c.ch[yy][x] == " ":
+                c.put(x, yy, "▁", grad(PAL_RUN, x / c.w - k), alpha=0.5 * (1 - k))
+        s.flush()
+        time.sleep(1 / FPS)
+    t1 = time.time()
+    while time.time() - t1 < 0.35:                 # big title dissolves
+        a = 1 - ease((time.time() - t1) / 0.35)
+        app.check_resize()
+        app.draw_title(app.title_top(), app.now(), pal=PAL_RUN, alpha=a)
+        s.flush()
+        time.sleep(1 / FPS)
+    t1 = time.time()
+    while time.time() - t1 < 0.5:                  # dashboard fades in
+        app.check_resize()
+        view.draw(fade=ease((time.time() - t1) / 0.5))
+        s.flush()
+        time.sleep(1 / FPS)
+
+
+# ───────────────────────────── summary ─────────────────────────────
+
+def summary_screen(app, res, elapsed, demo=False):
+    s = app.s
+    verdict = res["verdict"] if res else 0
+    pal = [PAL_OK, PAL_WARN, PAL_BAD][verdict]
+    glyph = [CHECK, BANG, CROSS][verdict]
+    head = ["Обновление завершено", "Готово — есть что прочитать", "Нужна проверка — не перезагружайся"][verdict]
+    n = len(res["changed"]) + len(res["added"]) if res else 0
+    stats = (f"{n} {plural(n, 'пакет', 'пакета', 'пакетов')} за {fmt_dur(elapsed)}" if res else "")
+    lines = []
+    if res:
+        lines += [("✗", p, BAD) for p in res["problems"]]
+        lines += [("⚠", w, WARN) for w in res["warnings"]]
+        lines += [("✓", o, GOOD) for o in res["ok"]]
+    countdown = verdict == 0 and not (res or {}).get("exitstatus")
+    try:
+        termios.tcflush(0, termios.TCIFLUSH)   # an Enter typed during the run/checks must not close it
+    except termios.error:
+        pass
+    t0, keep, deadline = time.time(), not countdown, time.time() + 10
+    while True:
+        app.check_resize()
+        c, t = s.canvas, time.time() - t0
+        W = min(c.w - 8, 84)
+        x0 = (c.w - W) // 2
+        top = max(1, c.h // 2 - 12)
+        gw = len(glyph[0])
+        gx = (c.w - gw) // 2
+        for ry, row in enumerate(glyph):
+            a = clamp01((t - ry * 0.06) / 0.3)
+            for i, ch in enumerate(row):
+                if ch != " ":
+                    col = grad(pal, i / gw * 0.7 + ry * 0.04 - t * 0.12)
+                    if ch in SHADOW_CHARS:
+                        col = shade(col, 0.45)
+                    c.put(gx + i, top + ry, ch, col, bold=True, alpha=a)
+        y = top + 8
+        c.cput(y, head, grad(pal, 0.2 - t * 0.1), bold=True, alpha=clamp01((t - 0.4) / 0.4))
+        if demo:
+            c.cput(y + 1, "демо-режим: это была имитация, система не менялась", DIM, alpha=clamp01((t - 0.5) / 0.4))
+        elif stats:
+            c.cput(y + 1, stats, DIM, alpha=clamp01((t - 0.5) / 0.4))
+        y += 3
+        longest = max([min(len(tx), W - 4) for _, tx, _ in lines] or [0]) + 4
+        x0 = (c.w - longest) // 2
+        for i, (icon, text, col) in enumerate(lines[: max(3, c.h - y - 6)]):
+            a = clamp01((t - 0.7 - i * 0.08) / 0.35)
+            wrapped = textwrap.wrap(text, max(10, W - 4)) or [""]
+            c.put(x0 + 2, y, icon, col, bold=True, alpha=a)
+            c.put(x0 + 4, y, wrapped[0], TEXT if icon != "✓" else DIM, alpha=a)
+            y += 1
+            for extra in wrapped[1:2]:
+                c.put(x0 + 4, y, extra, DIM, alpha=a)
+                y += 1
+        if res:
+            c.cput(c.h - 4, "журнал: " + res["log"].replace(os.path.expanduser("~"), "~"), FAINT)
+        if not keep:
+            left = max(0, deadline - time.time())
+            if left <= 0:
+                return
+            mon = "   ·   ←→ монитор" if app.monitors > 1 else ""
+            c.cput(c.h - 2, f"закроется через {int(math.ceil(left))} с   ·   Enter — закрыть{mon}   ·   "
+                            "любая клавиша — оставить", DIM)
+        else:
+            c.cput(c.h - 2, "Enter — закрыть" + ("   ·   ←→ монитор" if app.monitors > 1 else ""), DIM)
+        app.draw_toast()
+        s.flush()
+        if select.select([0], [], [], 1 / FPS)[0]:
+            try:
+                data = os.read(0, 64)
+            except OSError:
+                return
+            if not data:
+                return
+            if time.time() - t0 < 1.0:            # late typeahead: the verdict must be readable first
+                continue
+            keys = parse_keys(data)
+            if "enter" in keys:
+                return
+            moves = [k for k in keys if k in ("left", "right")]
+            for k in moves:
+                app.move_screen(k)
+            if len(moves) < len(keys):        # any other key keeps the window open
+                keep = True
+
+
+# ───────────────────────────── main ─────────────────────────────
+
+def run_auto(app):
+    view = LiveView(app, demo=DEMO)
+    transition(app, view)
+    t0 = time.time()
+    status, res, _ = engine.run_update(view, manual=False, stop_on_news=False,
+                                       cmd=DEMO_CMD if DEMO else None, dims=tuple(app.s.size),
+                                       on_spawn=lambda ch: setattr(app, "child", ch))
+    elapsed = time.time() - t0
+    if not DEMO and not view.raw and res is not None:
+        view.prog.learn()
+    if (view.game or view.hub) and not view.raw and engine.TERM_OK:
+        view.play_after()
+    return view, res, elapsed
+
+
+def run_manual(app, tty_state):
+    app.s.leave()
+    termios.tcsetattr(0, termios.TCSADRAIN, tty_state)
+    tty.setraw(0)
+    view = engine.TerminalView()
+    engine.VIEW = view
+    view.message("[arch-update] обычный Arch-Update: на вопросы отвечаешь ты. Всё пишется в журнал, "
+                 "в конце будет проверка системы.\n")
+    t0 = time.time()
+    status, res, _ = engine.run_update(view, manual=True, cmd=DEMO_CMD if DEMO else None,
+                                       dims=tuple(app.s.size), on_spawn=lambda ch: setattr(app, "child", ch))
+    return res, time.time() - t0
+
+
+def main():
+    if not sys.stdin.isatty():
+        sys.exit("arch-update-ui нужен терминал")
+    if DEMO:
+        os.environ["ARCH_UPDATE_AUTO_NOTIFY"] = "0"
+        os.environ["ARCH_UPDATE_AUTO_LOGDIR"] = os.path.join(engine.STATE_DIR, "demo-logs")
+    engine.shield_from_window_close()
+    old = termios.tcgetattr(0)
+    app = App()
+    app.child = None
+
+    def on_winch(*_):
+        app.resized = True
+        ch = getattr(app, "child", None)
+        if ch:
+            try:
+                ch.setwinsize(*reversed(shutil.get_terminal_size((120, 40))))
+            except (OSError, ValueError):
+                pass
+    signal.signal(signal.SIGWINCH, on_winch)
+    tty.setraw(0)
+    app.s.enter()
+    action, res = None, None
+    try:
+        action = app.loop()
+        if action == "auto":
+            view, res, elapsed = run_auto(app)
+            if engine.TERM_OK:
+                if view.raw:
+                    app.s.enter()
+                app.s.resize()
+                summary_screen(app, res, elapsed, demo=DEMO)
+        elif action == "manual":
+            res, elapsed = run_manual(app, old)
+            if engine.TERM_OK:
+                app.s.enter()
+                app.s.resize()
+                summary_screen(app, res, elapsed, demo=DEMO)
+    except Exception:
+        tb = traceback.format_exc()
+        try:
+            os.makedirs(engine.STATE_DIR, exist_ok=True)
+            with open(os.path.join(engine.STATE_DIR, "ui-error.log"), "a") as f:
+                f.write(time.strftime("\n== %F %T ==\n") + tb)
+        except OSError:
+            pass
+        app.s.leave()
+        try:
+            termios.tcsetattr(0, termios.TCSADRAIN, old)
+        except termios.error:
+            pass
+        print("\narch-update-ui: ошибка интерфейса (подробности в ~/.local/state/arch-update-auto/ui-error.log)")
+        print(tb)
+        if res:
+            for p in res["problems"]:
+                print("✗", p)
+            for w in res["warnings"]:
+                print("⚠", w)
+            print("✓ проблем не найдено" if not res["problems"] else "НЕ перезагружайся, пока не разберёмся")
+            print("журнал:", res["log"])
+        # Fall back to the plain updater only if the user chose an update, nothing started yet,
+        # and this is not the demo (which must never touch the system).
+        if engine.LOG is None and action in ("auto", "manual") and not DEMO and engine.TERM_OK:
+            os.environ["ARCH_UPDATE_AUTO_MODE"] = action
+            print("Запускаю обычный режим…\n")
+            os.execv(os.path.expanduser("~/.local/bin/arch-update-auto"), ["arch-update-auto"])
+        if engine.TERM_OK:
+            try:
+                input("Enter — закрыть")
+            except (EOFError, OSError):
+                pass
+        return
+    finally:
+        if engine.TERM_OK:
+            app.s.leave()
+            try:
+                termios.tcsetattr(0, termios.TCSADRAIN, old)
+            except termios.error:
+                pass
+
+
+if __name__ == "__main__":
+    main()
