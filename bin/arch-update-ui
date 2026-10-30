@@ -1185,7 +1185,7 @@ class LiveView(engine.TerminalView):
         self.best = ui_state().get("best", {})
 
     # engine hooks
-    def output(self, data, lines):
+    def output(self, data, *_):   # *_: an older engine, met mid-update, still passes its lines too
         self.raw_tail = (self.raw_tail + data)[-120_000:]
         if self.raw:
             self.out(data)

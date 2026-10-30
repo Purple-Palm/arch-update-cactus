@@ -756,7 +756,7 @@ class TerminalView:
         if LOG:
             LOG.text(msg)
 
-    def output(self, data, lines):
+    def output(self, data):
         self.out(data)
 
     def bell(self):
@@ -1198,7 +1198,6 @@ def pump(child, responder, auto):
     stdin_open = TERM_OK
     last_out, pending = time.time(), auto   # after a fallback a question may already be waiting
     forced = False
-    feed = Feed()
     while True:
         fds = [child.child_fd] + ([0] if stdin_open and TERM_OK else [])
         try:
@@ -1213,7 +1212,7 @@ def pump(child, responder, auto):
             if not data:
                 return
             LOG.output(data)
-            VIEW.output(data, feed.push(data))
+            VIEW.output(data)
             if auto:
                 responder.feed(data)
                 last_out, pending = time.time(), True
