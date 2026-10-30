@@ -10,7 +10,7 @@
 От своего пользователя, не от root:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/@REPO@/stable/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Purple-Palm/arch-update-cactus/stable/install.sh | bash
 ```
 
 Установщик сам поставит что нужно (спросит пароль sudo), подберёт терминал, включит значок

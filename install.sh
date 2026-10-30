@@ -2,7 +2,7 @@
 # Arch Update by Cactus — installer.
 #
 # First install on a machine (Arch Linux, as your normal user, not root):
-#   curl -fsSL https://raw.githubusercontent.com/@REPO@/stable/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Purple-Palm/arch-update-cactus/stable/install.sh | bash
 #
 #   install.sh             install or repair: packages, files, tray icon, timers (asks before installing)
 #   install.sh --sync      refresh the installed files after a self-update (no packages, no questions)
@@ -13,7 +13,7 @@
 # ~/.local/bin entries are symlinks into it, so a self-update replaces the whole thing at once.
 set -euo pipefail
 
-REPO=@REPO@
+REPO=Purple-Palm/arch-update-cactus
 BRANCH=stable
 DEST=$HOME/.local/share/arch-update-cactus
 DEST_REAL=$(realpath -m "$DEST")              # compared with this script's real path
