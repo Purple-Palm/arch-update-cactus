@@ -41,7 +41,8 @@ except Exception as e:      # no python-pexpect, a damaged file…: the update i
     print(f"arch-update-ui: не загрузился движок апдейтера: {e!r}")
     print("Если не хватает pexpect: sudo pacman -S --needed python-pexpect")
     try:
-        if "--self-test" not in sys.argv and input("Enter — обычный arch-update, q — выход: ").strip() not in ("q", "й"):
+        if "--self-test" not in sys.argv and "--demo" not in sys.argv and \
+                input("Enter — обычный arch-update, q — выход: ").strip() not in ("q", "й"):
             os.execvp("arch-update", ["arch-update"])
     except (EOFError, KeyboardInterrupt, OSError):
         pass
@@ -310,7 +311,7 @@ class Screen:
     def flush(self):
         c = self.canvas
         rows = c.rows()
-        buf = ["\x1b[?2026h"]
+        buf = ["\x1b[?2026h\x1b[0m"]
         for y, r in enumerate(rows):
             if c.prev[y] != r:
                 buf.append(f"\x1b[{y + 1};1H{r}")
@@ -389,7 +390,8 @@ def save_ui_state(**kw):
 
 
 def konsole_pid():
-    """PID of the Konsole window we run in (an ancestor process named konsole)."""
+    """PID of the Konsole window the launcher opened for us (an ancestor konsole started with the
+    ArchUpdate profile). Started by hand from another Konsole, we never move that window."""
     pid = os.getpid()
     for _ in range(8):
         try:
@@ -397,7 +399,8 @@ def konsole_pid():
                 ppid = int(f.read().rsplit(")", 1)[1].split()[1])
             with open(f"/proc/{ppid}/comm") as f:
                 if f.read().strip() == "konsole":
-                    return ppid
+                    with open(f"/proc/{ppid}/cmdline", "rb") as fc:
+                        return ppid if b"ArchUpdate" in fc.read().split(b"\0") else None
             pid = ppid
         except (OSError, ValueError, IndexError):
             return None
@@ -676,7 +679,7 @@ class App:
         """Packages after which the screen may freeze for a while: the NVIDIA driver, or a kernel
         while the NVIDIA DKMS module has to be rebuilt for it."""
         if self._risky is None:
-            kernels = set(engine.kernel_packages()) if engine.dkms_built().get("nvidia") else set()
+            kernels = set(engine.kernel_packages()) if "nvidia" in engine.dkms_built() else set()
             self._risky = lambda n: bool(engine.NVIDIA_PKGS.match(n)) or n in kernels
         return self._risky
 
@@ -841,7 +844,7 @@ class App:
             c.put(hx + i, y, ch, grad(pal, i / len(head) * 0.7 - t * 0.12), bold=True, alpha=alpha)
 
     def draw_menu(self):
-        c, t = self.s.canvas, self.now()
+        c, t = self.s.canvas, math.floor(self.now() * 10) / 10    # colour flow at 10 fps: cheaper frames
         BACKDROP.draw(c, t, PAL_ARCH)
         mt = time.time() - self.menu_t
         L = self.menu_layout()
@@ -993,7 +996,7 @@ class App:
         c.put(x0 + 3, y0 + h - 2, hint, DIM, bg=hexrgb("#121726"))
 
     def draw_news(self):
-        c, t = self.s.canvas, self.now()
+        c, t = self.s.canvas, math.floor(self.now() * 10) / 10
         W = min(c.w - 8, 100)
         x0 = (c.w - W) // 2
         if self.article is None:
@@ -1005,7 +1008,9 @@ class App:
                     for xx in range(W):
                         c.fill_bg(x0 + xx, y, 1, shade(grad(PAL_ARCH, xx / W * 0.5 - t * 0.1), 0.45))
                 tag = "  NEW" if item["new"] else ""
-                title = item["title"][:W - 14 - len(tag)]
+                title = item["title"]
+                if len(title) > W - 14 - len(tag):
+                    title = title[:W - 15 - len(tag)] + "…"
                 c.put(x0 + 1, y, ("▸ " if sel else "  ") + ru_date(item["date"]).ljust(7) + title,
                       (255, 255, 255) if sel else TEXT, bold=sel)
                 if tag:
@@ -1037,12 +1042,13 @@ class App:
             if len(body) > view_h:
                 c.put(x0 + W + 2, y, "▲" if self.scroll else " ", DIM)
                 c.put(x0 + W + 2, y + view_h - 1, "▼" if self.scroll + view_h < len(body) else " ", DIM)
-        self.hint("↑↓ прокрутка", "←→ страница", "Esc назад")
+        self.footer("↑↓ прокрутка   ←→ страница   Esc назад")       # here ←→ page, never move the window
         self.draw_toast()
 
     # ── input
     def handle(self, key):
-        if key in ("left", "right") and not self.confirm and self.monitors > 1:
+        if key in ("left", "right") and not self.confirm and self.monitors > 1 and \
+                not (self.state == "news" and self.article is not None):
             self.move_screen(key)
             return None
         if self.state == "splash":
@@ -1652,7 +1658,8 @@ def summary_view(res, elapsed):
         lines += [("✓", o, GOOD) for o in res["ok"]]
     return types.SimpleNamespace(
         verdict=verdict, pal=[PAL_OK, PAL_WARN, PAL_BAD][verdict], glyph=[CHECK, BANG, CROSS][verdict],
-        head=["Обновление завершено", "Готово — есть что прочитать", "Нужна проверка — не перезагружайся"][verdict],
+        head=(res or {}).get("head") or
+        ["Обновление завершено", "Готово — есть что прочитать", "Нужна проверка — не перезагружайся"][verdict],
         stats=f"{n} {plural(n, 'пакет', 'пакета', 'пакетов')} за {fmt_dur(elapsed)}" if res else "",
         lines=lines, log=res["log"] if res else None)
 
@@ -1733,7 +1740,7 @@ def summary_screen(app, res, elapsed, demo=False):
             keys = parse_keys(data)
             if "enter" in keys:
                 return
-            moves = [k for k in keys if k in ("left", "right")]
+            moves = [k for k in keys if k in ("left", "right")] if app.monitors > 1 else []
             for k in moves:
                 app.move_screen(k)
             if len(moves) < len(keys):        # any other key keeps the window open
@@ -1746,6 +1753,8 @@ def self_test():
     """Draw every screen off-screen at laptop and desktop sizes: no terminal, no network, no change
     to the system. install.sh --check runs it before a machine accepts a self-update, so a version
     that cannot draw itself never goes live."""
+    global save_ui_state
+    save_ui_state = lambda **kw: None          # noqa: E731 — the user's ui.json is never touched
     Screen.write = lambda self, s: None
     app = App(live=False)
     app.repo = [("linux", "6.18.1-1", "6.18.2-1"), ("mesa", "1:26.2.5-1", "1:26.2.6-1")] + \
@@ -1817,7 +1826,7 @@ def run_auto(app):
                                        cmd=DEMO_CMD if DEMO else None, dims=tuple(app.s.size),
                                        on_spawn=lambda ch: setattr(app, "child", ch), demo=DEMO)
     elapsed = time.time() - t0
-    if not DEMO and not view.raw and res is not None and status is not None:
+    if not DEMO and not view.raw and res is not None and res.get("started", True):
         view.prog.learn()
     if (view.game or view.hub) and not view.raw and engine.TERM_OK:
         view.play_after()

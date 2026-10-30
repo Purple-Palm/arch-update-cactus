@@ -4,4 +4,6 @@ Description=Arch Update by Cactus: install the newest tested version
 [Service]
 Type=oneshot
 ExecStart=%h/.local/bin/arch-update-cactus-sync
+# 10: a new version was installed
+SuccessExitStatus=10
 Nice=10

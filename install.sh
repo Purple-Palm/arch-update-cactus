@@ -16,12 +16,14 @@ set -euo pipefail
 REPO=@REPO@
 BRANCH=stable
 DEST=$HOME/.local/share/arch-update-cactus
+DEST_REAL=$(realpath -m "$DEST")              # compared with this script's real path
 BIN=$HOME/.local/bin
 APPS=$HOME/.local/share/applications
 UNITS=$HOME/.config/systemd/user
 STATE=$HOME/.local/state/arch-update-auto
 BACKUP=$STATE/backup-$(date +%F_%H-%M-%S)
 PROGRAMS=(arch-update-launcher arch-update-ui arch-update-auto arch-update-cactus-sync)
+MENU_NEW=0
 
 say() { printf '\e[1;36m::\e[0m %s\n' "$*"; }
 warn() { printf '\e[1;33m!!\e[0m %s\n' "$*" >&2; }
@@ -30,14 +32,16 @@ die() {
 	exit 1
 }
 
+# Where this script lives; empty when it is piped from curl.
+SRC=${BASH_SOURCE[0]-}
+ROOT=
+
 # ── bootstrap: piped from curl, or started from some other copy → work from the real checkout ──
 
-src=${BASH_SOURCE[0]-}
-ROOT=
-[[ -n $src && -f $src ]] && ROOT=$(cd "$(dirname "$(realpath "$src")")" && pwd)
-if [[ -z ${1-} && $ROOT != "$DEST" ]]; then
+bootstrap() {
 	[[ $EUID -ne 0 ]] || die "запусти от своего пользователя, не от root (sudo спросится сам, когда понадобится)"
 	command -v pacman >/dev/null || die "это не Arch Linux: нет pacman"
+	[[ ! -L $DEST ]] || die "$DEST — ссылка (на копию для разработки?), её не трогаю"
 	if ! command -v git >/dev/null; then
 		say "нужен git — ставлю"
 		{ sudo pacman -S --needed git; } </dev/tty
@@ -53,7 +57,7 @@ if [[ -z ${1-} && $ROOT != "$DEST" ]]; then
 		exec bash "$DEST/install.sh" "$@" </dev/tty   # curl | bash took stdin: give the questions a keyboard back
 	fi
 	exec bash "$DEST/install.sh" "$@"
-fi
+}
 
 # ── pieces ──
 
@@ -111,6 +115,7 @@ install_files() {
 	fi
 	# Menu entry. It overrides arch-update's own one, so the tray icon, its notification
 	# and any panel pin all open our launcher.
+	[[ -e $APPS/arch-update.desktop ]] || MENU_NEW=1
 	sed "s|@LAUNCHER@|$BIN/arch-update-launcher|" "$ROOT/share/arch-update.desktop.in" |
 		put "$APPS/arch-update.desktop" && changed=1
 	# Konsole profile (copies: Konsole rewrites profiles it is asked to edit).
@@ -131,19 +136,37 @@ install_files() {
 	return 0
 }
 
+# Every step decides (set -e is off inside a function called from "||").
 self_check() {
 	local f
-	for f in install.sh bin/arch-update-launcher bin/arch-update-cactus-sync; do
-		bash -n "$ROOT/$f"
+	for f in install.sh bin/arch-update-launcher bin/arch-update-cactus-sync lib/demo-update; do
+		bash -n "$ROOT/$f" || return 1
 	done
-	python3 -m py_compile "$ROOT/bin/arch-update-ui" "$ROOT/bin/arch-update-auto" "$ROOT/lib/engine.py" "$ROOT/lib/games.py"
-	python3 "$ROOT/bin/arch-update-ui" --self-test
+	python3 -m py_compile "$ROOT/bin/arch-update-ui" "$ROOT/bin/arch-update-auto" "$ROOT/lib/engine.py" \
+		"$ROOT/lib/games.py" || return 1
+	python3 "$ROOT/bin/arch-update-ui" --self-test || return 1
+}
+
+# Build and install one AUR package with plain makepkg (asks for sudo itself).
+makepkg_aur() {
+	local tmp
+	tmp=$(mktemp -d)
+	git clone --quiet "https://aur.archlinux.org/$1.git" "$tmp/$1"
+	(cd "$tmp/$1" && makepkg -si --needed)
+	rm -rf "$tmp"
 }
 
 install_packages() {
-	local want=(git python python-pexpect pacman-contrib ttf-hack) missing=() p
+	local want=(git python python-pexpect pacman-contrib libnotify ttf-hack) missing=() p cp
 	for p in "${want[@]}"; do
 		pacman -Q "$p" >/dev/null 2>&1 || missing+=("$p")
+	done
+	# ✓ ✗ ⚠ ✦ and the spinner come from fallback fonts (Hack lacks them)
+	for cp in 2713 2717 26a0 2726 280b; do
+		if [[ -z $(fc-list ":charset=$cp" family 2>/dev/null) ]]; then
+			missing+=(noto-fonts)
+			break
+		fi
 	done
 	if ! "$ROOT/bin/arch-update-launcher" --terminal >/dev/null; then
 		missing+=(kitty)
@@ -153,22 +176,19 @@ install_packages() {
 		sudo pacman -S --needed "${missing[@]}" ||
 			die "pacman не смог поставить пакеты. Если он не нашёл их на зеркале — сначала обнови систему: sudo pacman -Syu"
 	fi
-	command -v arch-update >/dev/null && return 0
-	# arch-update itself comes from the AUR: the prebuilt -bin package where there is one.
-	local pkg=arch-update helper
-	[[ $(uname -m) == x86_64 ]] && pkg=arch-update-bin
-	if helper=$(aur_helper); then
-		say "ставлю $pkg из AUR через $helper"
-		"$helper" -S --needed "$pkg"
-	else
-		say "ставлю $pkg из AUR (makepkg)"
+	# AUR packages: yay, as on the main machine (the auto-answers know its questions best)
+	local helper
+	if ! helper=$(aur_helper); then
+		say "ставлю yay (помощник для пакетов из AUR)"
 		sudo pacman -S --needed base-devel
-		local tmp
-		tmp=$(mktemp -d)
-		git clone --quiet "https://aur.archlinux.org/$pkg.git" "$tmp/$pkg"
-		(cd "$tmp/$pkg" && makepkg -si)
-		rm -rf "$tmp"
+		makepkg_aur yay-bin
+		helper=yay
 	fi
+	command -v arch-update >/dev/null && return 0
+	local pkg=arch-update
+	[[ $(uname -m) == x86_64 ]] && pkg=arch-update-bin      # prebuilt; elsewhere it is built from source
+	say "ставлю $pkg из AUR через $helper"
+	"$helper" -S --needed "$pkg"
 	command -v arch-update >/dev/null || die "arch-update не установился"
 }
 
@@ -176,17 +196,31 @@ setup_arch_update() {
 	local conf=$HOME/.config/arch-update/arch-update.conf helper
 	if [[ ! -f $conf ]]; then
 		arch-update --gen-config >/dev/null
-		# Same choices as on the main machine: no Flatpak, two old versions kept in the cache, light tray icon.
-		sed -i -e 's/^#NoFlatpak$/NoFlatpak/' -e 's/^#KeepOldPackages=.*/KeepOldPackages=2/' \
-			-e 's/^#TrayIconStyle=.*/TrayIconStyle=light/' "$conf"
+		# As on the main machine: two old versions stay in the package cache; yay for the AUR.
+		sed -i -e 's/^#KeepOldPackages=.*/KeepOldPackages=2/' "$conf"
 		if helper=$(aur_helper); then
 			sed -i "s/^#AURHelper=.*/AURHelper=$helper/" "$conf"
 		fi
 	fi
-	[[ -f $HOME/.config/autostart/arch-update-tray.desktop ]] || arch-update --tray --enable >/dev/null
+	if grep -qE '^[[:space:]]*NoVersion' "$conf"; then
+		warn "в $conf включён NoVersion: без версий апдейтер не увидит список обновлений — закомментируй его"
+	fi
+	[[ -f $HOME/.config/autostart/arch-update-tray.desktop ]] || arch-update --tray --enable >/dev/null || true
 	systemctl --user enable --now --quiet arch-update.timer 2>/dev/null || true
-	# Start the tray icon now, unless it already runs (it reads our menu entry only when it starts).
-	if ! pgrep -xu "$USER" arch-update-tra >/dev/null; then
+	# The tray picks the menu entry's file once, when it starts: one that started before our
+	# entry existed keeps opening the plain arch-update until it is restarted.
+	local unit='app-arch\x2dupdate\x2dtray@autostart.service'
+	if pgrep -xu "$USER" arch-update-tra >/dev/null; then
+		if ((MENU_NEW)); then
+			if systemctl --user --quiet is-active "$unit" 2>/dev/null; then
+				systemctl --user restart "$unit"
+			else
+				pkill -xu "$USER" arch-update-tra || true
+				sleep 1
+				setsid -f arch-update --tray >/dev/null 2>&1 </dev/null || true
+			fi
+		fi
+	else
 		setsid -f arch-update --tray >/dev/null 2>&1 </dev/null || true
 	fi
 }
@@ -196,11 +230,15 @@ report() {
 	term=$("$ROOT/bin/arch-update-launcher" --terminal 2>/dev/null || echo "не найден")
 	say "готово: Arch Update by Cactus $(git -C "$ROOT" log -1 --format='%h от %cd' --date=format:%d.%m.%Y)"
 	echo "   окружение: $de · терминал: $term · AUR: $(aur_helper || echo нет)"
-	echo "   запуск: иконка Arch-Update в трее или меню приложений; демо: arch-update-launcher --demo"
-	echo "   новые версии приезжают сами (раз в час и после входа): systemctl --user status arch-update-cactus-sync.timer"
+	echo "   запуск: иконка Arch-Update в трее или меню приложений; демо: ~/.local/bin/arch-update-launcher --demo"
+	echo "   новые версии приезжают сами (раз в час, после входа и при запуске); проверить сейчас:"
+	echo "   ~/.local/bin/arch-update-cactus-sync"
 	if [[ $de == *GNOME* ]] && ! pacman -Q gnome-shell-extension-appindicator >/dev/null 2>&1; then
 		warn "в GNOME значок в трее появится только с расширением AppIndicator:"
 		warn "  sudo pacman -S gnome-shell-extension-appindicator, затем перелогинься и включи его в «Расширениях»"
+	fi
+	if [[ $de == "?" ]]; then
+		warn "окружение без автозапуска? добавь в автозапуск своего WM: sleep 3 && arch-update --tray"
 	fi
 }
 
@@ -208,6 +246,7 @@ uninstall() {
 	local p
 	if systemctl --user show-environment >/dev/null 2>&1; then
 		systemctl --user disable --now --quiet arch-update-cactus-sync.timer 2>/dev/null || true
+		systemctl --user clean --what=state arch-update-cactus-sync.timer 2>/dev/null || true
 	fi
 	rm -f "$UNITS/arch-update-cactus-sync.service" "$UNITS/arch-update-cactus-sync.timer"
 	systemctl --user daemon-reload 2>/dev/null || true
@@ -220,17 +259,32 @@ uninstall() {
 	say "Папку можно убрать вручную: rm -rf $DEST"
 }
 
-case ${1-} in
---sync) install_files ;;
---check) self_check ;;
---uninstall) uninstall ;;
-"")
-	[[ $EUID -ne 0 ]] || die "запусти от своего пользователя, не от root"
-	install_packages
-	self_check || die "самопроверка не прошла — установка остановлена"
-	install_files
-	setup_arch_update
-	report
-	;;
-*) die "неизвестный параметр: $1 (есть --sync, --check, --uninstall)" ;;
-esac
+main() {
+	[[ -n $SRC && -f $SRC ]] && ROOT=$(cd "$(dirname "$(realpath "$SRC")")" && pwd)
+	if [[ -z ${1-} && $ROOT != "$DEST_REAL" ]]; then
+		bootstrap "$@"
+	fi
+	[[ -n $ROOT ]] || die "${1-}: запускай этот режим из папки апдейтера: $DEST/install.sh ${1-}"
+	case ${1-} in
+	--sync)
+		# only the installed copy: from a development clone it would point the machine at that clone
+		[[ $ROOT == "$DEST_REAL" ]] || die "--sync только для установленной копии: $DEST/install.sh --sync"
+		install_files
+		;;
+	--check) self_check ;;
+	--uninstall) uninstall ;;
+	"")
+		[[ $EUID -ne 0 ]] || die "запусти от своего пользователя, не от root"
+		install_packages
+		self_check || die "самопроверка не прошла — установка остановлена"
+		install_files
+		git -C "$ROOT" rev-parse HEAD >"$STATE/sync.ok"     # this version passed here
+		setup_arch_update
+		report
+		;;
+	*) die "неизвестный параметр: $1 (есть --sync, --check, --uninstall)" ;;
+	esac
+}
+
+# Last line on purpose: a download cut short by the network never runs half an installer.
+main "$@"

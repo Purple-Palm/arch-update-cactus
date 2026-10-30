@@ -86,39 +86,53 @@ class Prompts(unittest.TestCase):
 
 
 class Machine(unittest.TestCase):
-    """A fake /usr/lib/modules and /etc/mkinitcpio.d per test."""
+    """A fake /usr/lib/modules, /etc/mkinitcpio.d, /usr/src and power supplies per test; pacman
+    "owns" the module directories registered with kernel()."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        self.saved = engine.MODULES_DIR, engine.PRESET_DIR, engine.run
+        self.saved = engine.MODULES_DIR, engine.PRESET_DIR, engine.DKMS_SRC, engine.POWER_DIR, engine.run
         engine.MODULES_DIR = os.path.join(self.tmp, "modules")
         engine.PRESET_DIR = os.path.join(self.tmp, "presets")
+        engine.DKMS_SRC = os.path.join(self.tmp, "src")
+        engine.POWER_DIR = os.path.join(self.tmp, "power")
         os.makedirs(engine.PRESET_DIR)
         self.dkms = ""
+        self.owners = {}
         real_run = engine.run
 
         def fake_run(cmd, *a, **k):
             if cmd[0] == "dkms":
                 return self.dkms
-            if cmd[0] in ("sudo", "systemctl", "pacdiff", "pgrep"):
+            if cmd[:2] == ["pacman", "-Qo"]:
+                return "".join(f"{f} is owned by {self.owners[f]} 1.0-1\n" for f in cmd[2:] if f in self.owners)
+            if cmd[0] in ("sudo", "systemctl", "pacdiff", "pgrep", "findmnt"):
                 return ""
             return real_run(cmd, *a, **k)
         engine.run = fake_run
         engine.LOG = engine.RunLog()
 
     def tearDown(self):
-        engine.MODULES_DIR, engine.PRESET_DIR, engine.run = self.saved
+        engine.MODULES_DIR, engine.PRESET_DIR, engine.DKMS_SRC, engine.POWER_DIR, engine.run = self.saved
         engine.LOG.txt.close()
         engine.LOG.raw.close()
 
-    def kernel(self, pkg, kver, preset=None):
+    def kernel(self, pkg, kver, preset=None, owned=True):
         d = os.path.join(engine.MODULES_DIR, kver)
         os.makedirs(d)
-        with open(os.path.join(d, "pkgbase"), "w") as f:
-            f.write(pkg + "\n")
+        open(os.path.join(d, "modules.builtin"), "w").close()
+        if owned:
+            self.owners[os.path.join(d, "modules.builtin")] = pkg
         if preset is not None:
             with open(os.path.join(engine.PRESET_DIR, pkg + ".preset"), "w") as f:
                 f.write(preset)
+
+    def supply(self, name, **files):
+        d = os.path.join(engine.POWER_DIR, name)
+        os.makedirs(d)
+        for k, v in files.items():
+            with open(os.path.join(d, k), "w") as f:
+                f.write(f"{v}\n")
 
     def boot_file(self, name, data=b"x" * 64, mode=0o644):
         path = os.path.join(self.tmp, name)
@@ -134,7 +148,8 @@ class Machine(unittest.TestCase):
         self.dkms = ("nvidia/615.78, 7.2.11-arch1-1, x86_64: installed\n"
                      "v4l2loopback, 0.13, 7.2.11-arch1-1, x86_64: installed\n"
                      "zfs/2.3: added\n")
-        self.assertEqual(engine.dkms_built(), {"nvidia": {"7.2.11-arch1-1"}, "v4l2loopback": {"7.2.11-arch1-1"}})
+        self.assertEqual(engine.dkms_built(), {"nvidia": {"7.2.11-arch1-1"}, "v4l2loopback": {"7.2.11-arch1-1"},
+                                               "zfs": set()})
 
     def test_preset_files(self):
         self.kernel("linux-lts", "6.12.50-1-lts", 'ALL_kver="/boot/vmlinuz-linux-lts"\n'
@@ -172,6 +187,44 @@ class Machine(unittest.TestCase):
         r = self.checks()
         self.assertTrue(any("NVIDIA не собран под ядро 7.2.12-arch1-1" in p for p in r["problems"]), r["problems"])
 
+    def test_failed_nvidia_build_on_the_only_kernel(self):
+        # the dkms hook never fails pacman; the old kernel's build is gone, the new one didn't build
+        self.kernel("linux", "7.2.12-arch1-1")
+        self.dkms = "nvidia/615.78.08: added\n"
+        r = self.checks()
+        self.assertTrue(any("NVIDIA не собран под ядро 7.2.12-arch1-1" in p for p in r["problems"]), r["problems"])
+
+    def test_module_limited_to_other_kernels_is_not_missing(self):
+        self.kernel("linux", "7.2.12-arch1-1")
+        self.kernel("linux-lts", "6.12.50-1-lts")
+        self.dkms = "lts-only/1.0, 6.12.50-1-lts, x86_64: installed\n"
+        os.makedirs(os.path.join(engine.DKMS_SRC, "lts-only-1.0"))
+        with open(os.path.join(engine.DKMS_SRC, "lts-only-1.0", "dkms.conf"), "w") as f:
+            f.write('PACKAGE_NAME="lts-only"\nBUILD_EXCLUSIVE_KERNEL="^6\\.12"\n')
+        r = self.checks()
+        self.assertFalse(any("lts-only" in p for p in r["problems"]), r["problems"])
+
+    def test_kernels_are_found_by_owner_not_by_leftover_directories(self):
+        self.kernel("linux", "7.2.12-arch1-1")
+        self.kernel("linux", "7.2.11-arch1-1", owned=False)     # kernel-modules-hook's copy of the old one
+        self.assertEqual(engine.kernel_packages(), {"linux": "7.2.12-arch1-1"})
+
+    def test_running_kernel_replaced_asks_for_a_reboot(self):
+        self.kernel("linux", "0.0.1-not-the-running-one")
+        r = self.checks()
+        self.assertTrue(any("ядро обновилось" in w for w in r["warnings"]), r["warnings"])
+
+    def test_without_known_kernels_arch_updates_reboot_note_counts(self):
+        r = engine.system_checks({}, 0, types.SimpleNamespace(failures=set(), notes={"reboot"}), 0)
+        self.assertTrue(any("перезагруз" in w for w in r["warnings"]), r["warnings"])
+
+    def test_only_the_machines_own_battery_counts(self):
+        self.supply("hidpp_battery_0", type="Battery", scope="Device", capacity=18, status="Discharging")
+        self.supply("AC", type="Mains", online=1)
+        self.assertIsNone(engine.battery())
+        self.supply("BAT0", type="Battery", capacity=64, status="Charging")
+        self.assertEqual(engine.battery(), (64, False))
+
     def test_no_dkms_no_nvidia_lines(self):
         self.kernel("linux", "7.2.11-arch1-1")
         r = self.checks()
@@ -183,7 +236,7 @@ class SudoOnce(unittest.TestCase):
     the handover; the run then continues with a fresh ticket and its exit status comes through."""
 
     def test_password_once_then_the_update_runs(self):
-        tmp = tempfile.mkdtemp()
+        tmp = self.tmp = tempfile.mkdtemp()
         os.makedirs(os.path.join(tmp, "bin"))
         scripts = {
             # fake sudo: "-n …" succeeds only with a ticket, "-v" asks for the password
@@ -239,6 +292,18 @@ class SudoOnce(unittest.TestCase):
         self.assertIn("ticket ok", log)
         self.assertIn("answer=y", log)
         self.assertNotIn("secret", log)
+
+        # a refused password: nothing has started, and the summary says exactly that
+        View.asked.clear()
+        os.remove(os.path.join(self.tmp, "ticket"))
+        View.handover = lambda self, why, line: (View.asked.append(why), engine.RESPONDER.user_input(b"wrong\r"))
+        status, res, _ = engine.run_update(View(), cmd="fake-update", summary=True)
+        engine.LOG.txt.close()
+        engine.LOG.raw.close()
+        self.assertEqual(status, 125)
+        self.assertFalse(res["started"])
+        self.assertEqual(res["problems"], [])
+        self.assertIn("не начиналось", res["warnings"][0])
 
 
 if __name__ == "__main__":

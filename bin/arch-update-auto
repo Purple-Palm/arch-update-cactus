@@ -41,7 +41,9 @@ def print_summary(res):
         say(f"✗ {p}\n", C_RED)
     for w in res["warnings"]:
         say(f"⚠ {w}\n", C_YEL)
-    if res["verdict"] == 0:
+    if res.get("head"):
+        say(f"{res['head']}.\n", C_YEL)
+    elif res["verdict"] == 0:
         say("✓ Всё прошло чисто, перезагрузка не нужна.\n", C_GRN)
     elif res["verdict"] == 1:
         say("✓ Обновление прошло нормально.\n", C_GRN)

@@ -10,7 +10,7 @@
 # installed from TERMINALS. The UI paints its own colours, so any of them looks the same.
 BIN=$(dirname "$(realpath "$0")")
 TERMINALS=(konsole kitty alacritty foot wezterm ptyxis gnome-terminal kgx xfce4-terminal mate-terminal
-	lxterminal tilix terminator xterm)
+	xdg-terminal-exec terminator tilix lxterminal xterm)
 BG='#0b0e17' FG='#c9d1e3' TITLE='Arch Update'
 
 pick_terminal() {
@@ -33,15 +33,18 @@ terminal_cmd() {
 	alacritty) printf '%s\n' alacritty --class arch-update --title "$TITLE" -o 'window.startup_mode="Fullscreen"' \
 		-o "colors.primary.background=\"$BG\"" -o "colors.primary.foreground=\"$FG\"" \
 		-o 'window.padding={x=20,y=20}' -o font.size=13 -e "$@" ;;
-	foot) printf '%s\n' foot --fullscreen --title "$TITLE" --app-id arch-update -o "colors.background=${BG#\#}" \
-		-o "colors.foreground=${FG#\#}" -o pad=20x20 "$@" ;;
-	wezterm) printf '%s\n' wezterm start --class arch-update -- "$@" ;;
-	ptyxis) printf '%s\n' ptyxis --new-window --fullscreen -x "$*" ;;
+	foot) printf '%s\n' foot --fullscreen --title "$TITLE" --app-id arch-update -o "colors-dark.background=${BG#\#}" \
+		-o "colors-dark.foreground=${FG#\#}" -o pad=20x20 "$@" ;;
+	wezterm) printf '%s\n' wezterm start --always-new-process --class arch-update -- "$@" ;;
+	ptyxis) printf '%s\n' ptyxis --fullscreen --title="$TITLE" -- "$@" ;;
 	gnome-terminal) printf '%s\n' gnome-terminal --full-screen --hide-menubar --title "$TITLE" -- "$@" ;;
-	kgx) printf '%s\n' kgx --title "$TITLE" -e "$@" ;;
-	xfce4-terminal) printf '%s\n' xfce4-terminal --fullscreen --hide-menubar --hide-toolbar --hide-scrollbar \
-		--title "$TITLE" -x "$@" ;;
-	mate-terminal) printf '%s\n' mate-terminal --full-screen --hide-menubar --title "$TITLE" -x "$@" ;;
+	kgx) printf '%s\n' kgx --title "$TITLE" -- "$@" ;;
+	xfce4-terminal) printf '%s\n' xfce4-terminal --disable-server --fullscreen --hide-menubar --hide-toolbar \
+		--hide-scrollbar -T "$TITLE" --color-bg="$BG" --color-text="$FG" -x "$@" ;;
+	mate-terminal) printf '%s\n' mate-terminal --full-screen --hide-menubar -t "$TITLE" -x "$@" ;;
+	xdg-terminal-exec) printf '%s\n' xdg-terminal-exec "$@" ;;
+	terminator) printf '%s\n' terminator --fullscreen -T "$TITLE" -x "$@" ;;
+	tilix | lxterminal) printf '%s\n' "$t" -t "$TITLE" -e "$*" ;;
 	xterm) printf '%s\n' xterm -fullscreen -bg "$BG" -fg "$FG" -fa Hack -fs 13 -T "$TITLE" -e "$@" ;;
 	*) printf '%s\n' "$t" -e "$@" ;;
 	esac

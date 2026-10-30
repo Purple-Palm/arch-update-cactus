@@ -23,13 +23,15 @@ jobs:
       - uses: actions/checkout@v4
       - name: Lint shell scripts
         run: shellcheck install.sh bin/arch-update-launcher bin/arch-update-cactus-sync
+      - name: No unfilled placeholders
+        run: "! grep -n '@REPO@' install.sh README.md"
       - name: Self-test
         run: ./install.sh --check
       - name: Engine tests and headless runs at laptop and desktop terminal sizes
         run: |
           useradd -m tester
           chown -R tester: .
-          su tester -c 'python3 tests/test_engine.py && python3 tests/run.py'
+          su tester -c 'python3 tests/test_engine.py && python3 tests/test_sync.py && python3 tests/run.py'
 
   promote:
     needs: test
@@ -43,8 +45,14 @@ jobs:
           fetch-depth: 0
       - name: Fast-forward stable to the tested commit
         run: |
-          if git fetch -q origin stable && ! git merge-base --is-ancestor FETCH_HEAD "$GITHUB_SHA"; then
-            echo "stable is already past this commit; nothing to do"
-            exit 0
+          if git fetch -q origin stable; then
+            if git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+              echo "stable already contains this commit (a newer push was promoted first)"
+              exit 0
+            fi
+            if ! git merge-base --is-ancestor FETCH_HEAD "$GITHUB_SHA"; then
+              echo "::error::main and stable have diverged (was main force-pushed?); the machines stay on stable"
+              exit 1
+            fi
           fi
           git push origin "$GITHUB_SHA:refs/heads/stable"

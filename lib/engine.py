@@ -80,7 +80,9 @@ UNKNOWN_PROMPT = re.compile(
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>78]")
 FAILURE_MARKERS = re.compile(r"Initcpio image generation FAILED|error: command failed to execute correctly"
                              r"|An error has occurred during the update process"
-                             r"|invalid or corrupted package \(PGP signature\)|is unknown trust|is marginal trust", re.I)
+                             r"|invalid or corrupted package \(PGP signature\)|is unknown trust|is marginal trust"
+                             r"|You can do this later by running: #? ?dd if=\S+ of=\S+", re.I)
+KERNEL_FLASH = re.compile(r"dd if=\S+ of=\S+")   # depthcharge kernels (ARM Chromebooks): flash by hand
 KEYRING_TROUBLE = re.compile(r"PGP signature|unknown trust|marginal trust", re.I)
 
 SETTLE = 0.3        # seconds of silence before we treat the current line as a question
@@ -88,8 +90,10 @@ UNKNOWN_IDLE = 12   # seconds of silence on a question-looking line before handi
 STALL_IDLE = 120    # seconds of silence on any prompt-ish line (ends in : ? ] >) before handing over anyway
 KEEP_LOGS = 30
 PACMAN_LOCK = "/var/lib/pacman/db.lck"
-MODULES_DIR = "/usr/lib/modules"          # one directory per installed kernel, with a "pkgbase" file
+MODULES_DIR = "/usr/lib/modules"          # one directory per installed kernel
 PRESET_DIR = "/etc/mkinitcpio.d"
+DKMS_SRC = "/usr/src"
+POWER_DIR = "/sys/class/power_supply"
 STATE_DIR = os.path.expanduser("~/.local/state/arch-update-auto")
 REBOOT_PKGS = re.compile(
     r"^(linux(?:-lts|-zen|-hardened)?|linux-firmware.*|nvidia.*|lib32-nvidia-utils|opencl-nvidia|"
@@ -132,14 +136,17 @@ def pacman_busy():
 
 
 def kernel_packages():
-    """{package: kernel version} of the installed kernels (linux, linux-lts, linux-aarch64 …)."""
+    """{package: kernel version} of the installed kernels (linux, linux-lts, linux-aarch64 …): the
+    packages owning a /usr/lib/modules/<version>/modules.builtin. A copy nobody owns (the running
+    kernel kept by kernel-modules-hook after an upgrade) doesn't count."""
+    files = sorted(glob.glob(os.path.join(MODULES_DIR, "*", "modules.builtin")))
     kernels = {}
-    for f in glob.glob(os.path.join(MODULES_DIR, "*", "pkgbase")):
-        try:
-            with open(f) as fh:
-                kernels[fh.read().strip()] = os.path.basename(os.path.dirname(f))
-        except OSError:
-            pass
+    if files:
+        # "/usr/lib/modules/7.2.11-arch1-1/modules.builtin is owned by linux 7.2.11.arch1-1"
+        for line in run(["pacman", "-Qo"] + files, env=child_env()).splitlines():
+            m = re.match(r"^(\S+) is owned by (\S+) \S+$", line)
+            if m:
+                kernels[m.group(2)] = os.path.basename(os.path.dirname(m.group(1)))
     return kernels
 
 
@@ -162,21 +169,38 @@ def preset_files(pkg):
 
 
 def dkms_built():
-    """{module: {kernel versions it is installed for}} from `dkms status` (empty without DKMS)."""
+    """{module: {kernel versions it is installed for}} from `dkms status`. A module whose build
+    failed shows up as only "added" or "built": it gets an empty or partial set. {} without DKMS."""
     built = {}
     for line in run(["dkms", "status"]).splitlines():
         left, _, state = line.rpartition(":")
         parts = [p.strip() for p in left.split(",")]
-        if len(parts) < 3:
-            continue
-        if "/" in parts[0]:                     # "nvidia/615.78, 7.2.11-arch1-1, x86_64: installed"
-            module, kver = parts[0].split("/")[0], parts[1]
+        if "/" in parts[0]:                     # "nvidia/615.78, 7.2.11-arch1-1, x86_64: installed", "nvidia/615.78: added"
+            module, kver = parts[0].split("/")[0], parts[1] if len(parts) > 1 else None
         else:                                   # older dkms: "nvidia, 615.78, 7.2.11-arch1-1, x86_64: installed"
-            module, kver = parts[0], parts[2] if len(parts) > 3 else parts[1]
+            module, kver = parts[0], parts[2] if len(parts) > 2 else None
+        if not re.fullmatch(r"[\w.+-]+", module):
+            continue                            # a warning line, not a module
         mods = built.setdefault(module, set())
-        if state.strip().startswith("installed"):
+        if kver and state.strip().startswith("installed"):
             mods.add(kver)
     return built
+
+
+def dkms_skips(module, kver):
+    """The module's dkms.conf limits it to other kernels (BUILD_EXCLUSIVE_KERNEL): not missing there."""
+    for conf in glob.glob(os.path.join(DKMS_SRC, f"{module}-*", "dkms.conf")):
+        try:
+            with open(conf) as f:
+                m = re.search(r'^\s*BUILD_EXCLUSIVE_KERNEL\s*=\s*"?([^"\n]+)"?', f.read(), re.M)
+        except OSError:
+            continue
+        if m:
+            try:
+                return not re.search(m.group(1), kver)
+            except re.error:
+                return False
+    return False
 
 
 def installed_versions():
@@ -226,26 +250,42 @@ def sudo_asks_password():
 
 
 def battery():
-    """(percent, discharging) of a laptop battery, None on a desktop."""
-    for d in glob.glob("/sys/class/power_supply/*"):
+    """(percent, discharging) of the machine's own battery (the emptiest one), None on a desktop.
+    The battery of a wireless mouse or gamepad (scope "Device") doesn't count."""
+    found = []
+    for d in glob.glob(os.path.join(POWER_DIR, "*")):
         try:
             with open(os.path.join(d, "type")) as f:
                 if f.read().strip() != "Battery":
                     continue
+            if os.path.exists(os.path.join(d, "scope")):
+                with open(os.path.join(d, "scope")) as f:
+                    if f.read().strip() == "Device":
+                        continue
             with open(os.path.join(d, "capacity")) as f:
                 cap = int(f.read().strip())
             with open(os.path.join(d, "status")) as f:
-                return cap, f.read().strip() == "Discharging"
+                found.append((cap, f.read().strip() == "Discharging"))
         except (OSError, ValueError):
             continue
-    return None
+    return min(found) if found else None
+
+
+INHIBIT = ["systemd-inhibit", "--what=sleep:idle", "--mode=block"]   # not shutdown: the user may reboot
 
 
 def can_inhibit():
     try:
-        return subprocess.run(["systemd-inhibit", "--what=sleep:shutdown:idle", "--mode=block", "true"],
-                              capture_output=True, timeout=10).returncode == 0
+        return subprocess.run(INHIBIT + ["true"], capture_output=True, timeout=10).returncode == 0
     except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def is_chromebook():
+    try:
+        with open("/sys/class/dmi/id/sys_vendor") as f:
+            return f.read().strip() == "Google"
+    except OSError:
         return False
 
 
@@ -949,6 +989,15 @@ def detached_answer(line):
 
 # ───────────────────────────── checks ─────────────────────────────
 
+def not_started(why, verdict):
+    """Result of a run that never touched the system (refused before it began)."""
+    LOG.event("НЕ НАЧАТО", why)
+    notify("Обновление не начато", why, urgent=verdict == 2)
+    return {"changed": [], "added": [], "removed": [], "problems": [why] if verdict == 2 else [],
+            "warnings": [why] if verdict < 2 else [], "ok": [], "verdict": verdict, "log": LOG.path,
+            "exitstatus": None, "started": False, "head": "Обновление не начиналось"}
+
+
 def system_checks(before, exitstatus, responder, pacman_log_offset, failed_before=()):
     """Post-update checks. Returns a dict; also logs, appends pacman.log excerpt and notifies."""
     after = installed_versions()
@@ -968,6 +1017,10 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
     else:
         ok.append("pacman завершился штатно")
     for f in sorted(responder.failures):
+        flash = KERNEL_FLASH.search(f)
+        if flash:
+            problems.append(f"новое ядро не записано в раздел ядра — перед перезагрузкой выполни: sudo {flash.group(0)}")
+            continue
         (warnings if "update process" in f else problems).append(f"в выводе: «{f}»")
     if any(KEYRING_TROUBLE.search(f) for f in responder.failures):
         keyring = "archlinuxarm-keyring" if before.get("archlinuxarm-keyring") else "archlinux-keyring"
@@ -1003,18 +1056,17 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
                                     "(сначала: sudo mkinitcpio -P)")
     if checked and not any("НЕ перезагружайся" in p for p in problems):
         ok.append("ядро и initramfs на месте" if len(kernels) == 1 else f"ядра и initramfs на месте ({checked})")
-    built = dkms_built()
-    for module, kvers in sorted(built.items()):
-        if not kvers:
-            continue                            # added to DKMS but never built anywhere: not ours to judge
-        missing = [k for k in kernels.values() if k not in kvers]
+    # The dkms pacman hook never fails the transaction: a module that didn't build shows up only here.
+    for module, kvers in sorted(dkms_built().items()):
+        missing = [k for k in sorted(kernels.values()) if k not in kvers and not dkms_skips(module, k)]
         name = "драйвер NVIDIA" if module == "nvidia" else f"модуль DKMS {module}"
         if missing:
             problems.append(f"{name} не собран под ядро {', '.join(missing)} — НЕ перезагружайся")
-        else:
+        elif kernels:
             ok.append(f"{name} собран под ядро")
-    if kernels and not os.path.isdir(os.path.join(MODULES_DIR, os.uname().release)):
-        warnings.append(f"ядро обновилось (сейчас работает {os.uname().release}) — перезагрузись, когда будет удобно")
+    running = os.uname().release
+    if kernels and running not in kernels.values():
+        warnings.append(f"ядро обновилось (сейчас работает {running}) — перезагрузись, когда будет удобно")
     # -n: never asks for a password; no sbctl or Secure Boot off → nothing to check
     sb = run(["sudo", "-n", "sbctl", "verify"]) if secure_boot_on() else ""
     unsigned = [f for f in boot_files if f"{f} is not signed" in sb]
@@ -1023,11 +1075,16 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
     elif any(f"{f} is signed" in sb for f in boot_files):
         ok.append("подпись Secure Boot в порядке")
 
+    if is_chromebook() and {"alsa-ucm-conf", "sof-firmware"} & set(changed + added):
+        warnings.append("обновились alsa-ucm-conf/sof-firmware: если пропал звук, снова запусти скрипт "
+                        "chromebook-linux-audio")
     reboot = [p for p in changed + added if REBOOT_PKGS.match(p) or p in kernels]
     if reboot:
         warnings.append("перезагрузись, когда будет удобно (обновились: " + ", ".join(reboot[:8]) + ")")
-    elif "reboot" in responder.notes:       # arch-update's own guess; the kernel check above is ours
-        LOG.event("ЯДРО", "arch-update предлагал перезагрузку — ядро не менялось, пропускаю")
+    elif "reboot" in responder.notes and not kernels:      # no kernel of ours to judge by: trust arch-update
+        warnings.append("arch-update просит перезагрузиться — перезагрузись, когда будет удобно")
+    elif "reboot" in responder.notes:
+        LOG.event("ЯДРО", "arch-update предлагал перезагрузку, но работающее ядро на месте — пропускаю")
     if "pacnew" in responder.notes or run(["pacdiff", "-o"]).strip():
         warnings.append("есть .pacnew файлы — разберём вместе (pacdiff -o покажет список)")
     if "orphans" in responder.notes:
@@ -1237,25 +1294,24 @@ def run_update(view, manual=False, stop_on_news=True, cmd=None, summary=True, di
         LOG.event("ОКНО", "окно закрыто до запуска — обновление не начинаю")
         return None, None, None
     argv = shlex.split(cmd)
+    sudo_once = False
     if not demo:
         missing = unmounted_boot()
         if missing:
-            why = f"{', '.join(missing)} не смонтирован — обновление не начинаю (ядро записалось бы не туда)"
-            LOG.event("ПРОБЛЕМА", why)
-            notify("Обновление не начато", why, urgent=True)
-            return None, {"changed": [], "added": [], "removed": [], "problems": [why], "warnings": [], "ok": [],
-                          "verdict": 2, "log": LOG.path, "exitstatus": None}, None
+            return None, not_started(f"{', '.join(missing)} не смонтирован — обновление не начинаю "
+                                     "(ядро записалось бы не туда)", 2), None
         if elevation_command() == "sudo" and sudo_asks_password():
             # The password once, at the start, while the user is watching: sudo forgets it after
             # 5 minutes, and a long run asks again for the AUR step, the cache cleanup… The loop
             # keeps this terminal's ticket fresh and dies with the run (same session, SIGHUP).
+            # 125: the password was refused (or the question cancelled) — nothing has started.
             LOG.event("SUDO", "sudo спрашивает пароль: спрошу один раз в начале")
-            argv = ["sh", "-c", 'sudo -v || exit 1; (while sleep 50; do sudo -n -v || exit; done) '
+            sudo_once = True
+            argv = ["sh", "-c", 'sudo -v || exit 125; (while sleep 50; do sudo -n -v || exit; done) '
                                 '</dev/null >/dev/null 2>&1 & exec "$@"', "sh"] + argv
         if battery() and can_inhibit():
-            # a laptop must not fall asleep or power off in the middle of a pacman transaction
-            argv = ["systemd-inhibit", "--what=sleep:shutdown:idle", "--mode=block", "--who=Arch-Update",
-                    "--why=обновление системы"] + argv
+            # a laptop must not fall asleep in the middle of a pacman transaction
+            argv = INHIBIT + ["--who=Arch-Update", "--why=обновление системы"] + argv
     cols, rows = dims or shutil.get_terminal_size((120, 40))
     child = pexpect.spawn(argv[0], argv[1:], env=child_env(), dimensions=(rows, cols), echo=True)
     RUNNING = True
@@ -1293,5 +1349,8 @@ def run_update(view, manual=False, stop_on_news=True, cmd=None, summary=True, di
     RUNNING = False
     status = child.exitstatus if child.exitstatus is not None else child.signalstatus
     LOG.event("КОНЕЦ", f"arch-update завершился, код {status}")
+    if sudo_once and status == 125:
+        return status, not_started("пароль sudo не принят — обновление не начиналось, система не менялась", 1), \
+            responder
     result = system_checks(before, status, responder, pacman_log_offset, failed_before) if summary else None
     return status, result, responder

@@ -24,9 +24,9 @@ curl -fsSL https://raw.githubusercontent.com/@REPO@/stable/install.sh | bash
 
 - состояние: `systemctl --user status arch-update-cactus-sync.timer`
 - журнал самообновления: `~/.local/state/arch-update-auto/sync.log`
-- обновить прямо сейчас: `arch-update-cactus-sync`
+- проверить и обновить прямо сейчас: `~/.local/bin/arch-update-cactus-sync`
 - удалить: `~/.local/share/arch-update-cactus/install.sh --uninstall`
 
 ## Демо
 
-`arch-update-launcher --demo` — весь показ на выдуманном обновлении, система не меняется.
+`~/.local/bin/arch-update-launcher --demo` — весь показ на выдуманном обновлении, система не меняется.
