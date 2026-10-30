@@ -89,6 +89,10 @@ SETTLE = 0.3        # seconds of silence before we treat the current line as a q
 UNKNOWN_IDLE = 12   # seconds of silence on a question-looking line before handing over
 STALL_IDLE = 120    # seconds of silence on any prompt-ish line (ends in : ? ] >) before handing over anyway
 KEEP_LOGS = 30
+# arch-update's exit codes for a run that stopped before it touched anything (list_packages.sh, full_upgrade.sh)
+NOTHING_DONE = {4: "обновление отменено — система не менялась",
+                17: "уже идёт другое обновление Arch-Update — не перезагружайся, пока оно не закончится; "
+                    "это окно ничего не меняло"}
 PACMAN_LOCK = "/var/lib/pacman/db.lck"
 MODULES_DIR = "/usr/lib/modules"          # one directory per installed kernel
 PRESET_DIR = "/etc/mkinitcpio.d"
@@ -1355,5 +1359,7 @@ def run_update(view, manual=False, stop_on_news=True, cmd=None, summary=True, di
     if sudo_once and status == 125:
         return status, not_started("пароль sudo не принят — обновление не начиналось, система не менялась", 1), \
             responder
+    if child.exitstatus in NOTHING_DONE and installed_versions() == before:
+        return status, not_started(NOTHING_DONE[child.exitstatus], 1), responder
     result = system_checks(before, status, responder, pacman_log_offset, failed_before) if summary else None
     return status, result, responder

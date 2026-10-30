@@ -337,5 +337,59 @@ class SudoOnce(unittest.TestCase):
         self.assertIn("не начиналось", res["warnings"][0])
 
 
+class NothingDone(unittest.TestCase):
+    """arch-update stops before it touches anything when "Proceed with update?" is answered no (exit 4)
+    or another instance holds its lock (exit 17): the summary says the update did not start instead
+    of sounding the alarm. Any other failure still counts as a problem."""
+
+    def run_fake(self, script):
+        path = os.path.join(tempfile.mkdtemp(), "fake-update")
+        with open(path, "w") as f:
+            f.write("#!/bin/bash\n" + script)
+        os.chmod(path, 0o755)
+        saved_stdin = os.dup(0)
+        null = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(null, 0)                      # no keyboard
+        os.close(null)
+        self.addCleanup(os.close, saved_stdin)
+        self.addCleanup(os.dup2, saved_stdin, 0)
+        for name, value in (("unmounted_boot", lambda: []), ("sudo_asks_password", lambda: False)):
+            self.addCleanup(setattr, engine, name, getattr(engine, name))
+            setattr(engine, name, value)
+
+        class View(engine.TerminalView):
+            def out(self, data):
+                pass
+        status, res, _ = engine.run_update(View(), cmd=path, summary=True)
+        engine.LOG.txt.close()
+        engine.LOG.raw.close()
+        return status, res
+
+    def test_another_instance_is_running(self):
+        # what arch-update 4.4 prints (full_upgrade.sh); the engine has to answer "n"
+        status, res = self.run_fake("echo \"==> WARNING: There's already a running instance of Arch-Update\"\n"
+                                    "read -rp '-> Proceed anyway? [y/N] ' a\n"
+                                    "[ \"$a\" = n ] || exit 99\n"
+                                    "exit 17\n")
+        self.assertEqual(status, 17)
+        self.assertFalse(res["started"])
+        self.assertEqual(res["problems"], [])
+        self.assertIn("другое обновление", res["warnings"][0])
+        self.assertIn("не перезагружайся", res["warnings"][0])     # it may be our own run, in pacman
+
+    def test_the_update_was_declined(self):
+        status, res = self.run_fake("exit 4\n")
+        self.assertEqual(status, 4)
+        self.assertFalse(res["started"])
+        self.assertEqual(res["problems"], [])
+        self.assertIn("отменено", res["warnings"][0])
+
+    def test_a_failed_update_is_still_a_problem(self):
+        status, res = self.run_fake("exit 5\n")          # pacman failed
+        self.assertEqual(status, 5)
+        self.assertTrue(res.get("started", True))
+        self.assertTrue(any("кодом 5" in p for p in res["problems"]), res["problems"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
