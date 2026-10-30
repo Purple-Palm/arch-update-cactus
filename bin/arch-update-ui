@@ -85,7 +85,9 @@ PAL_WARN = [hexrgb(c) for c in ("#ffb347", "#ffd166", "#ff9f43", "#ffd166")]
 PAL_BAD = [hexrgb(c) for c in ("#ff5c7a", "#ff8f5c", "#ff3d6e", "#ff8f5c")]
 TEXT = hexrgb("#c9d1e3")
 DIM = hexrgb("#6b7591")
-FAINT = hexrgb("#2a3147")
+FAINT = hexrgb("#2a3147")       # rules, tracks, grid dots: never text (1.5:1 on BG)
+MUTED = hexrgb("#4e5876")       # quiet text: captions, pending stages, hints, the log path (2.7:1)
+TRACK = hexrgb("#1a2034")       # trough of the progress bars
 GOOD = hexrgb("#3ddc84")
 WARN = hexrgb("#ffc457")
 BAD = hexrgb("#ff5c7a")
@@ -130,25 +132,41 @@ class Backdrop:
                        rnd.choice("···∙∙•✦") if rnd.random() < 0.97 else "✦") for _ in range(n)]
 
     def draw(self, c, t, pal, fade=1.0):
+        """Drawn AFTER the screen's content, and only into cells two columns away from anything
+        drawn, so the sky never shows inside a selection band, never reads as punctuation next to
+        a word and never runs into a line of text."""
         # The background moves slowly: 6 updates per second look the same as 30 and keep almost
         # every row unchanged between frames, so only a small diff is sent to the terminal.
         t = math.floor(t * 6) / 6
         fade = round(fade * 8) / 8
-        for sx, sy, speed, ph, ch in self.stars:
-            x = int(((sx - t * speed) % 1.0) * c.w)
+        cells = []
+        for sx, sy, speed, ph, ch in self.stars[:max(1, c.w * c.h // 36)]:    # a small screen: fewer stars
+            x = int(((sx - t * speed) % 1.0) * c.w) % c.w     # % 1.0 can round up to 1.0
             y = int(sy * (c.h - 1))
             tw = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(t * 1.7 + ph))
             k = (0.10 if ch in "·∙" else 0.18) * tw * fade
-            c.put(x, y, ch, lerp(BG, grad(pal, sx + t * 0.02), k))
-        base = c.h - 3                                   # aurora: two soft sine ribbons
-        ribbons = "▁▂▃▄▅"
-        for x in range(c.w):
-            for j, (amp, fr, sp) in enumerate(((1.6, 0.045, 0.55), (1.1, 0.07, -0.4))):
-                v = math.sin(x * fr + t * sp + j * 2) * amp + math.sin(x * fr * 0.37 - t * 0.3) * 0.8
-                yy = base - int(round(v + 1.5)) - j
-                if 0 <= yy < c.h:
-                    k = (0.10 + 0.06 * math.sin(x * 0.05 + t)) * fade
-                    c.put(x, yy, ribbons[(int(v * 2) + 2) % 5], lerp(BG, grad(pal, x / c.w * 0.8 + t * 0.03 + j * 0.3), k))
+            cells.append((x, y, ch, lerp(BG, grad(pal, sx + t * 0.02), k)))
+        base = c.h - 3                     # aurora: two thin sine threads, ▔ ─ ▁ by the height in the row
+        for j, (amp, fr, sp) in enumerate(((1.3, 0.045, 0.55), (0.9, 0.07, -0.4))):
+            hue = math.floor(t * 0.03 * 48) / 48 + j * 0.3
+            for x in range(c.w):
+                v = math.sin(x * fr + t * sp + j * 2) * amp + math.sin(x * fr * 0.37 - t * 0.3) * 0.6
+                yf = base - 1.5 - j - v                    # fractional row (grows downwards)
+                r = math.floor(yf)
+                if 0 <= r < c.h:
+                    k = math.floor((0.16 + 0.07 * math.sin(x * 0.05 + t)) * fade * 64) / 64
+                    col = lerp(BG, grad(pal, math.floor(x / c.w * 0.8 * 24) / 24 + hue), k)
+                    cells.append((x, r, "▔─▁"[min(2, int((yf - r) * 3))], col))
+        keep = []
+        for x, y, ch, fg in cells:         # decided against the content alone, then written
+            fgs, bgs = c.fg[y], c.bg[y]
+            for i in range(max(0, x - 2), min(c.w, x + 3)):
+                if fgs[i] is not None or bgs[i] is not None:
+                    break
+            else:
+                keep.append((x, y, ch, fg))
+        for x, y, ch, fg in keep:
+            c.ch[y][x], c.fg[y][x] = ch, fg
 
 
 U = types.SimpleNamespace(grad=grad, lerp=lerp, shade=shade, PAL_ARCH=PAL_ARCH, PAL_RUN=PAL_RUN, TEXT=TEXT,
@@ -170,9 +188,21 @@ GLYPHS = {
     "E": ["███████╗", "██╔════╝", "█████╗  ", "██╔══╝  ", "███████╗", "╚══════╝"],
     " ": ["   "] * 6,
 }
-CHECK = ["          ██╗", "         ██╔╝", "   ██╗  ██╔╝ ", "   ╚██╗██╔╝  ", "    ╚███╔╝   ", "     ╚══╝    "]
-CROSS = ["██╗  ██╗", "╚██╗██╔╝", " ╚███╔╝ ", " ██╔██╗ ", "██╔╝ ██╗", "╚═╝  ╚═╝"]
-BANG = ["██╗", "██║", "██║", "╚═╝", "██╗", "╚═╝"]
+# Verdict glyphs in half blocks: a pixel is one column by half a row (about square), so the strokes
+# run at a smooth 45 degrees instead of the big font's two-column steps.
+CHECK = ["             ▄██",
+         "           ▄██▀ ",
+         " ▄▄      ▄██▀   ",
+         " ▀██▄  ▄██▀     ",
+         "   ▀████▀       ",
+         "     ▀▀         "]
+CROSS = ["██▄      ▄██",
+         " ▀██▄  ▄██▀ ",
+         "   ▀████▀   ",
+         "   ▄████▄   ",
+         " ▄██▀  ▀██▄ ",
+         "██▀      ▀██"]
+BANG = [" ████ ", " ████ ", " ████ ", "  ▀▀  ", " ▄▄▄▄ ", " ████ "]
 SHADOW_CHARS = set("╔╗╚╝═║")
 
 
@@ -273,6 +303,50 @@ class Canvas:
                 parts.append(ch)
             out.append("".join(parts) + "\x1b[0m")
         return out
+
+
+def bar(c, x, y, w, frac, color, alpha=1.0):
+    """Progress bar: the gradient fill ends in a 1/8-cell edge and lies in a dim full-height trough."""
+    filled = clamp01(frac) * w
+    full = int(filled)
+    for i in range(w):
+        if i < full:
+            c.put(x + i, y, "█", color(i), alpha=alpha)
+        elif i == full:
+            c.put(x + i, y, " ▏▎▍▌▋▊▉"[int((filled - i) * 8)], color(i), bg=TRACK, alpha=alpha)
+        else:
+            c.put(x + i, y, " ", bg=TRACK, alpha=alpha)
+
+
+KEY_RE = re.compile(r"(?<!\S)(↑↓|←→|[↑↓←→]|Enter|Esc|Space|Ctrl\+\]|стрелки|[A-Za-z])(?=\s)")
+
+
+def keyline(c, y, text, col=DIM, key=TEXT, alpha=1.0, x=None, bg=None):
+    """A line of key hints (centred unless x is given): the keys a step brighter than what they do."""
+    if len(text) > c.w - 2:
+        text = text[:c.w - 3] + "…"
+    if x is None:
+        x = (c.w - len(text)) // 2
+    c.put(x, y, text, col, bg=bg, alpha=alpha)
+    for m in KEY_RE.finditer(text):
+        c.put(x + m.start(), y, m.group(), key, bg=bg, alpha=alpha)
+
+
+def pill(c, x, y, w, color, accent, alpha=1.0):
+    """Selection band: a bright edge on the left and a gradient that dissolves into the background over
+    its last ten cells. It writes every cell of the band, so no star or aurora glyph ever shows inside."""
+    for i in range(w):
+        k = min(1.0, (w - i) / 10) ** 1.5
+        c.put(x + i, y, " ", bg=lerp(BG, color(i), alpha * (0.15 + 0.85 * k)))
+    c.put(x, y, "▌", accent, alpha=alpha)
+
+
+def badge(c, x, y, text, col, alpha=1.0):
+    """A small label: tinted background with half-block ends, text in the accent colour (len+2 cells)."""
+    tint = lerp(BG, col, 0.24)
+    c.put(x, y, "▐", tint, alpha=alpha)
+    c.put(x + 1, y, text, col, bg=tint, bold=True, alpha=alpha)
+    c.put(x + 1 + len(text), y, "▌", tint, alpha=alpha)
 
 
 def term_size():
@@ -734,7 +808,7 @@ class App:
                     c.put(x0 + x, top + ry + dy, ch, col, bold=ch not in SHADOW_CHARS, alpha=a_t * alpha)
         if word == "ARCH" and c.h > top + 8:
             c.cput(top + 6, "U P D A T E", grad(pal, -t * 0.12), bold=True, alpha=alpha)
-        return top + 6
+        return top + 6 if word == "ARCH" else top + 5     # the one-line title has no "U P D A T E" row
 
     def byline(self, y, t, start):
         c = self.s.canvas
@@ -749,15 +823,11 @@ class App:
         return "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(t * 12) % 10]
 
     def footer(self, text):
-        c = self.s.canvas
-        if len(text) > c.w - 2:
-            text = text[:c.w - 3] + "…"
-        c.cput(c.h - 2, text, DIM)
+        keyline(self.s.canvas, self.s.canvas.h - 2, text)
 
     # ── screens
     def draw_splash(self):
         c, t = self.s.canvas, self.now()
-        BACKDROP.draw(c, t, PAL_ARCH, clamp01(t / 1.5))
         top = max(1, c.h // 2 - 9)
         y = self.draw_title(top, t, reveal_t=t)
         self.byline(y + 1, t, 0.9)
@@ -769,21 +839,23 @@ class App:
                  ("загружаю новости Arch", self.news is not None,
                   (f"{len(self.news)} новостей" if self.news else "нет связи с archlinux.org")
                   if self.news is not None else "")]
+        tx = (c.w - max(len(label) + 4 for label, _, _ in tasks)) // 2     # one left edge: icons in a column
         for i, (label, done, result) in enumerate(tasks):
             a = clamp01((t - 1.2 - i * 0.15) / 0.4)
             if a <= 0:
                 continue
             line = f"{'✓' if done else self.spinner(t + i)}  {result if done else label + '…'}"
             col = GOOD if done else grad(PAL_ARCH, t * 0.3 + i * 0.2)
-            c.cput(y + i, line, col if done else col, alpha=a)
+            c.put(tx, y + i, line, col, alpha=a)
         news_ready = self.news is not None or t > 5.0      # slow archlinux.org: news fills in on the menu
         if self.repo is not None and news_ready and t > 2.0:
             self.state, self.menu_t, self.from_splash = "menu", time.time(), True
             self.announce_version()
         elif self.repo is None and t > 15:
-            c.cput(c.h - 2, "проверка затянулась · Enter — обычный Arch-Update без проверки · q — выход", DIM)
+            keyline(c, c.h - 2, "проверка затянулась · Enter — обычный Arch-Update без проверки · q — выход")
         elif t > 1.5:
             self.hint("q выход")
+        BACKDROP.draw(c, t, PAL_ARCH, clamp01(t / 1.5))     # after the content: only into empty cells
         self.draw_toast()
 
     def announce_version(self):
@@ -800,7 +872,7 @@ class App:
         if self.version:
             c = self.s.canvas
             text = f"{self.version[1]} · {self.version[0]}"
-            c.put(c.w - len(text) - 2, c.h - 1, text, FAINT)
+            c.put(c.w - len(text) - 2, c.h - 1, text, MUTED)
 
     def menu_layout(self):
         """Sizes of the menu blocks. On a low terminal (a laptop) they shrink step by step —
@@ -815,25 +887,26 @@ class App:
             L.pkg_rows = min((pk + L.ncol - 1) // L.ncol, max(3, min(8, c.h - 32)))
 
         def measure():
-            L.title_h = 10 if L.big_title else 3
+            L.title_h = (10 if c.w < 92 else 9) if L.big_title else 3
             L.news_h = (2 + L.news_rows if L.news_rows else 0) if self.news else 2
             if pk:
                 L.upd_h = 1 + L.pkg_rows + (1 if pk > L.pkg_rows * L.ncol else 0) + (1 if self.check_failed else 0) + 1
             else:
                 L.upd_h = 4
-            L.warn_h = (2 if self.kernel_gpu else 0) + (2 if self.low_battery is not None else 0)
+            nw = bool(self.kernel_gpu) + (self.low_battery is not None)
+            L.warn_h = nw + 1 if nw else 0                   # warnings stacked, one blank row below
             L.menu_h = 1 + (2 * items if L.menu_subs else items + 1)
             return L.title_h + L.news_h + L.upd_h + L.warn_h + L.menu_h
         shrink = [("menu_subs", False), ("news_rows", min(L.news_rows, 1)), ("pkg_rows", min(L.pkg_rows, 2)),
                   ("big_title", False), ("news_rows", 0), ("pkg_rows", min(L.pkg_rows, 1))]
         L.total = measure()
-        while L.total > c.h - 3 and shrink:
+        while L.total > c.h - 4 and shrink:                  # a free row above the footer
             setattr(L, *shrink.pop(0))
             L.total = measure()
         return L
 
     def title_top(self):
-        return max(1, (self.s.canvas.h - 3 - self.menu_layout().total) // 2)
+        return 1 + max(0, (self.s.canvas.h - 4 - self.menu_layout().total) // 2)
 
     def draw_small_title(self, y, t, pal=PAL_ARCH, alpha=1.0):
         """The title in one line, for terminals too low for the big letters."""
@@ -845,7 +918,6 @@ class App:
 
     def draw_menu(self):
         c, t = self.s.canvas, math.floor(self.now() * 10) / 10    # colour flow at 10 fps: cheaper frames
-        BACKDROP.draw(c, t, PAL_ARCH)
         mt = time.time() - self.menu_t
         L = self.menu_layout()
         W = L.W
@@ -883,7 +955,7 @@ class App:
                 c.put(x0 + 2, y, date, DIM, alpha=a)
                 c.put(x0 + 9, y, title, TEXT, alpha=a)
                 if item["new"]:
-                    c.put(x0 + W - 5, y, " NEW ", BG, bg=PINK, bold=True, alpha=a)
+                    badge(c, x0 + W - 5, y, "NEW", PINK, alpha=a)
                 y += 1
             y += 1
         elif self.news_err:
@@ -935,13 +1007,15 @@ class App:
             if len(msg) > W - 2:
                 msg = "ядро/NVIDIA: сохрани работу — экран может подвиснуть"[:W - 2]
             c.put(x0 + 2, y, msg, WARN, alpha=a)
-            y += 2
+            y += 1
         if self.low_battery is not None:
             a = appear(k); k += 1
             c.put(x0, y, "⚠", WARN, bold=True, alpha=a)
             c.put(x0 + 2, y, f"батарея {self.low_battery}% — подключи зарядку, обновление может идти долго"[:W - 2],
                   WARN, alpha=a)
-            y += 2
+            y += 1
+        if self.kernel_gpu or self.low_battery is not None:
+            y += 1
 
         # menu: a gradient pill under the selected item
         y += 1
@@ -952,19 +1026,19 @@ class App:
             a = appear(k + i)
             sel = i == self.menu_sel
             if sel:
-                for xx in range(mw):
-                    g = grad(PAL_ARCH, xx / mw * 0.6 - t * 0.1)
-                    c.fill_bg(mx + xx, y, 1, lerp(BG, shade(g, 0.5), a))
+                pill(c, mx, y, mw, lambda xx: shade(grad(PAL_ARCH, xx / mw * 0.6 - t * 0.1), 0.5),
+                     grad(PAL_ARCH, -t * 0.1), a)
                 c.put(mx + 2, y, "▸ " + title, (255, 255, 255), bold=True, alpha=a)
                 if sub:
                     c.put(mx + 4, y + 1, sub[:mw - 4], DIM, alpha=a)
             else:
                 c.put(mx + 4, y, title, TEXT, alpha=a * 0.9)
                 if sub and L.menu_subs:
-                    c.put(mx + 4, y + 1, sub[:mw - 4], FAINT, alpha=a)
+                    c.put(mx + 4, y + 1, sub[:mw - 4], MUTED, alpha=a)
             y += 2 if L.menu_subs or sel else 1     # compact: only the chosen item explains itself
         self.hint("↑↓ выбор", "Enter запуск", "q выход")
         self.draw_version()
+        BACKDROP.draw(c, t, PAL_ARCH)                       # after the content, before toast and modal
         self.draw_toast()
         if self.confirm:
             self.draw_modal("Ядро или драйвер NVIDIA",
@@ -977,7 +1051,7 @@ class App:
         c, t = self.s.canvas, self.now()
         c.dim(0.72)
         w = min(c.w - 6, max(52, max(len(l) for l in lines) + 8))
-        h = len(lines) + (5 if input_text is not None else 4)
+        h = len(lines) + (6 if input_text is not None else 4)       # the answer field gets a blank row below
         x0, y0 = (c.w - w) // 2, (c.h - h) // 2
         border = grad(pal, -t * 0.25)
         c.blank(x0, y0, w, h, hexrgb("#121726"))
@@ -992,8 +1066,10 @@ class App:
         yy = y0 + 1 + len(lines)
         if input_text is not None:
             cur = "█" if int(t * 2) % 2 == 0 else " "
-            c.put(x0 + 3, yy + 1, "› " + input_text + cur, (255, 255, 255), bg=hexrgb("#121726"), bold=True)
-        c.put(x0 + 3, y0 + h - 2, hint, DIM, bg=hexrgb("#121726"))
+            field = hexrgb("#1b2235")                                 # the answer sits in a field
+            c.fill_bg(x0 + 2, yy + 1, w - 4, field)
+            c.put(x0 + 3, yy + 1, ("› " + input_text + cur)[-(w - 6):], (255, 255, 255), bg=field, bold=True)
+        keyline(c, y0 + h - 2, hint, x=x0 + 3, bg=hexrgb("#121726"))
 
     def draw_news(self):
         c, t = self.s.canvas, math.floor(self.now() * 10) / 10
@@ -1005,8 +1081,8 @@ class App:
             for i, item in enumerate(self.news):
                 sel = i == self.news_sel
                 if sel:
-                    for xx in range(W):
-                        c.fill_bg(x0 + xx, y, 1, shade(grad(PAL_ARCH, xx / W * 0.5 - t * 0.1), 0.45))
+                    pill(c, x0, y, W, lambda xx: shade(grad(PAL_ARCH, xx / W * 0.5 - t * 0.1), 0.45),
+                         grad(PAL_ARCH, -t * 0.1))
                 tag = "  NEW" if item["new"] else ""
                 title = item["title"]
                 if len(title) > W - 14 - len(tag):
@@ -1014,7 +1090,7 @@ class App:
                 c.put(x0 + 1, y, ("▸ " if sel else "  ") + ru_date(item["date"]).ljust(7) + title,
                       (255, 255, 255) if sel else TEXT, bold=sel)
                 if tag:
-                    c.put(x0 + W - 5, y, tag.strip(), PINK, bold=True)
+                    badge(c, x0 + W - 6, y, "NEW", PINK)
                 y += 2
             self.hint("↑↓ выбор", "Enter читать", "Esc назад")
             self.draw_toast()
@@ -1382,11 +1458,11 @@ class LiveView(engine.TerminalView):
     def draw(self, fade=1.0):
         c, t = self.s.canvas, time.time() - self.app.t0
         t = math.floor(t * 10) / 10     # colour flows at 10 fps: most rows stay identical between frames
-        BACKDROP.draw(c, t, PAL_RUN, fade)
         if self.game or self.hub:
             self.draw_games(c, t)
         else:
             self.draw_dashboard(c, t, fade)
+        BACKDROP.draw(c, t, PAL_RUN, fade)      # after the content (only into empty cells), before the modal
         self.app.draw_toast()
         if self.modal:
             why, line = self.modal
@@ -1416,15 +1492,13 @@ class LiveView(engine.TerminalView):
         for i, ch in enumerate(text_l):
             c.put(x + i, y, ch, grad(PAL_RUN, i / 40 - t * 0.15), bold=i < 11)
         x += len(text_l)
-        for i in range(bw):
-            c.put(x + i, y, "█" if i < frac * bw else "─", grad(PAL_RUN, i / bw * 0.7 - t * 0.25) if i < frac * bw
-                  else FAINT)
+        bar(c, x, y, bw, frac, lambda i: grad(PAL_RUN, i / bw * 0.7 - t * 0.25))
         c.put(x + bw, y, text_r, TEXT)
 
     def draw_games(self, c, t):
         if self.hub:
-            self.status_strip(c, t, 1)
-            top = max(4, c.h // 2 - 9)
+            self.status_strip(c, t, 1 if c.h >= 26 else 0)      # a laptop screen: row 0, as in the games
+            top = max(3, (c.h - 9) // 2)                        # the 9-row block, centred
             title = "МИНИ-ИГРЫ"
             c.cput(top, " ".join(title), grad(PAL_ARCH, -t * 0.12), bold=True)
             c.cput(top + 1, "обновление идёт дальше само — играй спокойно", DIM)
@@ -1435,8 +1509,8 @@ class LiveView(engine.TerminalView):
                 sel = i == self.hub_sel
                 best = self.best.get(G.name)
                 if sel:
-                    for xx in range(mw):
-                        c.fill_bg(mx + xx, y, 1, shade(grad(PAL_ARCH, xx / mw * 0.6 - t * 0.1), 0.5))
+                    pill(c, mx, y, mw, lambda xx: shade(grad(PAL_ARCH, xx / mw * 0.6 - t * 0.1), 0.5),
+                         grad(PAL_ARCH, -t * 0.1))
                 c.put(mx + 2, y, ("▸ " if sel else "  ") + f"{i + 1}  {G.title}", (255, 255, 255) if sel else TEXT,
                       bold=sel)
                 if best:
@@ -1450,7 +1524,7 @@ class LiveView(engine.TerminalView):
         for sc in (3, 2):        # largest scale that fits the screen (big monitors get big cells)
             g.scale = sc
             w_, h_ = g.size()
-            if w_ <= c.w - 6 and h_ <= c.h - 8:
+            if w_ <= c.w - 6 and h_ <= min(c.h - 8, c.h * 3 // 4):
                 break
             g.scale = 1
         gw, gh = g.size()
@@ -1460,24 +1534,27 @@ class LiveView(engine.TerminalView):
             self.status_strip(c, t, 1)
             y0, foot = max(3, (c.h - gh) // 2), c.h - 2
             c.cput(y0 - 1, title, grad(PAL_ARCH, 0.2 - t * 0.1), bold=True)
-        else:                              # low terminal (a laptop): everything packed, title only if it fits
+        else:                              # low terminal (a laptop): title only if it fits, the rest centred
             self.status_strip(c, t, 0)
-            y0, foot = 1, c.h - 1
-            if c.h >= gh + 3:
-                c.cput(1, title, grad(PAL_ARCH, 0.2 - t * 0.1), bold=True)
-                y0 = 2
-        c.blank(x0, y0, gw, gh, None)      # the star field / aurora never shows through the board
+            foot = c.h - 1
+            has_title = c.h >= gh + 3
+            y0 = 1 + max(0, (c.h - 2 - gh - has_title) // 2)
+            if has_title:
+                c.cput(y0, title, grad(PAL_ARCH, 0.2 - t * 0.1), bold=True)
+                y0 += 1
+        c.blank(x0, y0, gw, gh, BG)        # the board counts as drawn: no star or aurora inside it
         g.draw(c, U, x0, y0, t)
         hint = g.hints + "   ·   Esc — выйти из игры"
         if len(hint) > c.w - 2:
             hint = g.hints + "  ·  Esc — выход"
-        c.cput(foot, hint[:c.w - 2], DIM)
+        keyline(c, foot, hint)
 
     def draw_dashboard(self, c, t, fade=1.0):
         W = min(c.w - 8, 84)
         x0 = (c.w - W) // 2
         p = self.prog
         top = max(1, c.h // 2 - 13)
+        gap = 1 if c.h < 30 else 2         # blank rows between blocks: one on a laptop, two on a desktop
 
         # header
         head = "A R C H   U P D A T E"
@@ -1495,7 +1572,7 @@ class LiveView(engine.TerminalView):
         order = engine.Progress.STAGES
         cur = order.index(p.stage) if p.stage in order else -1
         seg = W // len(stages)
-        y = top + 4
+        y = top + 2 + gap
         for i, (key, name) in enumerate(stages):
             idx = order.index(key)
             cx = x0 + i * seg + seg // 2
@@ -1505,16 +1582,16 @@ class LiveView(engine.TerminalView):
                 pulse = 0.55 + 0.45 * math.sin(t * 5)
                 dot, col = "◉", lerp(DIM, grad(PAL_RUN, i * 0.15 - t * 0.2), pulse)
             else:
-                dot, col = "○", FAINT
+                dot, col = "○", MUTED
             if i < len(stages) - 1:
                 lc = grad(PAL_RUN, i * 0.15) if idx < cur else FAINT
-                c.put(cx + 2, y, "─" * (seg - 3), lc, alpha=fade)
+                c.put(cx + 2, y, ("━" if idx < cur else "─") * (seg - 3), lc, alpha=fade)     # done: heavier
             c.put(cx, y, dot, col, bold=True, alpha=fade)
-            c.put(cx - len(name) // 2, y + 1, name, TEXT if idx == cur else (DIM if idx < cur else FAINT),
+            c.put(cx - len(name) // 2, y + 1, name, TEXT if idx == cur else (DIM if idx < cur else MUTED),
                   bold=idx == cur, alpha=fade)
 
         # stage line
-        y += 4
+        y += 2 + gap
         title = {"start": "Подготовка", "download": "Скачиваю пакеты", "install": "Устанавливаю пакеты",
                  "hooks": "Выполняю хуки", "aur": "Собираю пакеты из AUR", "cleanup": "Наводим порядок",
                  "end": "Готово"}.get(p.stage, "Обновление")
@@ -1535,17 +1612,7 @@ class LiveView(engine.TerminalView):
         # progress bar (overall), sub-cell precision, flowing gradient
         y += 2
         frac = p.overall()
-        bw = W
-        filled = frac * bw
-        parts = " ▏▎▍▌▋▊▉█"
-        for i in range(bw):
-            col = grad(PAL_RUN, i / bw * 0.8 - t * 0.25)
-            if i < int(filled):
-                c.put(x0 + i, y, "█", col, alpha=fade)
-            elif i == int(filled):
-                c.put(x0 + i, y, parts[int((filled - i) * 8)], col, alpha=fade)
-            else:
-                c.put(x0 + i, y, "─", FAINT, alpha=fade)
+        bar(c, x0, y, W, frac, lambda i: grad(PAL_RUN, i / W * 0.8 - t * 0.25), alpha=fade)
         pct = f"{int(frac * 100)}%"
         c.put(x0 + W - len(pct), y + 1, pct, TEXT, bold=True, alpha=fade)
 
@@ -1565,8 +1632,8 @@ class LiveView(engine.TerminalView):
         c.put(x0 + len(eta_txt) + 3, y + 1, el, DIM, alpha=fade)
 
         # activity feed: newest at the bottom, older lines fade out
-        y += 4
-        rows = max(4, min(9, c.h - y - 5))
+        y += 2 + gap
+        rows = max(3, min(9, c.h - 5 - gap - y))      # the invitation keeps its blank row(s) above
         items = self.feed[-rows:]
         for i, (ts, text, kind) in enumerate(items):
             age_rank = len(items) - 1 - i
@@ -1581,13 +1648,13 @@ class LiveView(engine.TerminalView):
 
         # invitation to play
         inv = "▶  G — мини-игры, пока идёт обновление"
-        yy = min(c.h - 5, y + rows + 2)
+        yy = y + rows + gap
         ix = (c.w - len(inv)) // 2
         pulse = 0.7 + 0.3 * math.sin(t * 2.2)
         for i, ch in enumerate(inv):
             c.put(ix + i, yy, ch, lerp(BG, grad(PAL_ARCH, i / len(inv) * 0.6 - t * 0.15), pulse), bold=True, alpha=fade)
         hint = "Ctrl+] — полный вывод и ручной режим" + ("   ·   ←→ монитор" if self.app.monitors > 1 else "")
-        c.cput(c.h - 2, hint, FAINT, alpha=fade)
+        keyline(c, c.h - 2, hint, MUTED, DIM, alpha=fade)      # quieter than the invitation above
 
 
 def transition(app, view):
@@ -1668,7 +1735,10 @@ def draw_summary(app, sv, t, demo, left):
     """One frame of the summary; left = seconds until it closes by itself, None if it stays open."""
     c = app.s.canvas
     W = min(c.w - 8, 84)
-    top = max(1, c.h // 2 - 12)
+    gap = 7 if c.h < 30 else 8                                   # glyph top -> headline
+    wraps = [textwrap.wrap(tx, max(10, W - 4), break_on_hyphens=False) or [""] for _, tx, _ in sv.lines]
+    need = gap + 3 + sum(min(2, len(w)) for w in wraps)          # glyph, headline, stats, blank, list
+    top = max(1, (c.h - 4 - need) // 2)                          # centred above the journal line
     gw = len(sv.glyph[0])
     gx = (c.w - gw) // 2
     for ry, row in enumerate(sv.glyph):
@@ -1679,7 +1749,7 @@ def draw_summary(app, sv, t, demo, left):
                 if ch in SHADOW_CHARS:
                     col = shade(col, 0.45)
                 c.put(gx + i, top + ry, ch, col, bold=True, alpha=a)
-    y = top + 8
+    y = top + gap
     c.cput(y, sv.head, grad(sv.pal, 0.2 - t * 0.1), bold=True, alpha=clamp01((t - 0.4) / 0.4))
     if demo:
         c.cput(y + 1, "демо-режим: это была имитация, система не менялась", DIM, alpha=clamp01((t - 0.5) / 0.4))
@@ -1688,25 +1758,26 @@ def draw_summary(app, sv, t, demo, left):
     y += 3
     longest = max([min(len(tx), W - 4) for _, tx, _ in sv.lines] or [0]) + 4
     x0 = (c.w - longest) // 2
-    for i, (icon, text, col) in enumerate(sv.lines[: max(3, c.h - y - 6)]):
+    for i, (icon, _, col) in enumerate(sv.lines[: max(3, c.h - y - 6)]):
         a = clamp01((t - 0.7 - i * 0.08) / 0.35)
-        wrapped = textwrap.wrap(text, max(10, W - 4)) or [""]
+        wrapped = wraps[i]
         if y + min(2, len(wrapped)) > c.h - 5:            # low terminal: the log line stays readable
             break
         c.put(x0 + 2, y, icon, col, bold=True, alpha=a)
-        c.put(x0 + 4, y, wrapped[0], TEXT if icon != "✓" else DIM, alpha=a)
+        tcol = TEXT if icon != "✓" else DIM               # one colour per item, its second line too
+        c.put(x0 + 4, y, wrapped[0], tcol, alpha=a)
         y += 1
         for extra in wrapped[1:2]:
-            c.put(x0 + 4, y, extra, DIM, alpha=a)
+            c.put(x0 + 4, y, extra, tcol, alpha=a)
             y += 1
     if sv.log:
-        c.cput(c.h - 4, "журнал: " + sv.log.replace(os.path.expanduser("~"), "~"), FAINT)
+        c.cput(c.h - 4, "журнал: " + sv.log.replace(os.path.expanduser("~"), "~"), MUTED)
     mon = "   ·   ←→ монитор" if app.monitors > 1 else ""
     if left is not None:
-        c.cput(c.h - 2, f"закроется через {int(math.ceil(left))} с   ·   Enter — закрыть{mon}   ·   "
-                        "любая клавиша — оставить", DIM)
+        keyline(c, c.h - 2, f"закроется через {int(math.ceil(left))} с   ·   Enter — закрыть{mon}   ·   "
+                            "любая клавиша — оставить")
     else:
-        c.cput(c.h - 2, "Enter — закрыть" + mon, DIM)
+        keyline(c, c.h - 2, "Enter — закрыть" + mon)
 
 
 def summary_screen(app, res, elapsed, demo=False):

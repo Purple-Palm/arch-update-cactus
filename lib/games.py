@@ -23,10 +23,10 @@ def frame(c, U, x, y, w, h, color, title=""):
         c.put(x + 2, y, f" {title} ", U.TEXT, bold=True)
 
 
-def block(c, x, y, s, col, ghost=False, alpha=1.0, head=False):
+def block(c, x, y, s, col, ghost=False, alpha=1.0):
     """One board cell at scale s: 2*s columns by s rows (s=1 keeps the small classic look)."""
     if s == 1:
-        c.put(x, y, "░░" if ghost else ("▓▓" if head else "▇▇"), col, alpha=alpha)
+        c.put(x, y, "░░" if ghost else "▇▇", col, alpha=alpha)
         return
     w = 2 * s - 1                       # gap on the right ...
     for r in range(s):
@@ -35,16 +35,19 @@ def block(c, x, y, s, col, ghost=False, alpha=1.0, head=False):
         elif r == s - 1:                # ... and half a row at the bottom: every cell reads as a tile
             c.put(x, y + r, "▀" * w, col, alpha=alpha)
         else:
-            c.put(x, y + r, ("▓" if head else "█") * w, col, alpha=alpha)
+            c.put(x, y + r, "█" * w, col, alpha=alpha)
 
 
 def overlay(c, U, x, y, w, h, lines, t):
-    """Centered message over a board (pause / game over)."""
-    cy = y + h // 2 - len(lines) // 2
+    """A card over a board (pause / game over): one panel with a blank row around the text, in the
+    upper third so the snake (which starts mid-board) and Tetris's stack stay visible below it."""
+    cw = min(w - 2, max(len(text) for text, _ in lines) + 6)
+    chh = len(lines) + 2
+    cx, cy = x + (w - cw) // 2, y + max(1, (h - chh) // 3)
+    c.blank(cx, cy, cw, chh, U.PANEL)
     for i, (text, bold) in enumerate(lines):
         col = U.grad(U.PAL_ARCH, 0.2 - t * 0.15) if bold else U.TEXT
-        bx = x + (w - len(text)) // 2
-        c.put(bx - 1, cy + i, " " + text + " ", col, bg=U.PANEL, bold=bold)
+        c.put(x + (w - len(text)) // 2, cy + 1 + i, text, col, bg=U.PANEL, bold=bold)
 
 
 # ───────────────────────────── Tetris ─────────────────────────────
@@ -314,11 +317,14 @@ class Snake:
             col = U.grad(U.PAL_RUN, i / max(8, n) * 0.6)
             if i == 0:
                 col = U.lerp(col, (255, 255, 255), 0.35)
-            block(c, x0 + 1 + x * 2 * s, y0 + 1 + y * s, s, col, head=i == 0)
+            block(c, x0 + 1 + x * 2 * s, y0 + 1 + y * s, s, col)     # the head: lighter, not dithered
         if self.food:
             pulse = 0.6 + 0.4 * abs(((t * 2.5) % 2) - 1)
             fx, fy = x0 + 1 + self.food[0] * 2 * s, y0 + 1 + self.food[1] * s
-            c.put(fx + s - 1, fy + s // 2, "◆", U.lerp(U.BG, U.PINK, pulse), bold=True)
+            if s == 1:
+                c.put(fx, fy, "◆", U.lerp(U.BG, U.PINK, pulse), bold=True)
+            else:                       # a big board: the food is a tile like the snake's, not a speck
+                block(c, fx, fy, s, U.lerp(U.BG, U.PINK, pulse))
         if self.paused:
             overlay(c, U, x0, y0, bw, bh, [("ПАУЗА", True), ("Space — продолжить", False)], t)
         elif self.over:
