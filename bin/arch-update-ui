@@ -15,6 +15,7 @@ handed to you, every run logged to ~/.local/state/arch-update-auto/logs/.
   arch-update-ui --demo    the whole show on a simulated update (changes nothing)
   arch-update-ui --self-test   draw every screen off-screen (used before a self-update is accepted)
 """
+import errno
 import html
 import json
 import math
@@ -650,16 +651,22 @@ def reports_parts(st):
     if not st["endpoint"]:
         return parts + ["сервер для отчётов ещё не подключён — отчёты ждут на этой машине"
                         + (f": {st['waiting']}" if st["waiting"] else "")]
+    # The sender notes its last error as it came ("HTTP 400: …", "URLError: …"), said here in short.
+    # A refusal is final; other errors are tried again with the reports still waiting, so with none
+    # waiting such an error is out of date.
+    http = re.match(r"HTTP (\d+)", st["last_error"] or "")
+    code = int(http.group(1)) if http else None
+    refused = code is not None and code not in (408, 429) and code < 500
     m = re.match(r"\d{4}-(\d\d)-(\d\d)T(\d\d):(\d\d)", st["last_sent"] or "")
     if st["waiting"]:
         parts.append(f"ждут отправки: {st['waiting']}")
-    elif m:
-        parts.append("последний отчёт отправлен {1}.{0} {2}:{3}".format(*m.groups()))
-    else:
-        parts.append("первый отчёт уйдёт после следующего обновления")
-    if st["last_error"]:
-        err = " ".join(st["last_error"].split())
-        parts.append("ошибка: " + (err if len(err) <= 48 else err[:47] + "…"))
+    elif not refused:                                   # a refusal is newer than the last report sent
+        parts.append("последний отчёт отправлен {1}.{0} {2}:{3}".format(*m.groups()) if m else
+                     "первый отчёт уйдёт после следующего обновления")
+    if refused:
+        parts.append("последний отчёт не принят сервером")
+    elif st["last_error"] and st["waiting"]:
+        parts.append(("сервер не ответил" if code else "нет связи с сервером") + " — повторю при следующем запуске")
     return parts
 
 
@@ -1260,19 +1267,26 @@ class App:
         try:
             report.set_consent(on)           # off also drops what was still waiting to be sent
         except OSError as e:
-            self.toast(f"не удалось сохранить: {e.strerror or e}", secs=4)
+            why = {errno.ENOSPC: "нет места на диске", errno.EROFS: "диск только для чтения",
+                   errno.EACCES: "нет прав на запись", errno.EPERM: "нет прав на запись"}
+            self.toast(f"не удалось сохранить выбор: {why.get(e.errno, 'ошибка записи')}", secs=4)
             return
         self.refresh_reports()
         self.pv_gen += 1                     # the preview carries this machine's ID only while on
-        self.toast("спасибо! отчёт уйдёт после следующего обновления" if on else
-                   "отчёты выключены" + (", неотправленные удалены" if waiting else ""), secs=3)
+        if not on:
+            self.toast("отчёты выключены" + (", неотправленные удалены" if waiting else ""), secs=3)
+        elif self.rep["endpoint"]:
+            self.toast("спасибо! отчёт уйдёт после следующего обновления", secs=3)
+        else:                                # no server yet: they wait on this machine (the line below says so)
+            self.toast("спасибо! отчёты включены — уйдут, когда подключат сервер", secs=3)
 
     def _load_preview(self, gen):
         try:
             src = preview_source(report.preview())
         except Exception as e:               # whatever went wrong, the screen says it instead of waiting
             src = [("json", f"не удалось собрать отчёт: {e!r}")]
-        self.pv_data = (gen, src)
+        if gen == self.pv_gen:               # one for an earlier visit, finished late, is not shown
+            self.pv_data = (gen, src)
 
     def preview_rows(self, width):
         """The preview wrapped to the width, or None while it is being put together (in a thread
@@ -1326,7 +1340,7 @@ class App:
             c.cput(y, line, DIM)
             y += 1
         y += 1
-        view_h = max(1, c.h - y - 4)
+        view_h = max(1, c.h - y - 5)        # the row below the text says where it is; the toast's row stays free
         self.pv_page = max(1, view_h - 2)
         rows = self.preview_rows(W)
         if rows is None:
@@ -2007,7 +2021,9 @@ class ReportLine:
         if self.state == "rejected":
             return "отчёт не принят сервером"
         if self.state == "waiting":
-            if self.endpoint and now - self.t0 < self.SENDING:
+            if not self.endpoint:            # nothing sends it before a server is set
+                return "отчёт сохранён — уйдёт, когда подключат сервер"
+            if now - self.t0 < self.SENDING:
                 return "отчёт: отправляется…"
             return "отчёт ждёт отправки — уйдёт при следующем запуске"
         return ""
@@ -2017,8 +2033,9 @@ def queue_report(app, res, mode, elapsed):
     """This update's report, if the user said yes (never for the demo): queued, and sent by a
     process of its own. Returns its ReportLine for the summary, or None when none was made."""
     w, h = term_size()
+    mon = app.monitors or None               # counted only for Konsole on KDE: elsewhere unknown, not 0
     path = report.after_update(res, demo=DEMO, mode=mode, seconds=elapsed,
-                               ui={"screen": f"{w}x{h}", "monitors": app.monitors})
+                               ui={"screen": f"{w}x{h}", "monitors": mon})
     return ReportLine(path) if path else None
 
 
@@ -2161,7 +2178,9 @@ def self_test():
     states = [dict(REPORTS_UNDECIDED), dict(REPORTS_UNDECIDED, decided=True),
               dict(REPORTS_UNDECIDED, enabled=True, decided=True, id="1a2b3c4d", waiting=2),
               dict(REPORTS_UNDECIDED, enabled=True, decided=True, id="f" * 90, endpoint=True, waiting=12,
-                   last_sent="2026-10-30T17:45:45", last_error="URLError: " + "name resolution failed " * 6)]
+                   last_sent="2026-10-30T17:45:45", last_error="URLError: " + "name resolution failed " * 6),
+              dict(REPORTS_UNDECIDED, enabled=True, decided=True, id="1a2b3c4d", endpoint=True,
+                   last_sent="2026-10-30T17:45:45", last_error="HTTP 400: отчёт не принят")]
     preview = json.dumps({"schema": 1, "id": "1a2b3c4d", "time": "2026-10-31T08:00:00Z",
                           "updater": {"commit": "abc1234", "date": "31.10.2026"},
                           "device": {"model": "очень длинное название модели " * 6, "odd": "\x1b[2J\x9b2J",
@@ -2234,8 +2253,9 @@ def self_test():
                                (summary_view(None, 0), True, None)):
             shot(lambda: draw_summary(app, sv, 2.0, demo, left))
         sent = ReportLine(os.path.join(report.OUTBOX, "x.json"))
-        for state, age in (("waiting", 0), ("waiting", 60), ("sent", 0), ("rejected", 0)):
-            sent.state, sent.t0, sent.polled, sent.endpoint = state, time.time() - age, math.inf, True
+        for state, age, endpoint in (("waiting", 0, True), ("waiting", 60, True), ("waiting", 0, False),
+                                     ("sent", 0, True), ("rejected", 0, True)):
+            sent.state, sent.t0, sent.polled, sent.endpoint = state, time.time() - age, math.inf, endpoint
             shot(lambda: draw_summary(app, summary_view(res, 125, sent), 2.0, False, 7.5))
     print("arch-update-ui: self-test ok")
 

@@ -50,6 +50,8 @@ class Run:
         self.lock = threading.Lock()
         env = {k: v for k, v in os.environ.items() if not k.startswith(("XDG_", "ARCH_UPDATE"))}
         env.update(HOME=self.home, TERM="xterm-256color", LANG="C.UTF-8", LC_ALL="C.UTF-8")
+        # No run reaches the real server for the update reports, whatever lib/report.py has as ENDPOINT.
+        env["ARCH_UPDATE_REPORT_URL"] = ""
         self.child = pexpect.spawn(sys.executable, [UI, "--demo"], env=env, dimensions=(rows, cols))
         # The UI blocks once the pty buffer is full, so somebody must read all the time.
         self.reader = threading.Thread(target=self._drain, daemon=True)
@@ -203,6 +205,8 @@ class Run:
             return
         if "ВКЛ" not in self.text() or "ВЫКЛ" in self.text():
             self.failures.append("настройки: после Enter отчёты не включились")
+        if "когда подключат сервер" not in self.text():     # there is no server here: the toast says so
+            self.failures.append("настройки: после включения обещана отправка, а сервера нет")
         self.send(DOWN, ENTER)
         if not self.wait("preview", '"device"', timeout=60):
             return
