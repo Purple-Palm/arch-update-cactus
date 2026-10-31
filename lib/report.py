@@ -5,9 +5,10 @@ developer, so that a problem on any machine can be looked into without asking fo
 A report holds the update's result (verdict, changed packages, the post-update checks), what the
 machine is (model, CPU, GPU, memory, kernel, desktop, terminal, and how it is connected: Wi-Fi or
 cable, the adapter, the signal) and the update's log. Taken out of all of it: the user's and the
-host's names, home paths, IP and MAC addresses, e-mail addresses and the machine ID. The name of
-the Wi-Fi network is never read. Nothing is collected while reports are off (the default), and
-the demo never reports.
+host's names, home paths, IP and MAC addresses, e-mail addresses, the machine ID, passwords and
+tokens in web addresses, the instance names of systemd units (a user or a Wi-Fi network can be
+named there) and a password typed before its prompt showed. The name of the Wi-Fi network is never
+read. Nothing is collected while reports are off (the default), and the demo never reports.
 
 Everything stays in ~/.local/state/arch-update-auto: settings.json (the choice, a random report
 ID), reports/outbox (waiting to be sent) and reports/sent (the last ones that went out).
@@ -21,6 +22,7 @@ ID), reports/outbox (waiting to be sent) and reports/sent (the last ones that we
 import datetime
 import fcntl
 import glob
+import http.client
 import json
 import os
 import platform
@@ -31,6 +33,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -48,6 +51,7 @@ SENT = os.path.join(REPORTS, "sent")
 REJECTED = os.path.join(REPORTS, "rejected")
 STATUS = os.path.join(REPORTS, "status.json")
 KEEP = {OUTBOX: 20, SENT: 20, REJECTED: 5}
+TRIES = 3                           # times the relay may fail on one report (500, 502) before it is set aside
 LOG_LIMIT = 200_000                 # characters of log in one report: the head and the tail of a longer one
 ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
@@ -70,9 +74,24 @@ def _read_json(path):
 def _write_json(path, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+    except BaseException:
+        _remove(tmp)                    # a full disk leaves no half-written file behind
+        raise
+
+
+def _remove(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _str(value):
+    return value if isinstance(value, str) else ""
 
 
 def settings():
@@ -88,24 +107,33 @@ def decided():
 
 
 def set_consent(on):
-    """The user's choice. Switching off also drops what was waiting to be sent."""
+    """The user's choice. Switching off drops what was waiting to be sent, before anything else: if
+    the choice cannot be written then, settings.json goes (without it reports are off) and the error
+    is raised all the same."""
     s = settings()
     s["reports"] = bool(on)
     s["reports_decided"] = datetime.date.today().isoformat()
-    if on and not re.fullmatch(r"[0-9a-f]{8}", str(s.get("report_id", ""))):
+    if on and not _id_ok(s.get("report_id")):
         s["report_id"] = secrets.token_hex(4)          # random: not derived from anything on the machine
-    _write_json(SETTINGS, s)
     if not on:
         for f in glob.glob(os.path.join(OUTBOX, "*.json")):
-            try:
-                os.remove(f)
-            except OSError:
-                pass
+            _remove(f)
+    try:
+        _write_json(SETTINGS, s)
+    except OSError:
+        if not on:
+            _remove(SETTINGS)
+        raise
     return s
 
 
+def _id_ok(rid):
+    return isinstance(rid, str) and re.fullmatch(r"[0-9a-f]{8}", rid) is not None
+
+
 def report_id():
-    return settings().get("report_id", "")
+    rid = settings().get("report_id")
+    return rid if _id_ok(rid) else ""
 
 
 # ───────────────────────────── taking out what is personal ─────────────────────────────
@@ -114,13 +142,35 @@ def report_id():
 # log: replacing every one of them would ruin the log, and as a user or host name they say nothing.
 COMMON = {"arch", "archlinux", "linux", "user", "admin", "root", "home", "test", "pc", "computer", "laptop",
           "desktop", "chromebook", "localhost", "penguin", "manjaro", "endeavouros", "cachyos", "garuda"}
+# The words of what the scrubber puts in: a name that is one of them (Mac) is not looked for inside <mac>.
+PLACEHOLDERS = {"user", "host", "name", "email", "mac", "secret", "credentials", "instance"}
 MAC = re.compile(r"(?<![\w:-])(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![\w:-])")
-IPV4 = re.compile(r"(?<![\w.:-])(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
+IPV4 = re.compile(r"(?<![\w.-])(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
                   r"(?![\w.-])")
 IPV6 = re.compile(r"(?<![\w:.])(?:(?:[0-9A-Fa-f]{1,4}:){4,7}[0-9A-Fa-f]{1,4}"
                   r"|(?:[0-9A-Fa-f]{1,4}:)+:(?:[0-9A-Fa-f]{1,4}:)*[0-9A-Fa-f]{1,4})(?![\w:.])")
 EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]{1,64}@[\w-]{1,63}(?:\.[\w-]{1,63}){0,8}\.(?!(?:service|socket|timer|mount|"
                    r"target|path|slice|scope|device|swap|automount)\b)[A-Za-z]{2,24}\b")
+# What a web address carries before "@" (user:password, or a token alone): makepkg prints the source
+# it failed to fetch as it is. Found from "://", never from a scheme: a pattern that starts with the
+# scheme's letters tries every word boundary of a long run again (quadratic on "a.a.a.a…").
+CREDENTIALS = re.compile(r"://[^\s/?#@:'\"<>]+(?::[^\s/?#'\"]*)?@")
+# A secret in a query or a fragment: ?token=…, &api_key=…, #access_token=…, X-Amz-Signature=…
+SECRET_PARAM = re.compile(r"(?i)([?&;#][\w.~%+-]{0,40}?(?:token|auth|key|pass|pwd|secret|sig|credential|jwt|session"
+                          r"|x-amz-|x-goog-)[\w.~%+-]{0,40}=)[^\s&#;'\"<>()\[\],]+")
+# A password typed before its prompt showed is echoed on a line of its own, right above the prompt.
+TYPED_AHEAD = re.compile(r"(?im)^\S{1,128}\n(?=[^\n]*?(?:password|passphrase|пароль))(?=[^\n]*:[^\S\n]*$)")
+TYPED_AHEAD_SAYS = "<ввод до запроса пароля>\n"
+# A templated unit's instance can be a user (syncthing@cactus.service) or a Wi-Fi network (netctl names
+# its profiles "interface-network": netctl@wlp2s0\x2dHome.service); a number (user@1000.service) or a
+# tty (getty@tty1.service) says nothing, if that is all of it (ping@192.168.1.5.service is no number).
+# Unit names are at most 255 characters.
+UNIT_TYPE = r"\.(?:service|socket|timer|path|target)\b"
+UNIT_INSTANCE = re.compile(r"@(?!(?:\d+|tty\w*)" + UNIT_TYPE + r")[\w:.\\-]{1,255}(" + UNIT_TYPE + ")")
+# Right after a user name in a unit's name: more of a path (home-cactus-Music.mount, systemd writes a "-"
+# in a folder's name as \x2d) or the unit's end (home-cactus.mount).
+UNIT_AFTER_NAME = (r"(?=(?:-|\\x2d)[\w.\\-]{0,255}\.(?:mount|automount|swap)\b"
+                   r"|\.(?:mount|automount|swap|service|socket|timer|path|target)\b)")
 
 
 def _who():
@@ -130,7 +180,8 @@ def _who():
         pw = pwd.getpwuid(os.getuid())
         users.add(pw.pw_name)
         homes.add(pw.pw_dir)
-        names.update(p for p in re.split(r"[\s,]+", pw.pw_gecos) if p)     # the real name, if one is set
+        # the real name, if one is set (not the room or the phone numbers that can follow it)
+        names.update(p for p in re.split(r"[\s,]+", pw.pw_gecos) if re.search(r"[^\W\d_]", p))
     except KeyError:
         pass
     users.update(filter(None, (os.environ.get("USER"), os.environ.get("LOGNAME"))))
@@ -152,24 +203,37 @@ def _who():
 
 
 def scrubber():
-    """A function that takes everything personal out of a text (see the module's doc)."""
+    """A function that takes everything personal out of a text (see the module's doc). What it leaves
+    it leaves again: a text scrubbed twice is the text scrubbed once."""
     users, hosts, names, homes, machine = _who()
-    rules = []
+    rules = [(TYPED_AHEAD, TYPED_AHEAD_SAYS)]
     for h in sorted(homes, key=len, reverse=True):            # /home/cactus/... → ~/...
         rules.append((re.compile(r"(?<![\w.-])" + re.escape(h) + r"(?![\w.-])"), "~"))
     for u in users:
         for h in hosts:
             rules.append((re.compile(re.escape(u) + "@" + re.escape(h), re.I), "<user>@<host>"))
+    # In these places a user name is one whatever it is, a common word too (see COMMON).
     for u in sorted(users, key=len, reverse=True):
         rules.append((re.compile(r"(?i)(password for |пароль для |/home/|user |пользовател[ья] )" + re.escape(u)
-                                 + r"(?![\w.-])"), r"\1<user>"))
+                                 + r"(?![\w-])"), r"\1<user>"))
+    # Before the e-mail rule (bob:secret@example.com is no address) and that before the names
+    # (cactus@cactus.dev is an address, not a user at some host).
+    rules += [(CREDENTIALS, "://<credentials>@"), (SECRET_PARAM, r"\1<secret>"), (EMAIL, "<email>")]
+    for u in sorted(users, key=len, reverse=True):            # home-cactus.mount, run-media-cactus-USB.mount
+        forms = "|".join(re.escape(f) for f in sorted({u, u.replace("-", r"\x2d")}, key=len, reverse=True))
+        rules.append((re.compile(r"(?i)(?:(?<=[-@])|(?<=\\x2d))(?:" + forms + ")" + UNIT_AFTER_NAME), "<user>"))
+    # A name ends where a word does: before a "." too (zork-laptop.local, "set to zork-laptop."), but
+    # not before a "-" (arch-update-cactus is no user's name).
+    plain, guarded = (r"(?<![\w-])", r"(?![\w-])"), (r"(?<![\w<-])", r"(?![\w>-])")
     for words, repl in ((users, "<user>"), (hosts, "<host>"), (names, "<name>")):
         for w in sorted(words, key=len, reverse=True):
             if len(w) >= 3 and w.lower() not in COMMON:
-                rules.append((re.compile(r"(?<![\w.-])" + re.escape(w) + r"(?![\w.-])", re.I), repl))
+                before, after = guarded if w.lower() in PLACEHOLDERS else plain
+                rules.append((re.compile(before + re.escape(w) + after, re.I), repl))
+    rules.append((UNIT_INSTANCE, r"@<instance>\1"))           # after the names: syncthing@<user>.service stays
     if re.fullmatch(r"[0-9a-f]{32}", machine):
         rules.append((re.compile(machine, re.I), "<machine-id>"))
-    rules += [(MAC, "<mac>"), (EMAIL, "<email>"), (IPV4, "<ip>"), (IPV6, "<ip>")]
+    rules += [(MAC, "<mac>"), (IPV4, "<ip>"), (IPV6, "<ip>")]
 
     def scrub(text):
         for rx, repl in rules:
@@ -377,9 +441,30 @@ def _log_text(path):
     except (OSError, TypeError):
         return ""
     if len(text) > LOG_LIMIT:
-        head, tail = text[:LOG_LIMIT // 4], text[-(LOG_LIMIT * 3 // 4):]
+        head, tail = _cut(text)
         text = f"{head}\n…[пропущено {len(text) - len(head) - len(tail)} символов]…\n{tail}"
     return text
+
+
+def _cut(text):
+    """The head (LOG_LIMIT // 4) and the tail (the rest of LOG_LIMIT) of a longer log, cut between lines,
+    or in a line that long between words: a name cut in two would get past the scrubber. Only a word
+    that long is cut where it falls."""
+    end, start = LOG_LIMIT // 4, len(text) - LOG_LIMIT * 3 // 4
+    for sep in "\n ":
+        i = text.rfind(sep, 0, end)
+        if i != -1:
+            end = i
+            break
+    last = text.rfind("\n", 0, end) + 1
+    if TYPED_AHEAD.match(text, last):                     # a password typed ahead, its prompt cut away
+        end = max(last - 1, 0)
+    for sep in "\n ":
+        i = text.find(sep, start, len(text) - 1)          # not the newline that ends the log
+        if i != -1:
+            start = i + 1
+            break
+    return text[:end], text[start:]
 
 
 def build(res, mode="auto", seconds=None, ui=None):
@@ -399,9 +484,19 @@ def build(res, mode="auto", seconds=None, ui=None):
 
 
 def _prune(folder):
+    """Only the newest KEEP[folder] reports stay."""
     for old in sorted(glob.glob(os.path.join(folder, "*.json")))[:-KEEP[folder]]:
+        _remove(old)
+    _drop_old_tmp(folder)
+
+
+def _drop_old_tmp(folder):
+    """Temp files a write left behind (killed halfway): gone after a day, when no write can still be at it."""
+    day_ago = time.time() - 86400
+    for tmp in glob.glob(os.path.join(folder, "*.tmp")):
         try:
-            os.remove(old)
+            if os.path.getmtime(tmp) < day_ago:
+                os.remove(tmp)
         except OSError:
             pass
 
@@ -459,45 +554,93 @@ def send_pending(timeout=15):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return 0, len(waiting)                     # another sender is at it
+        _drop_old_tmp(REPORTS)
         return _send(waiting, url, timeout)
+
+
+def _tries(names):
+    """How often the relay failed on each report still waiting, as status.json counts them."""
+    got = _read_json(STATUS).get("tries")
+    if not isinstance(got, dict):
+        return {}
+    return {k: n for k, n in got.items() if k in names and type(n) is int and n > 0}
 
 
 def _send(waiting, url, timeout):
     sent = 0
     agent = "arch-update-cactus/" + updater_version().get("commit", "?")
+    scrub = scrubber()
+    tries = _tries({os.path.basename(p) for p in waiting})
     for path in waiting:
+        if not enabled():                               # switched off meanwhile
+            break
+        name = os.path.basename(path)
         try:
-            with open(path, "rb") as f:
-                data = f.read()
-        except OSError:
+            with open(path, encoding="utf-8") as f:
+                report = json.load(f)
+        except OSError:                                 # taken back meanwhile
             continue
-        req = urllib.request.Request(url, data=data, method="POST",
-                                     headers={"Content-Type": "application/json", "User-Agent": agent})
+        except ValueError:
+            report = None
+        if not isinstance(report, dict):                # damaged: the relay would refuse it
+            _file_away(path, REJECTED)
+            continue
+        # Through the scrubber once more: one queued by an older version goes out as clean as a new one.
+        report = scrub_all(report, scrub)
+        data = json.dumps(report, ensure_ascii=False).encode("utf-8", "replace")
         try:
+            req = urllib.request.Request(url, data=data, method="POST",
+                                         headers={"Content-Type": "application/json", "User-Agent": agent})
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 code = r.status
         except urllib.error.HTTPError as e:
             code = e.code
-        except (OSError, ValueError) as e:              # offline, DNS, TLS: try again later
-            _note(last_error=f"{type(e).__name__}: {e}"[:200])
+        except (OSError, ValueError, http.client.HTTPException) as e:   # offline, DNS, TLS: try again later
+            _note(last_error=f"{type(e).__name__}: {e}"[:200], tries=tries)
             break
         if 200 <= code < 300:
-            dest = SENT
             sent += 1
-            _note(last_sent=datetime.datetime.now().isoformat(timespec="seconds"), last_error="")
-        elif code in (408, 429) or code >= 500:
-            _note(last_error=f"HTTP {code}")
+            tries.pop(name, None)
+            _note(last_sent=datetime.datetime.now().isoformat(timespec="seconds"), last_error="", tries=tries)
+            _file_away(path, SENT, report)
+        elif code in (408, 429, 503):                   # busy or limited: the others would get the same now
+            _note(last_error=f"HTTP {code}", tries=tries)
             break
+        elif code >= 500:                               # it failed on this one: the next may go through
+            tries[name] = tries.get(name, 0) + 1
+            if tries[name] < TRIES:
+                _note(last_error=f"HTTP {code}", tries=tries)
+                continue
+            del tries[name]
+            _note(last_error=f"HTTP {code}: отчёт не принят после {TRIES} попыток", tries=tries)
+            _file_away(path, REJECTED, report)
         else:                                           # refused for good: keep a few to look at
-            dest = REJECTED
-            _note(last_error=f"HTTP {code}: отчёт не принят")
-        os.makedirs(dest, exist_ok=True)
+            tries.pop(name, None)
+            _note(last_error=f"HTTP {code}: отчёт не принят", tries=tries)
+            _file_away(path, REJECTED, report)
+    return sent, len(glob.glob(os.path.join(OUTBOX, "*.json")))
+
+
+def _file_away(path, dest, report=None):
+    """Out of the outbox into dest (sent/ or rejected/): the report as it went out, or the file itself
+    when there is none or it cannot be written."""
+    target = os.path.join(dest, os.path.basename(path))
+    copied = False
+    if report is not None:
         try:
-            os.replace(path, os.path.join(dest, os.path.basename(path)))
+            _write_json(target, report)
+            copied = True
         except OSError:
             pass
-        _prune(dest)
-    return sent, len(glob.glob(os.path.join(OUTBOX, "*.json")))
+    try:
+        if copied:
+            os.remove(path)
+        else:
+            os.makedirs(dest, exist_ok=True)
+            os.replace(path, target)
+    except OSError:
+        pass
+    _prune(dest)
 
 
 def state_of(path):
@@ -510,11 +653,11 @@ def state_of(path):
 
 
 def status():
-    """For the settings screen."""
+    """For the settings screen: the same keys and types whatever status.json and settings.json hold."""
     s = _read_json(STATUS)
     return {"enabled": enabled(), "decided": decided(), "id": report_id(), "endpoint": bool(endpoint()),
             "waiting": len(glob.glob(os.path.join(OUTBOX, "*.json"))),
-            "last_sent": s.get("last_sent", ""), "last_error": s.get("last_error", "")}
+            "last_sent": _str(s.get("last_sent")), "last_error": _str(s.get("last_error"))}
 
 
 def preview():
@@ -522,7 +665,9 @@ def preview():
     sent = sorted(glob.glob(os.path.join(SENT, "*.json")) + glob.glob(os.path.join(OUTBOX, "*.json")),
                   key=os.path.basename)
     report = _read_json(sent[-1]) if sent else {}
-    if not report:
+    if report:
+        report = scrub_all(report, scrubber())         # as it goes out (see _send)
+    else:
         logs = sorted(glob.glob(os.path.join(engine.STATE_DIR, "logs", "20*.log")))
         report = build({"verdict": None, "log": logs[-1] if logs else None}, mode="—")
         report["id"] = report["id"] or "(появится, когда отчёты включены)"
