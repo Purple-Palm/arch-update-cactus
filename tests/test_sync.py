@@ -343,12 +343,10 @@ class Install(unittest.TestCase):
         os.makedirs(self.home)
         _, remote = stand_in_for_github(self.tmp)
         self.tag = git(remote, "rev-parse", "refs/tags/stable")
-        stubs = os.path.join(self.tmp, "stubs")
+        stubs = self.stubs = os.path.join(self.tmp, "stubs")
         os.makedirs(stubs)
         for name, body in STUBS.items():
-            with open(os.path.join(stubs, name), "w") as f:
-                f.write("#!/bin/bash\n" + body + "\n")
-            os.chmod(os.path.join(stubs, name), 0o755)
+            self.stub(name, body)
         gitconfig = os.path.join(self.tmp, "gitconfig")          # GitHub is the stand-in
         with open(gitconfig, "w") as f:
             f.write(f'[url "{remote}"]\n\tinsteadOf = https://github.com/Purple-Palm/arch-update-cactus.git\n')
@@ -359,6 +357,11 @@ class Install(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def stub(self, name, body):
+        with open(os.path.join(self.stubs, name), "w") as f:
+            f.write("#!/bin/bash\n" + body + "\n")
+        os.chmod(os.path.join(self.stubs, name), 0o755)
 
     def install(self, **env):
         """The README one-liner: install.sh piped into bash. Returns (exit status, output)."""
@@ -379,6 +382,20 @@ class Install(unittest.TestCase):
         with open(os.path.join(self.home, ".config/arch-update/arch-update.conf")) as f:
             self.assertEqual(f.read(), "KeepOldPackages=2\nAURHelper=yay\n")
         self.assertTrue(os.path.isfile(os.path.join(self.home, ".config/autostart/arch-update-tray.desktop")))
+        self.assertIn("готово", out)
+        # no user systemd here, so no timers: the report must not promise hourly updates
+        self.assertNotIn("раз в час", out)
+        self.assertIn("фоновые проверки не включились", out)
+
+    def test_a_refused_sudo_is_named_and_a_rerun_finishes(self):
+        self.stub("pacman", '[[ "$*" == "-Q libnotify" ]] && exit 1\nexit 0')    # one package to install
+        self.stub("sudo", 'echo "tester is not in the sudoers file." >&2\nexit 1')
+        status, out = self.install()
+        self.assertEqual(status, 1, out)
+        self.assertIn("sudo -v", out)
+        self.stub("sudo", "exit 0")                                            # fixed: the same one-liner
+        status, out = self.install()
+        self.assertEqual(status, 0, out)
         self.assertIn("готово", out)
 
     def test_arch_update_config_is_found_under_xdg_config_home(self):

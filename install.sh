@@ -33,6 +33,14 @@ die() {
 	exit 1
 }
 
+# Packages are installed through sudo; a fresh Arch install may not have it yet.
+need_sudo() {
+	command -v sudo >/dev/null && return 0
+	warn "нет sudo, а пакеты ставятся через него. Один раз под root (su -):"
+	warn "  pacman -S sudo && usermod -aG wheel $(id -un) && echo '%wheel ALL=(ALL:ALL) ALL' >/etc/sudoers.d/wheel"
+	die "потом перелогинься и запусти установщик снова"
+}
+
 # Where this script lives; empty when it is piped from curl.
 SRC=${BASH_SOURCE[0]-}
 ROOT=
@@ -45,6 +53,7 @@ bootstrap() {
 	[[ ! -L $DEST ]] || die "$DEST — ссылка (на копию для разработки?), её не трогаю"
 	if ! command -v git >/dev/null; then
 		say "нужен git — ставлю"
+		need_sudo
 		{ sudo pacman -S --needed git; } </dev/tty
 	fi
 	if [[ -d $DEST/.git ]]; then
@@ -150,11 +159,11 @@ self_check() {
 
 # Build and install one AUR package with plain makepkg (asks for sudo itself).
 makepkg_aur() {
-	local tmp
+	local tmp ok=0
 	tmp=$(mktemp -d)
-	git clone --quiet "https://aur.archlinux.org/$1.git" "$tmp/$1"
-	(cd "$tmp/$1" && makepkg -si --needed)
+	git clone --quiet "https://aur.archlinux.org/$1.git" "$tmp/$1" && (cd "$tmp/$1" && makepkg -si --needed) && ok=1
 	rm -rf "$tmp"
+	((ok))
 }
 
 install_packages() {
@@ -172,24 +181,28 @@ install_packages() {
 	if ! "$ROOT/bin/arch-update-launcher" --terminal >/dev/null; then
 		missing+=(kitty)
 	fi
+	local again="Исправь и запусти установщик снова: что уже стоит, второй раз не ставится"
 	if ((${#missing[@]})); then
 		say "ставлю пакеты: ${missing[*]}"
+		need_sudo
 		sudo pacman -S --needed "${missing[@]}" ||
-			die "pacman не смог поставить пакеты. Если он не нашёл их на зеркале — сначала обнови систему: sudo pacman -Syu"
+			die "пакеты не поставились. Если не пустил sudo — проверь: sudo -v. Если pacman не нашёл их на зеркале — сначала обнови систему: sudo pacman -Syu. $again"
 	fi
 	# AUR packages: yay, as on the main machine (the auto-answers know its questions best)
 	local helper
 	if ! helper=$(aur_helper); then
 		say "ставлю yay (помощник для пакетов из AUR)"
-		sudo pacman -S --needed base-devel
-		makepkg_aur yay-bin
+		need_sudo
+		sudo pacman -S --needed base-devel || die "не поставился base-devel (нужен, чтобы собрать yay). $again"
+		makepkg_aur yay-bin || die "yay не собрался: AUR недоступен или сборка упала (её вывод выше). $again"
 		helper=yay
 	fi
 	command -v arch-update >/dev/null && return 0
 	local pkg=arch-update
 	[[ $(uname -m) == x86_64 ]] && pkg=arch-update-bin      # prebuilt; elsewhere it is built from source
 	say "ставлю $pkg из AUR через $helper"
-	"$helper" -S --needed "$pkg"
+	need_sudo
+	"$helper" -S --needed "$pkg" || die "$pkg не поставился из AUR (вывод $helper выше). $again"
 	command -v arch-update >/dev/null || die "arch-update не установился"
 }
 
@@ -228,13 +241,22 @@ setup_arch_update() {
 }
 
 report() {
-	local term de=${XDG_CURRENT_DESKTOP:-?}
+	local term de=${XDG_CURRENT_DESKTOP:-?} timer=0
 	term=$("$ROOT/bin/arch-update-launcher" --terminal 2>/dev/null || echo "не найден")
+	systemctl --user is-enabled --quiet arch-update-cactus-sync.timer 2>/dev/null && timer=1
 	say "готово: Arch Update by Cactus $(git -C "$ROOT" log -1 --format='%h от %cd' --date=format:%d.%m.%Y)"
 	echo "   окружение: $de · терминал: $term · AUR: $(aur_helper || echo нет)"
 	echo "   запуск: иконка Arch-Update в трее или меню приложений; демо: ~/.local/bin/arch-update-launcher --demo"
-	echo "   новые версии приезжают сами (раз в час, после входа и при запуске); проверить сейчас:"
+	if ((timer)); then
+		echo "   новые версии приезжают сами (раз в час, после входа и при запуске); проверить сейчас:"
+	else
+		echo "   новые версии приезжают при запуске; проверить сейчас:"
+	fi
 	echo "   ~/.local/bin/arch-update-cactus-sync"
+	if ((!timer)); then
+		warn "фоновые проверки не включились: в этом сеансе нет systemd --user (установщик запущен через su?)."
+		warn "  запусти его ещё раз из терминала на рабочем столе — включатся"
+	fi
 	if [[ $de == *GNOME* ]] && ! pacman -Q gnome-shell-extension-appindicator >/dev/null 2>&1; then
 		warn "в GNOME значок в трее появится только с расширением AppIndicator:"
 		warn "  sudo pacman -S gnome-shell-extension-appindicator, затем перелогинься и включи его в «Расширениях»"
