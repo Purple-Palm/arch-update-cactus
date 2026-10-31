@@ -48,7 +48,7 @@ SENT = os.path.join(REPORTS, "sent")
 REJECTED = os.path.join(REPORTS, "rejected")
 STATUS = os.path.join(REPORTS, "status.json")
 KEEP = {OUTBOX: 20, SENT: 20, REJECTED: 5}
-LOG_LIMIT = 400_000                 # characters of log in one report: the head and the tail of a longer one
+LOG_LIMIT = 200_000                 # characters of log in one report: the head and the tail of a longer one
 ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 
