@@ -43,7 +43,7 @@ if [[ -t 1 && -t 2 && ${TERM:-dumb} != dumb ]]; then
 	TTY=1
 	cols=$(stty size 2>/dev/null </dev/tty) || cols=
 	cols=${cols#* }
-	if [[ $cols =~ ^[0-9]+$ ]] && ((cols < WIDTH)); then
+	if [[ $cols =~ ^[0-9]+$ ]] && ((cols > 0 && cols < WIDTH)); then   # 0: the size is not known
 		WIDTH=$((cols > 40 ? cols : 40))
 	fi
 	if [[ -z ${NO_COLOR-} ]]; then                # https://no-color.org
@@ -105,25 +105,29 @@ banner() {
 	printf '  %s  %sby Cactus%s\n\n' "${lines[-1]}" "$DIM" "$OFF"
 }
 
-# WRAPPED = $2 broken between words into lines of at most WIDTH - $1 columns; leading spaces of $2
-# indent each of its lines. (${#} counts letters in a UTF-8 locale and bytes in "C": there a line
-# comes out shorter, never longer.)
+# WRAPPED = $2 broken between words into lines of at most WIDTH - $1 columns. A $2 that starts with
+# spaces is a command and stays one line, indented by them: copied from the screen, it has to run as
+# it is (a terminal narrower than the command folds it, and a copy still gives one line). (${#}
+# counts letters in a UTF-8 locale and bytes in "C": there a line comes out shorter, never longer.)
 WRAPPED=()
 wrap() {
-	local lead=${2%%[! ]*} room word line=''
+	local room=$((WIDTH - $1)) word line=''
 	local -a words=()
-	room=$((WIDTH - $1 - ${#lead}))
-	read -r -d '' -a words <<<"$2" || true
 	WRAPPED=()
+	if [[ $2 == ' '* ]]; then
+		WRAPPED=("$2")
+		return 0
+	fi
+	read -r -d '' -a words <<<"$2" || true
 	for word in "${words[@]}"; do
 		if [[ -n $line ]] && ((${#line} + 1 + ${#word} > room)); then
-			WRAPPED+=("$lead$line")
+			WRAPPED+=("$line")
 			line=$word
 		else
 			line=${line:+$line }$word
 		fi
 	done
-	WRAPPED+=("$lead$line")
+	WRAPPED+=("$line")
 }
 
 # End a "●" line that waits for its result: its ✓, ! or ✗ line takes its place.
@@ -184,19 +188,37 @@ pending() {
 
 # An aligned block (the card about reports, the final report) is collected in BLOCK first. A row is
 # a label of 10 columns, padded where it is written (printf would pad bytes, not letters), and its
-# value broken to fit under itself; each further argument continues the value on a line of its own.
+# value broken to fit beside it; each further argument continues the value on a line of its own. A
+# part that does not fit there (a long path, or a command, on a narrow terminal) goes under the
+# label instead, two columns in, or none for a line that needs them. A command starts with spaces,
+# as for wrap(); here they only mark it and are not shown.
 BLOCK=()
 row() {
-	local label=$1 part i
+	local label=$1 part line under
 	shift
 	for part in "$@"; do
 		wrap 16 "$part"
-		for i in "${!WRAPPED[@]}"; do
+		under=0
+		for line in "${WRAPPED[@]}"; do
+			line=${line#"${line%%[! ]*}"}
+			((${#line} <= WIDTH - 16)) || under=1
+		done
+		if ((under)); then
+			wrap 6 "$part"
+			[[ -z $label ]] || BLOCK+=("$DIM${label%"${label##*[! ]}"}$OFF")
+			label=
+		fi
+		for line in "${WRAPPED[@]}"; do
+			line=${line#"${line%%[! ]*}"}
 			if [[ -n $label ]]; then
-				BLOCK+=("$DIM$label$OFF  ${WRAPPED[i]}")
+				BLOCK+=("$DIM$label$OFF  $line")
 				label=
+			elif ((!under)); then
+				BLOCK+=("            $line")
+			elif ((${#line} <= WIDTH - 6)); then
+				BLOCK+=("  $line")
 			else
-				BLOCK+=("            ${WRAPPED[i]}")
+				BLOCK+=("$line")
 			fi
 		done
 	done
@@ -427,7 +449,8 @@ setup_arch_update() {
 		warn "в ${conf/#"$HOME"/\~} включён NoVersion: без версий апдейтер не увидит список обновлений." \
 			"Закомментируй его"
 	fi
-	[[ -f $config/autostart/arch-update-tray.desktop ]] || arch-update --tray --enable >/dev/null || true
+	local autostart=$config/autostart/arch-update-tray.desktop
+	[[ -f $autostart ]] || arch-update --tray --enable >/dev/null || true
 	systemctl --user enable --now --quiet arch-update.timer 2>/dev/null || true
 	# The tray picks the menu entry's file once, when it starts: one that started before our
 	# entry existed keeps opening the plain arch-update until it is restarted.
@@ -445,7 +468,31 @@ setup_arch_update() {
 	else
 		setsid -f arch-update --tray >/dev/null 2>&1 </dev/null || true
 	fi
-	ok "arch-update" "настроен, значок в трее"
+	# Claim only what is so. The icon is there when the applet runs in a graphical session (one just
+	# started gets two seconds to come up); from ssh or a console it has no screen to show on here,
+	# and its autostart entry brings it at the next login.
+	local screen=${WAYLAND_DISPLAY-}${DISPLAY-} up=0 i
+	if [[ -n $screen ]]; then
+		for ((i = 0; i < 10; i++)); do
+			if pgrep -xu "$USER" arch-update-tra >/dev/null; then
+				up=1
+				break
+			fi
+			sleep 0.2
+		done
+	fi
+	if ((up)); then
+		ok "arch-update" "настроен, значок в трее"
+	elif [[ -f $autostart && -z $screen ]]; then
+		ok "arch-update" "настроен, значок появится при входе"
+	else
+		ok "arch-update" "настроен"
+	fi
+	if [[ ! -f $autostart ]]; then
+		warn "автозапуск значка в трее не включился:" "  arch-update --tray --enable"
+	elif ((!up)) && [[ -n $screen ]]; then
+		warn "значок в трее не запустился:" "  arch-update --tray"
+	fi
 }
 
 # Update reports (lib/report.py) stay off until the user says yes. The question comes once, on an
@@ -505,8 +552,7 @@ summary() {
 	echo
 	row 'окружение ' "$shown · терминал: $term · AUR: $(aur_helper || echo нет)"
 	row 'запуск    ' "значок Arch-Update в трее или меню приложений"
-	# shellcheck disable=SC2088  # a path for the user to type, not one to expand
-	row 'демо      ' "~/.local/bin/arch-update-launcher --demo"
+	row 'демо      ' "  ~/.local/bin/arch-update-launcher --demo"
 	if ((timer)); then
 		row 'обновления' "новые версии приезжают сами: раз в час, при входе и при запуске" \
 			"проверить сейчас: ~/.local/bin/arch-update-cactus-sync"

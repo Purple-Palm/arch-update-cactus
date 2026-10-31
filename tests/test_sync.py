@@ -16,7 +16,9 @@ Install does a first install on a clean HOME the way the README does (install.sh
 cloning the tag from the stand-in), with stubs for pacman, sudo, arch-update and the rest; it is
 skipped as root, which install.sh refuses. Without a terminal its output is plain text that fits
 80 columns and the question about update reports is not asked; in a terminal (a pty) the question
-comes once, only a yes turns reports on, and --sync and --check never ask.
+comes once, only a yes turns reports on, and --sync, --check and an install whose stdin is not the
+keyboard never ask. The tray icon is claimed only when it is there, and a narrow terminal gets
+lines that fit it, with commands left whole.
 Needs git; the UI self-test inside and the terminal runs need python-pexpect.
 """
 import fcntl
@@ -322,7 +324,7 @@ STUBS = {
     "pacman": "exit 0", "sudo": "exit 0", "yay": "exit 0", "kitty": "exit 0", "setsid": "exit 0",
     "fc-list": "echo 'Noto Sans'",
     "systemctl": "exit 1",                  # no user systemd: no timers, nothing reaches a real session
-    "pgrep": "exit 1",
+    "pgrep": "exit 1", "pkill": "exit 0",
     # like the real one: its files under XDG_CONFIG_HOME, and it refuses to overwrite either of them
     "arch-update": 'config=${XDG_CONFIG_HOME:-$HOME/.config}\n'
                    'echo "$*" >>"$HOME/arch-update.calls"\n'
@@ -378,13 +380,14 @@ class Install(unittest.TestCase):
                                start_new_session=True)
         return r.returncode, (r.stdout + r.stderr).decode("utf-8", "replace")
 
-    def in_a_terminal(self, *cmd, answer=None, typed_ahead=""):
-        """cmd in an 80x24 terminal that shows colours (a pty); typed_ahead is typed right away, and the
-        question about update reports, if it comes, gets answer and Enter. Returns (exit status, output
-        without colours, whether it asked)."""
+    def in_a_terminal(self, *cmd, answer=None, typed_ahead="", size=(24, 80), **env):
+        """cmd in a terminal that shows colours (a pty of size rows x columns); typed_ahead is typed
+        right away, and the question about update reports, if it comes, gets answer and Enter. Returns
+        (exit status, the output as the screen shows it: no colours, each line as its last carriage
+        return left it, whether it asked)."""
         import pexpect
-        child = pexpect.spawn(cmd[0], list(cmd[1:]), env=dict(self.env, TERM="xterm-256color"),
-                              encoding="utf-8", dimensions=(24, 80), timeout=120)
+        child = pexpect.spawn(cmd[0], list(cmd[1:]), env=dict(self.env, TERM="xterm-256color", **env),
+                              encoding="utf-8", dimensions=size, timeout=120)
         child.send(typed_ahead)
         out, asked = "", False
         while child.expect_exact([QUESTION, pexpect.EOF]) == 0:
@@ -395,7 +398,8 @@ class Install(unittest.TestCase):
             child.sendline(answer or "")
         out += child.before
         child.close()
-        return child.exitstatus, ANSI.sub("", out).replace("\r", ""), asked
+        screen = [line.rstrip("\r").rsplit("\r", 1)[-1] for line in ANSI.sub("", out).split("\n")]
+        return child.exitstatus, "\n".join(screen), asked
 
     def one_liner_in_a_terminal(self, **kw):
         return self.in_a_terminal("bash", "-c", 'cat "$0" | bash', os.path.join(ROOT, "install.sh"), **kw)
@@ -426,6 +430,8 @@ class Install(unittest.TestCase):
         with open(os.path.join(self.home, ".config/arch-update/arch-update.conf")) as f:
             self.assertEqual(f.read(), "KeepOldPackages=2\nAURHelper=yay\n")
         self.assertTrue(os.path.isfile(os.path.join(self.home, ".config/autostart/arch-update-tray.desktop")))
+        # no graphical session to show it in: the icon is promised for the next login, not claimed
+        self.assertIn("✓ arch-update · настроен, значок появится при входе", out)
         self.assertIn("Готово — Arch Update by Cactus", out)
         # no user systemd here, so no timers: the report must not promise hourly updates
         self.assertNotIn("раз в час", out)
@@ -445,6 +451,28 @@ class Install(unittest.TestCase):
         self.assertIn("новые версии приезжают сами: раз в час, при входе и при запуске", out)    # on one line
         self.assertNotIn("фоновые проверки не включились", out)
         self.assertPlainAndNarrow(out)
+
+    def test_the_tray_icon_is_claimed_only_when_it_is_there(self):
+        # arch-update cannot set up the tray's autostart: no icon is promised, the command to try is given
+        self.stub("arch-update", '[[ "$*" == "--tray --enable" ]] && { echo "ERROR: no tray" >&2; exit 5; }\n'
+                  + STUBS["arch-update"])
+        status, out = self.install()
+        self.assertEqual(status, 0, out)
+        self.assertRegex(out, r"(?m)^  ✓ arch-update · настроен$")
+        self.assertIn("  ! автозапуск значка в трее не включился:\n      arch-update --tray --enable\n", out)
+        # in a graphical session (a rerun, which sets the autostart up): an applet that never comes up...
+        self.stub("arch-update", STUBS["arch-update"])
+        status, out = self.install(DISPLAY=":0")
+        self.assertEqual(status, 0, out)
+        self.assertRegex(out, r"(?m)^  ✓ arch-update · настроен$")
+        self.assertIn("  ! значок в трее не запустился:\n      arch-update --tray\n", out)
+        # ...and one that runs
+        self.stub("pgrep", "exit 0")
+        status, out = self.install(DISPLAY=":0")
+        self.assertEqual(status, 0, out)
+        self.assertIn("  ✓ arch-update · настроен, значок в трее\n", out)
+        self.assertNotIn("не запустился", out)
+        self.assertNotIn("автозапуск значка", out)
 
     def test_a_refused_sudo_is_named_and_a_rerun_finishes(self):
         self.stub("pacman", '[[ "$*" == "-Q libnotify" ]] && exit 1\nexit 0')    # one package to install
@@ -506,6 +534,31 @@ class Install(unittest.TestCase):
                 self.assertEqual(status, 0, out)
                 self.assertFalse(asked, out)
         self.assertIsNone(self.reports())
+
+    def test_an_install_without_a_keyboard_does_not_ask(self):
+        # the output on a terminal, but stdin not one (a script started it): there is nobody to answer
+        status, out = self.install()
+        self.assertEqual(status, 0, out)
+        installed = os.path.join(self.home, ".local/share/arch-update-cactus/install.sh")
+        status, out, asked = self.in_a_terminal("bash", "-c", '"$0" </dev/null', installed)
+        self.assertEqual(status, 0, out)
+        self.assertIn("Готово", out)
+        self.assertFalse(asked, out)
+        self.assertIsNone(self.reports())
+
+    def test_the_width_follows_the_terminal(self):
+        # 40 columns: every line fits, but for commands, which stay whole so that a copy of one runs
+        self.stub("pacman", '[[ "$*" == "-Q gnome-shell-extension-appindicator" ]] && exit 1\nexit 0')
+        status, out, asked = self.one_liner_in_a_terminal(size=(24, 40), XDG_CURRENT_DESKTOP="GNOME")
+        self.assertEqual(status, 0, out)
+        self.assertTrue(asked, out)
+        self.assertEqual([line.strip() for line in out.splitlines() if len(line) > 40],
+                         ["~/.local/bin/arch-update-launcher --demo",
+                          "sudo pacman -S gnome-shell-extension-appindicator"], out)
+        # a terminal that does not know its size (0x0: a serial console, ssh -tt) is not a narrow one
+        status, out, asked = self.one_liner_in_a_terminal(size=(0, 0))
+        self.assertEqual(status, 0, out)
+        self.assertEqual(out.count(BANNER_ROW), 1, out)
 
     def test_arch_update_config_is_found_under_xdg_config_home(self):
         config = os.path.join(self.tmp, "xdg-config")
