@@ -669,7 +669,9 @@ def reports_parts(st):
     # waiting such an error is out of date.
     http = re.match(r"HTTP (\d+)", st["last_error"] or "")
     code = int(http.group(1)) if http else None
-    refused = code is not None and code not in (408, 429) and code < 500
+    # A refusal: a 4xx answer, or a report set aside after the server failed on it again and again
+    refused = code is not None and ((code < 500 and code not in (404, 405, 408, 429))
+                                    or "не принят" in st["last_error"])
     m = re.match(r"\d{4}-(\d\d)-(\d\d)T(\d\d):(\d\d)", st["last_sent"] or "")
     if st["waiting"]:
         parts.append(f"ждут отправки: {st['waiting']}")
@@ -1022,10 +1024,9 @@ class App:
         the window opens: first the user has the chance to switch the reports off in Настройки. So
         when the menu is left for an update or for good (leaving=True) or after SEND_AFTER seconds in
         it, once per start, and only if the reports are still on then (never in the demo)."""
-        if not self.sender_due:
+        if not self.sender_due or not self.menu_since:  # left from the splash: the menu never showed, next time
             return
-        if not leaving and (self.state != "menu" or not self.menu_since
-                            or time.time() - self.menu_since < self.SEND_AFTER):
+        if not leaving and (self.state != "menu" or time.time() - self.menu_since < self.SEND_AFTER):
             return
         self.sender_due = False
         st = report.status()                # now, not as the window opened: a "no" since then counts
@@ -2252,7 +2253,9 @@ def self_test():
               dict(REPORTS_UNDECIDED, enabled=True, decided=True, id="1a2b3c4d", endpoint=True, waiting=1,
                    last_error="HTTP 503"),
               dict(REPORTS_UNDECIDED, enabled=True, decided=True, id="1a2b3c4d", endpoint=True,
-                   last_sent="2026-10-30T17:45:45", last_error="HTTP 400: отчёт не принят")]
+                   last_sent="2026-10-30T17:45:45", last_error="HTTP 400: отчёт не принят"),
+              dict(REPORTS_UNDECIDED, enabled=True, decided=True, id="1a2b3c4d", endpoint=True,
+                   last_sent="2026-10-30T17:45:45", last_error="HTTP 500: отчёт не принят после 3 попыток")]
     sent = ReportLine(lambda: os.path.join(report.OUTBOX, "x.json"))     # queued at once
     gate = threading.Event()
     building = ReportLine(lambda: gate.wait(60) and None)               # still being put together
