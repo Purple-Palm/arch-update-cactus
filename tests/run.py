@@ -10,6 +10,8 @@ address where nobody listens: the demo must still queue, send and mention none.
 Two more short runs (80x24, 200x60) open the settings with Enter pressed twice and held down (the
 reports must stay off), switch them on, look at "Что именно уходит", switch them off again and
 check that nothing was queued or sent.
+One run (80x24) takes "Обычный Arch-Update" and types a password ahead while the update gets ready
+(a stand-in pacman makes that take two seconds): it must reach neither the screen nor the journal.
 The output is rendered with pyte; the test fails on a UI exception, a screen that never shows
 up, or a bad exit. A text snapshot of every stage is written to tests/out/<cols>x<rows>/.
 
@@ -18,6 +20,7 @@ up, or a bad exit. A text snapshot of every stage is written to tests/out/<cols>
 
 Needs python-pexpect and python-pyte (pip: pexpect pyte).
 """
+import glob
 import json
 import os
 import shutil
@@ -37,10 +40,11 @@ SIZES = [(80, 24), (100, 30), (136, 38), (200, 60)]
 UP, DOWN, ESC, ENTER = "\x1b[A", "\x1b[B", "\x1b", "\r"
 REPORTS_ON = (136, 38)          # the play run at this size has the update reports on
 EARLIER_REPORT = "20261030-120000-abcd.json"     # waits in that run's outbox from the start
+TYPED_AHEAD = "secret-typed-ahead"               # the manual run's password, typed before anything asks
 
 
 class Run:
-    def __init__(self, cols, rows, name=None, reports_on=False):
+    def __init__(self, cols, rows, name=None, reports_on=False, slow_pacman=False):
         self.cols, self.rows = cols, rows
         self.reports_on = reports_on
         self.name = name or f"{cols}x{rows}"
@@ -58,6 +62,13 @@ class Run:
         env.update(HOME=self.home, TERM="xterm-256color", LANG="C.UTF-8", LC_ALL="C.UTF-8")
         # No run reaches the real server for the update reports, whatever lib/report.py has as ENDPOINT.
         env["ARCH_UPDATE_REPORT_URL"] = self.seed_reports() if reports_on else ""
+        if slow_pacman:                 # pacman -Q on a slow machine: the update takes a moment to start
+            stub = os.path.join(self.home, "stub")
+            os.makedirs(stub)
+            with open(os.path.join(stub, "pacman"), "w") as f:
+                f.write("#!/bin/sh\nsleep 2\n")
+            os.chmod(os.path.join(stub, "pacman"), 0o755)
+            env["PATH"] = stub + os.pathsep + env.get("PATH", os.defpath)
         self.child = pexpect.spawn(sys.executable, [UI, "--demo"], env=env, dimensions=(rows, cols))
         # The UI blocks once the pty buffer is full, so somebody must read all the time.
         self.reader = threading.Thread(target=self._drain, daemon=True)
@@ -188,6 +199,35 @@ class Run:
         if self.wait("menu", "Обновить автоматически", timeout=40):
             self.send("й")
 
+    def manual(self):
+        """Обычный Arch-Update, and a password typed ahead while the update gets ready: arch-update's
+        pty would echo it onto the screen and into the journal, so it must never get there. Every
+        question after that gets Enter (in the demo that goes on whatever the answer)."""
+        if not self.wait("menu", "Обычный Arch-Update", timeout=40):
+            return
+        self.send(DOWN, ENTER, pause=0.5)
+        self.send(TYPED_AHEAD)
+        if not self.wait("manual", "Proceed with update", timeout=30):
+            return
+        end = time.time() + 120
+        while time.time() < end and self.child.isalive() and "это была имитация" not in self.text():
+            if TYPED_AHEAD in self.text():
+                self.snapshot("manual-typed-ahead-FAILED")
+                self.failures.append("ручной режим: набранное заранее попало в arch-update")
+                return
+            self.send(ENTER, pause=1.5)
+        if not self.wait("summary", "это была имитация", timeout=5):
+            return
+        time.sleep(1.2)                                # the summary ignores keys for its first second
+        self.send(ENTER)
+        self.after.append(self.typed_ahead_not_logged)
+
+    def typed_ahead_not_logged(self):
+        for path in glob.glob(os.path.join(self.home, ".local/state/arch-update-auto/demo-logs/*.log")):
+            with open(path, encoding="utf-8", errors="replace") as f:
+                if TYPED_AHEAD in f.read():
+                    self.failures.append(f"ручной режим: набранное заранее попало в журнал {os.path.basename(path)}")
+
     def gone(self, stage, needle, timeout=20):
         """Wait until the needle has left the screen."""
         end = time.time() + timeout
@@ -302,8 +342,8 @@ class Run:
         shutil.rmtree(self.home, ignore_errors=True)
 
 
-def run(size, results, name=None, script=Run.play, reports_on=False):
-    r = Run(*size, name, reports_on)
+def run(size, results, name=None, script=Run.play, reports_on=False, slow_pacman=False):
+    r = Run(*size, name, reports_on, slow_pacman)
     try:
         script(r)
     except Exception as e:                              # a harness problem is a failure too
@@ -320,6 +360,8 @@ def main():
                for s in sizes]
     if not sys.argv[1:]:
         threads.append(threading.Thread(target=run, args=((80, 24), results, "80x24-menu-q", Run.quit_from_menu)))
+        threads.append(threading.Thread(target=run, args=((80, 24), results, "80x24-manual", Run.manual),
+                                        kwargs={"slow_pacman": True}))
         for cols, rows in ((80, 24), (200, 60)):
             threads.append(threading.Thread(target=run, args=((cols, rows), results, f"{cols}x{rows}-settings",
                                                               Run.settings)))

@@ -359,6 +359,14 @@ def term_size():
         return os.terminal_size((120, 40))
 
 
+def drop_typeahead():
+    """Throw away the keys typed but not read yet. Never raises (it runs as arch-update starts)."""
+    try:
+        termios.tcflush(0, termios.TCIFLUSH)
+    except (termios.error, OSError):        # no terminal any more: the window was closed
+        pass
+
+
 class Screen:
     def __init__(self):
         self.size = term_size()
@@ -2114,10 +2122,7 @@ def summary_screen(app, res, elapsed, demo=False, sent=None):
     s = app.s
     sv = summary_view(res, elapsed, sent)
     countdown = sv.verdict == 0 and not (res or {}).get("exitstatus")
-    try:
-        termios.tcflush(0, termios.TCIFLUSH)   # an Enter typed during the run/checks must not close it
-    except termios.error:
-        pass
+    drop_typeahead()                           # an Enter typed during the run/checks must not close it
     t0, keep, deadline = time.time(), not countdown, time.time() + 10
     while True:
         app.check_resize()
@@ -2286,10 +2291,19 @@ def run_manual(app, tty_state):
     engine.VIEW = view
     view.message("[arch-update] обычный Arch-Update: на вопросы отвечаешь ты. Всё пишется в журнал, "
                  "в конце будет проверка системы.\n")
+
+    # Keys typed while the screen switched (a password typed ahead) must never reach arch-update: its
+    # pty echoes them, onto the screen and into the journal. Nothing has asked for anything yet, so
+    # they go now, and again the moment it starts: run_update gets ready first (pacman -Q, sudo -n),
+    # which takes a moment on a slow machine, and whatever is typed meanwhile would go to it too.
+    def spawned(child):
+        app.child = child
+        drop_typeahead()
+
+    drop_typeahead()
     t0 = time.time()
     status, res, _ = engine.run_update(view, manual=True, cmd=DEMO_CMD if DEMO else None,
-                                       dims=tuple(app.s.size), on_spawn=lambda ch: setattr(app, "child", ch),
-                                       demo=DEMO)
+                                       dims=tuple(app.s.size), on_spawn=spawned, demo=DEMO)
     elapsed = time.time() - t0
     return res, elapsed, queue_report(app, res, "manual", elapsed)
 
