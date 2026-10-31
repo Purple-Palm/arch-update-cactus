@@ -20,6 +20,7 @@ LOG=$STATE/sync.log
 OK=$STATE/sync.ok
 REJECTED=$STATE/sync.rejected
 TAG=stable
+CHECK_SECS=120          # a self-test that hangs counts as failed (it takes seconds even on a slow laptop)
 mkdir -p "$STATE"
 
 log() {
@@ -47,7 +48,15 @@ wait=30
 
 exec 9>"$STATE/sync.lock"
 if [[ ${1-} == --quick ]]; then
-	flock -w 20 9 || exit 0
+	# Still busy after 20 s (a slow network): the window opens on what is checked out if that
+	# version passed here; one that sync has switched to and is still checking is waited for.
+	if ! flock -w 20 9; then
+		[[ $(git -C "$ROOT" rev-parse HEAD 2>/dev/null) == "$(cat "$OK" 2>/dev/null)" ]] && exit 0
+		if ! flock -w $((CHECK_SECS + 30)) 9; then
+			log "окно открылось, не дождавшись проверки версии $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)"
+			exit 0
+		fi
+	fi
 else
 	flock -n 9 || exit 0
 fi
@@ -64,7 +73,7 @@ switch_to() {
 
 # The checked-out version's self-test, then refresh what install.sh generates from it.
 verified() {
-	"$ROOT/install.sh" --check >>"$LOG" 2>&1 && "$ROOT/install.sh" --sync >>"$LOG" 2>&1
+	timeout "$CHECK_SECS" "$ROOT/install.sh" --check >>"$LOG" 2>&1 && "$ROOT/install.sh" --sync >>"$LOG" 2>&1
 }
 
 # This version failed here: back to the last one that passed.

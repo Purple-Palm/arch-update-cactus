@@ -4,9 +4,10 @@
 Each test builds "main" with the tag "stable" (moved by CI once the tests pass) from this working
 tree in a bare repository, installs it into an empty HOME the way install.sh does, then pushes new
 versions and runs the sync: a good one is taken, a broken one is rolled back, one CI has not
-passed is left alone, a check cut short is redone, edits in the installed copy are saved and
-undone, a development clone is never touched, an unreachable GitHub is reported once, and a
-machine installed from the former "stable" branch follows the tag.
+passed is left alone, a check cut short is redone, a launch never opens a version that is still
+being checked, edits in the installed copy are saved and undone, a development clone is never
+touched, an unreachable GitHub is reported once, and a machine installed from the former "stable"
+branch follows the tag.
 
   python3 tests/test_sync.py
 Promote runs CI's promote step, cut out of .github/workflows/test.yml, against the same kind of
@@ -16,10 +17,12 @@ cloning the tag from the stand-in), with stubs for pacman, sudo, arch-update and
 skipped as root, which install.sh refuses.
 Needs git; the UI self-test inside needs python-pexpect.
 """
+import fcntl
 import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -149,6 +152,35 @@ class Sync(unittest.TestCase):
         self.sync()
         self.assertEqual(self.head(), self.v1)
         self.assertEqual(self.read_state("sync.rejected"), bad)
+
+    def test_a_launch_never_opens_a_version_still_being_checked(self):
+        # The launcher's sync waits 20 s for one already running (the timer's), then lets the
+        # window open on a version that passed here, but waits on while one is being checked.
+        v2 = self.push("README.md", "\nновая строка\n", "v2")
+        fetching = os.path.join(self.tmp, "home2")             # a second machine, its sync still fetching
+        shutil.copytree(self.home, fetching, symlinks=True)
+        git(self.dest, "fetch", "-q", "origin", "stable")      # this one: switched to v2, check running
+        git(self.dest, "reset", "-q", "--hard", "FETCH_HEAD")
+        locks, runs = [], {}
+        for home in (self.home, fetching):
+            f = open(os.path.join(home, ".local/state/arch-update-auto/sync.lock"), "w")
+            fcntl.flock(f, fcntl.LOCK_EX)                     # the other sync holds the lock
+            locks.append(f)
+            runs[home] = subprocess.Popen([os.path.join(home, ".local/share/arch-update-cactus/bin/arch-update-cactus-sync"),
+                                           "--quick"], env=dict(self.env, HOME=home))
+            self.addCleanup(runs[home].wait)
+            self.addCleanup(runs[home].kill)                    # only matters when the test fails
+        t0 = time.time()
+        self.assertEqual(runs[fetching].wait(timeout=60), 0)
+        self.assertGreater(time.time() - t0, 19)
+        time.sleep(2)
+        self.assertIsNone(runs[self.home].poll())               # v2 has not passed yet: still waiting
+        with open(os.path.join(self.state, "sync.ok"), "w") as f:
+            f.write(v2 + "\n")                                  # the other sync's check passed
+        locks[0].close()
+        self.assertEqual(runs[self.home].wait(timeout=60), 0)
+        self.assertEqual(self.head(), v2)
+        locks[1].close()
 
     def test_an_install_from_the_stable_branch_follows_the_tag(self):
         # Machines installed before CI moved a tag cloned the branch "stable". Their sync runs the
