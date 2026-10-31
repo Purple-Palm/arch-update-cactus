@@ -59,7 +59,7 @@ def print_summary(res):
         say("✓ Всё прошло чисто, перезагрузка не нужна.\n", C_GRN)
     elif res["verdict"] == 1:
         say("✓ Обновление прошло нормально.\n", C_GRN)
-    say(f"Лог: {res['log']}\n", C_DIM)
+    say(f"Журнал: {res['log']}\n", C_DIM)
 
 
 def drop_typeahead():
@@ -159,7 +159,11 @@ def main():
         cols, rows = shutil.get_terminal_size((120, 40))
         if report.after_update(res, mode="manual" if manual else "auto", seconds=time.time() - t0,
                                ui={"screen": f"{cols}x{rows}"}):
-            say("Отчёт об этом обновлении уходит разработчику (выключить: Arch Update → Настройки).\n")
+            if report.endpoint():
+                say("Отчёт об этом обновлении уходит разработчику (выключить: Arch-Update → Настройки).\n")
+            else:                   # no server yet: nothing sends it, it waits on this machine
+                say("Отчёт сохранён — уйдёт, когда подключат сервер для отчётов "
+                    "(выключить: Arch-Update → Настройки).\n")
     if interactive and engine.TERM_OK:
         wait_close(verdict, status)
     sys.exit(2 if verdict == 2 else (status or 0))
