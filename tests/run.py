@@ -5,8 +5,9 @@ Every run gets its own empty HOME (the real one is never touched) and goes throu
 demo in a real pty: splash, menu, the auto mode dashboard, all three mini-games, the question
 modal, a game left open until the update finishes, the summary. Game and menu keys are also
 typed with the Russian layout on (з pauses Tetris; a short extra run leaves the menu with й).
-Two more short runs (80x24, 200x60) open the settings, switch the update reports on, look at
-"Что именно уходит", switch them off again and check that nothing was queued or sent.
+Two more short runs (80x24, 200x60) open the settings with Enter pressed twice and held down (the
+reports must stay off), switch them on, look at "Что именно уходит", switch them off again and
+check that nothing was queued or sent.
 The output is rendered with pyte; the test fails on a UI exception, a screen that never shows
 up, or a bad exit. A text snapshot of every stage is written to tests/out/<cols>x<rows>/.
 
@@ -183,10 +184,20 @@ class Run:
             return
         if "отчёты об обновлениях: не выбраны" not in self.text():
             self.failures.append("меню: нет подписи «отчёты об обновлениях: не выбраны»")
-        self.send(ENTER)
-        if not self.wait("settings", "ВЫКЛ", timeout=5):
+        # The Enter that opens the settings lands on the switch: pressed twice, or held down (the key
+        # repeats after about half a second, then every 40 ms), it must still not switch them on.
+        self.send(ENTER + ENTER)
+        if not self.still_off("settings-double-enter"):
+            return
+        self.send(ESC)
+        if not self.wait("menu-again", "▸ Настройки", timeout=5):
+            return
+        self.send(ENTER, pause=0.6)
+        self.send(*[ENTER] * 12, pause=0.04)
+        if not self.still_off("settings-held-enter"):
             return
         self.unpainted("settings")
+        time.sleep(1)                               # a fresh press after a pause is a choice
         self.send(ENTER)                            # the switch is the first item
         if not self.wait("settings-on", "ID этой машины", timeout=5):
             return
@@ -207,6 +218,18 @@ class Run:
             return
         self.send("q")
         self.after.append(self.nothing_reported)
+
+    def still_off(self, stage):
+        """The settings are open, the reports still off and no choice recorded."""
+        if not self.wait(stage, "Отчёты об обновлениях", timeout=5):
+            return False
+        time.sleep(0.5)
+        if "ВЫКЛ" not in self.text() or \
+                os.path.exists(os.path.join(self.home, ".local/state/arch-update-auto/settings.json")):
+            self.snapshot(stage + "-FAILED")
+            self.failures.append(f"{stage}: отчёты включились без отдельного нажатия")
+            return False
+        return True
 
     def nothing_reported(self):
         state = os.path.join(self.home, ".local/state/arch-update-auto")

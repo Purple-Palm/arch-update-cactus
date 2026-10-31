@@ -746,7 +746,7 @@ class App:
         # The reports' state, read again only when the settings are open: never once per frame.
         self.rep, self.rep_t = (report.status() if live else dict(REPORTS_UNDECIDED)), time.time()
         self.hinted = False
-        self.set_sel = 0
+        self.set_sel, self.set_key_t = 0, 0.0
         self.pv_open, self.pv_scroll, self.pv_page = False, 0, 10      # "Что именно уходит"
         self.pv_gen, self.pv_data, self.pv_busy, self.pv_wrap = 0, None, None, None
         bat = engine.battery() if live else None
@@ -1246,6 +1246,7 @@ class App:
     # ── settings
     def open_settings(self):
         self.state, self.set_sel, self.pv_open = "settings", 0, False
+        self.set_key_t = time.time()         # the Enter that opened the screen is no choice (see handle)
         self.pv_gen += 1                     # the preview is put together once per visit
         self.refresh_reports()
 
@@ -1448,7 +1449,12 @@ class App:
             elif key in ("enter", "space"):
                 what = SETTINGS_ITEMS[self.set_sel][0]
                 if what == "reports":
-                    self.toggle_reports()
+                    # As in the kernel/NVIDIA confirm, only a fresh press after a pause (longer than a
+                    # held key waits before it repeats) is a choice: the Enter that opened this screen,
+                    # pressed twice or held down, never flips the switch.
+                    fresh, self.set_key_t = time.time() - self.set_key_t > 0.8, time.time()
+                    if fresh:
+                        self.toggle_reports()
                 elif what == "preview":
                     self.pv_open, self.pv_scroll = True, 0
                 else:
