@@ -14,13 +14,17 @@ Promote runs CI's promote step, cut out of .github/workflows/test.yml, against t
 stand-in: it creates the tag, only ever moves it forward, and never overwrites a tag it cannot read.
 Install does a first install on a clean HOME the way the README does (install.sh piped into bash,
 cloning the tag from the stand-in), with stubs for pacman, sudo, arch-update and the rest; it is
-skipped as root, which install.sh refuses.
-Needs git; the UI self-test inside needs python-pexpect.
+skipped as root, which install.sh refuses. Without a terminal its output is plain text that fits
+80 columns and the question about update reports is not asked; in a terminal (a pty) the question
+comes once, only a yes turns reports on, and --sync and --check never ask.
+Needs git; the UI self-test inside and the terminal runs need python-pexpect.
 """
 import fcntl
 import os
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -332,6 +336,9 @@ STUBS = {
                    '\tmkdir -p "$config/autostart" && : >"$config/autostart/arch-update-tray.desktop" ;;\n'
                    'esac',
 }
+QUESTION = "Отправлять отчёты?"                  # the installer's question about update reports
+BANNER_ROW = "▄▀█ █▀█ █▀▀ █ █"                    # "ARCH" in the installer's banner
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
 class Install(unittest.TestCase):
@@ -364,13 +371,50 @@ class Install(unittest.TestCase):
         os.chmod(os.path.join(self.stubs, name), 0o755)
 
     def install(self, **env):
-        """The README one-liner: install.sh piped into bash. Returns (exit status, output)."""
+        """The README one-liner without a terminal: install.sh piped into bash, in a session of its own,
+        so it has no /dev/tty either (as in CI, whoever runs the tests). Returns (exit status, output)."""
         with open(os.path.join(ROOT, "install.sh"), "rb") as f:
-            r = subprocess.run(["bash"], stdin=f, env=dict(self.env, **env), capture_output=True, timeout=300)
+            r = subprocess.run(["bash"], stdin=f, env=dict(self.env, **env), capture_output=True, timeout=300,
+                               start_new_session=True)
         return r.returncode, (r.stdout + r.stderr).decode("utf-8", "replace")
 
+    def in_a_terminal(self, *cmd, answer=None, typed_ahead=""):
+        """cmd in an 80x24 terminal that shows colours (a pty); typed_ahead is typed right away, and the
+        question about update reports, if it comes, gets answer and Enter. Returns (exit status, output
+        without colours, whether it asked)."""
+        import pexpect
+        child = pexpect.spawn(cmd[0], list(cmd[1:]), env=dict(self.env, TERM="xterm-256color"),
+                              encoding="utf-8", dimensions=(24, 80), timeout=120)
+        child.send(typed_ahead)
+        out, asked = "", False
+        while child.expect_exact([QUESTION, pexpect.EOF]) == 0:
+            out += child.before + QUESTION
+            child.expect_exact("[y/N]")
+            out += child.before + child.after
+            asked = True
+            child.sendline(answer or "")
+        out += child.before
+        child.close()
+        return child.exitstatus, ANSI.sub("", out).replace("\r", ""), asked
+
+    def one_liner_in_a_terminal(self, **kw):
+        return self.in_a_terminal("bash", "-c", 'cat "$0" | bash', os.path.join(ROOT, "install.sh"), **kw)
+
+    def reports(self):
+        """The user's choice about update reports, as the installer reads it: "включены", "выключены",
+        or None while there is none."""
+        cli = [sys.executable, os.path.join(self.home, ".local/share/arch-update-cactus/lib/report.py")]
+        if subprocess.run(cli + ["--decided"], env=self.env).returncode:
+            return None
+        return subprocess.run(cli + ["--status"], env=self.env, capture_output=True, text=True).stdout.strip()
+
+    def assertPlainAndNarrow(self, out):
+        """Output for a pipe or a log: no colour codes, and no line wider than a Chromebook's 80 columns."""
+        self.assertNotIn("\x1b", out)
+        self.assertEqual([line for line in out.splitlines() if len(line) > 80], [])
+
     def test_first_install_on_a_clean_machine(self):
-        status, out = self.install()
+        status, out = self.install(TERM="xterm-256color")       # a desktop terminal's TERM, the output to a pipe
         self.assertEqual(status, 0, out)
         dest = os.path.join(self.home, ".local/share/arch-update-cactus")
         self.assertEqual(git(dest, "rev-parse", "HEAD"), self.tag)
@@ -382,10 +426,25 @@ class Install(unittest.TestCase):
         with open(os.path.join(self.home, ".config/arch-update/arch-update.conf")) as f:
             self.assertEqual(f.read(), "KeepOldPackages=2\nAURHelper=yay\n")
         self.assertTrue(os.path.isfile(os.path.join(self.home, ".config/autostart/arch-update-tray.desktop")))
-        self.assertIn("готово", out)
+        self.assertIn("Готово — Arch Update by Cactus", out)
         # no user systemd here, so no timers: the report must not promise hourly updates
         self.assertNotIn("раз в час", out)
         self.assertIn("фоновые проверки не включились", out)
+        # no terminal to answer from: nobody is asked about reports, and the choice stays open
+        self.assertNotIn(QUESTION, out)
+        self.assertIsNone(self.reports())
+        self.assertRegex(out, r"отчёты +выключены")
+        # the banner shows once, not again in the copy the bootstrap starts
+        self.assertEqual(out.count(BANNER_ROW), 1, out)
+        self.assertPlainAndNarrow(out)
+
+    def test_with_user_systemd_the_report_promises_the_timer(self):
+        self.stub("systemctl", "exit 0")                    # a desktop session: user systemd, the timers enable
+        status, out = self.install()
+        self.assertEqual(status, 0, out)
+        self.assertIn("новые версии приезжают сами: раз в час, при входе и при запуске", out)    # on one line
+        self.assertNotIn("фоновые проверки не включились", out)
+        self.assertPlainAndNarrow(out)
 
     def test_a_refused_sudo_is_named_and_a_rerun_finishes(self):
         self.stub("pacman", '[[ "$*" == "-Q libnotify" ]] && exit 1\nexit 0')    # one package to install
@@ -393,10 +452,60 @@ class Install(unittest.TestCase):
         status, out = self.install()
         self.assertEqual(status, 1, out)
         self.assertIn("sudo -v", out)
+        self.assertPlainAndNarrow(out)
         self.stub("sudo", "exit 0")                                            # fixed: the same one-liner
         status, out = self.install()
         self.assertEqual(status, 0, out)
-        self.assertIn("готово", out)
+        self.assertIn("Готово", out)
+
+    def test_in_a_terminal_the_one_liner_asks_about_reports_once(self):
+        status, out, asked = self.one_liner_in_a_terminal(answer="y")
+        self.assertEqual(status, 0, out)
+        self.assertTrue(asked, out)
+        card = re.sub(r"\s+", " ", out.replace("┃", " "))                     # lines of the card joined
+        for said in ("модель устройства и железо", "тип сети без её названия", "журнал обновления",
+                     "имя пользователя и компьютера, пароли, адреса, название Wi-Fi",
+                     "закрытый репозиторий разработчика на GitHub", "в любой момент: Arch Update → Настройки"):
+            self.assertIn(said, card)
+        self.assertEqual(self.reports(), "включены")
+        self.assertRegex(out, r"отчёты +включены")
+        self.assertEqual(out.count(BANNER_ROW), 1, out)
+        # the user has chosen: the same one-liner again keeps the choice and does not ask
+        status, out, asked = self.one_liner_in_a_terminal()
+        self.assertEqual(status, 0, out)
+        self.assertFalse(asked, out)
+        self.assertEqual(self.reports(), "включены")
+
+    def test_only_a_yes_turns_reports_on(self):
+        settings = os.path.join(self.home, ".local/state/arch-update-auto/settings.json")
+        # Enter, "н" (where "нет" starts) and anything else is a no
+        for answer, chosen in (("", "выключены"), ("н", "выключены"), ("нет", "выключены"), ("n", "выключены"),
+                               ("y", "включены"), ("YES", "включены"), ("д", "включены"), ("Да", "включены")):
+            with self.subTest(answer=answer):
+                if os.path.exists(settings):
+                    os.remove(settings)                                         # not chosen yet
+                status, out, asked = self.one_liner_in_a_terminal(answer=answer)
+                self.assertEqual(status, 0, out)
+                self.assertTrue(asked, out)
+                self.assertEqual(self.reports(), chosen)
+
+    def test_keys_pressed_during_the_install_are_no_answer(self):
+        # an Enter pressed while pacman worked must not answer a question that was not on the screen yet
+        status, out, asked = self.one_liner_in_a_terminal(typed_ahead="\r\r", answer="y")
+        self.assertEqual(status, 0, out)
+        self.assertTrue(asked, out)
+        self.assertEqual(self.reports(), "включены")
+
+    def test_sync_and_check_never_ask(self):
+        status, out = self.install()                                           # no terminal: still open
+        self.assertEqual(status, 0, out)
+        installed = os.path.join(self.home, ".local/share/arch-update-cactus/install.sh")
+        for mode in ("--sync", "--check"):
+            with self.subTest(mode=mode):
+                status, out, asked = self.in_a_terminal(installed, mode)
+                self.assertEqual(status, 0, out)
+                self.assertFalse(asked, out)
+        self.assertIsNone(self.reports())
 
     def test_arch_update_config_is_found_under_xdg_config_home(self):
         config = os.path.join(self.tmp, "xdg-config")

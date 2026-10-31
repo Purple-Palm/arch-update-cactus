@@ -4,7 +4,8 @@
 # First install on a machine (Arch Linux, as your normal user, not root):
 #   curl -fsSL https://raw.githubusercontent.com/Purple-Palm/arch-update-cactus/stable/install.sh | bash
 #
-#   install.sh             install or repair: packages, files, tray icon, timers (asks before installing)
+#   install.sh             install or repair: packages, files, tray icon, timers (asks before installing;
+#                          at a keyboard, once, whether update reports may go to the developer)
 #   install.sh --sync      refresh the installed files after a self-update (no packages, no questions)
 #   install.sh --check     self-test of this checkout (used before a self-update is accepted)
 #   install.sh --uninstall remove the links, menu entry and timer (logs and settings stay)
@@ -25,20 +26,202 @@ STATE=$HOME/.local/state/arch-update-auto
 BACKUP=$STATE/backup-$(date +%F_%H-%M-%S)
 PROGRAMS=(arch-update-launcher arch-update-ui arch-update-auto arch-update-cactus-sync)
 MENU_NEW=0
+BANNER_SHOWN=${ARCH_UPDATE_BANNER_SHOWN-}     # the bootstrap showed it before starting this copy
+unset ARCH_UPDATE_BANNER_SHOWN
 
-say() { printf '\e[1;36m::\e[0m %s\n' "$*"; }
-warn() { printf '\e[1;33m!!\e[0m %s\n' "$*" >&2; }
+# ── output: the look of the UI on a terminal, plain text in a pipe or a log (sync.log, the tests) ──
+
+WIDTH=80        # lines are broken between words to fit (a narrower terminal: its own width)
+TTY=0           # stdout and stderr are a terminal: a "●" line can make way for its result
+PENDING=0       # such a line is on the screen now, without its newline
+OFF='' BOLD='' ACCENT='' DIM='' MUTED='' GOOD='' WARN='' BAD='' COLOUR=''
+# The UI's palette (bin/arch-update-ui); the banner and the card run along its accent gradient
+# #1793d1 #4f7bff #8b5cff #d65cff #ff5ca8. Text keeps the terminal's own colour: the UI's TEXT
+# (#c9d1e3) is made for the UI's dark background and would all but vanish on a light terminal.
+GRAD_R=(23 79 139 214 255) GRAD_G=(147 123 92 92 92) GRAD_B=(209 255 255 255 168)
+if [[ -t 1 && -t 2 && ${TERM:-dumb} != dumb ]]; then
+	TTY=1
+	cols=$(stty size 2>/dev/null </dev/tty) || cols=
+	cols=${cols#* }
+	if [[ $cols =~ ^[0-9]+$ ]] && ((cols < WIDTH)); then
+		WIDTH=$((cols > 40 ? cols : 40))
+	fi
+	if [[ -z ${NO_COLOR-} ]]; then                # https://no-color.org
+		OFF=$'\e[0m' BOLD=$'\e[1m'
+		ACCENT=$'\e[38;2;79;123;255m'             # #4f7bff
+		DIM=$'\e[38;2;107;117;145m'               # #6b7591
+		MUTED=$'\e[38;2;78;88;118m'               # #4e5876
+		GOOD=$'\e[38;2;61;220;132m'               # #3ddc84
+		WARN=$'\e[38;2;255;196;87m'               # #ffc457
+		BAD=$'\e[38;2;255;92;122m'                # #ff5c7a
+	fi
+fi
+trap '((PENDING == 0)) || echo' EXIT            # a "●" line cut short still ends before the prompt
+
+# COLOUR = point $1 of $2 along the accent gradient (empty without colours).
+gradient() {
+	COLOUR=
+	[[ -n $OFF ]] || return 0
+	local n=$((${#GRAD_R[@]} - 1)) p i f
+	p=$(($1 * n * 256 / ($2 > 1 ? $2 - 1 : 1)))
+	i=$((p / 256)) f=$((p % 256))
+	if ((i >= n)); then
+		i=$((n - 1)) f=256
+	fi
+	printf -v COLOUR '\e[38;2;%d;%d;%dm' $(((GRAD_R[i] * (256 - f) + GRAD_R[i + 1] * f) / 256)) \
+		$(((GRAD_G[i] * (256 - f) + GRAD_G[i + 1] * f) / 256)) $(((GRAD_B[i] * (256 - f) + GRAD_B[i + 1] * f) / 256))
+}
+
+# "ARCH UPDATE" in half-block letters along the gradient, then "by Cactus"; one line on a terminal
+# narrower than 60 columns. The letters are spelled in ASCII (# █, ^ ▀, _ ▄), so that a row can be
+# cut into columns in any locale.
+banner() {
+	local rows=('_^# #^# #^^ # #   # # #^# #^_ _^# ^#^ #^^' '#^# #^_ #__ #^#   #_# #^^ #_^ #^#  #  ##_')
+	local row out x ch lines=()
+	((WIDTH >= 60)) || rows=('A R C H   U P D A T E')
+	for row in "${rows[@]}"; do
+		out=
+		((${#rows[@]} > 1)) || out=$BOLD
+		for ((x = 0; x < ${#row}; x++)); do
+			ch=${row:x:1}
+			case $ch in
+			' ')
+				out+=' '
+				continue
+				;;
+			'#') ch=█ ;;
+			'^') ch=▀ ;;
+			_) ch=▄ ;;
+			esac
+			gradient "$x" "${#row}"
+			out+=$COLOUR$ch
+		done
+		lines+=("$out$OFF")
+	done
+	echo
+	for ((x = 0; x < ${#lines[@]} - 1; x++)); do
+		printf '  %s\n' "${lines[x]}"
+	done
+	printf '  %s  %sby Cactus%s\n\n' "${lines[-1]}" "$DIM" "$OFF"
+}
+
+# WRAPPED = $2 broken between words into lines of at most WIDTH - $1 columns; leading spaces of $2
+# indent each of its lines. (${#} counts letters in a UTF-8 locale and bytes in "C": there a line
+# comes out shorter, never longer.)
+WRAPPED=()
+wrap() {
+	local lead=${2%%[! ]*} room word line=''
+	local -a words=()
+	room=$((WIDTH - $1 - ${#lead}))
+	read -r -d '' -a words <<<"$2" || true
+	WRAPPED=()
+	for word in "${words[@]}"; do
+		if [[ -n $line ]] && ((${#line} + 1 + ${#word} > room)); then
+			WRAPPED+=("$lead$line")
+			line=$word
+		else
+			line=${line:+$line }$word
+		fi
+	done
+	WRAPPED+=("$lead$line")
+}
+
+# End a "●" line that waits for its result: its ✓, ! or ✗ line takes its place.
+settle() {
+	((PENDING)) || return 0
+	printf '\r\e[2K'
+	PENDING=0
+}
+
+# "  <mark> <text>": the mark in its colour, the text broken to fit; each further argument starts a
+# line of its own under the text. No mark: the lines only, indented as under one.
+mark() {
+	local sign=$1 colour=$2 part i
+	shift 2
+	settle
+	for part in "$@"; do
+		wrap 4 "$part"
+		for i in "${!WRAPPED[@]}"; do
+			if [[ -n $sign ]]; then
+				printf '  %s%s%s %s\n' "$colour" "$sign" "$OFF" "${WRAPPED[i]}"
+				sign=
+			else
+				printf '    %s\n' "${WRAPPED[i]}"
+			fi
+		done
+	done
+}
+
+step() { mark '●' "$ACCENT" "$@"; }        # a step whose own output (pacman, makepkg, yay) follows
+warn() { mark '!' "$WARN" "$@" >&2; }
 die() {
-	printf '\e[1;31m✗\e[0m %s\n' "$*" >&2
+	mark '✗' "$BAD" "$@" >&2
 	exit 1
+}
+
+# "  ✓ <step> · <detail>": a step done, or a check that found everything in place.
+ok() {
+	local i
+	settle
+	wrap 4 "$1${2:+ · $2}"
+	for i in "${!WRAPPED[@]}"; do
+		if ((i == 0)); then
+			printf '  %s✓%s %s%s%s%s\n' "$GOOD" "$OFF" "$1" "$DIM" "${WRAPPED[0]#"$1"}" "$OFF"
+		else
+			printf '    %s%s%s\n' "$DIM" "${WRAPPED[i]}" "$OFF"
+		fi
+	done
+}
+
+# A step that takes a moment and writes nothing itself: "  ● <step>…" until its result takes the
+# line (only on a terminal; elsewhere the result is enough).
+pending() {
+	((TTY)) || return 0
+	settle
+	printf '  %s●%s %s…' "$ACCENT" "$OFF" "$1"
+	PENDING=1
+}
+
+# An aligned block (the card about reports, the final report) is collected in BLOCK first. A row is
+# a label of 10 columns, padded where it is written (printf would pad bytes, not letters), and its
+# value broken to fit under itself; each further argument continues the value on a line of its own.
+BLOCK=()
+row() {
+	local label=$1 part i
+	shift
+	for part in "$@"; do
+		wrap 16 "$part"
+		for i in "${!WRAPPED[@]}"; do
+			if [[ -n $label ]]; then
+				BLOCK+=("$DIM$label$OFF  ${WRAPPED[i]}")
+				label=
+			else
+				BLOCK+=("            ${WRAPPED[i]}")
+			fi
+		done
+	done
+}
+
+# Print BLOCK and empty it: indented four columns, or as a card, the gradient down its left edge.
+block() {
+	local i
+	for i in "${!BLOCK[@]}"; do
+		if [[ ${1-} == card ]]; then
+			gradient "$i" "${#BLOCK[@]}"
+			printf '  %s┃%s%s\n' "$COLOUR" "$OFF" "${BLOCK[i]:+ ${BLOCK[i]}}"
+		else
+			printf '    %s\n' "${BLOCK[i]}"
+		fi
+	done
+	BLOCK=()
 }
 
 # Packages are installed through sudo; a fresh Arch install may not have it yet.
 need_sudo() {
 	command -v sudo >/dev/null && return 0
-	warn "нет sudo, а пакеты ставятся через него. Один раз под root (su -):"
-	warn "  pacman -S sudo && usermod -aG wheel $(id -un) && echo '%wheel ALL=(ALL:ALL) ALL' >/etc/sudoers.d/wheel"
-	die "потом перелогинься и запусти установщик снова"
+	die "нет sudo, а пакеты ставятся через него. Один раз под root (su -):" "  pacman -S sudo" \
+		"  usermod -aG wheel $(id -un)" "  echo '%wheel ALL=(ALL:ALL) ALL' >/etc/sudoers.d/wheel" \
+		"Потом перелогинься и запусти установщик снова"
 }
 
 # Where this script lives; empty when it is piped from curl.
@@ -48,21 +231,33 @@ ROOT=
 # ── bootstrap: piped from curl, or started from some other copy → work from the real checkout ──
 
 bootstrap() {
+	local err old
 	[[ $EUID -ne 0 ]] || die "запусти от своего пользователя, не от root (sudo спросится сам, когда понадобится)"
 	command -v pacman >/dev/null || die "это не Arch Linux: нет pacman"
 	[[ ! -L $DEST ]] || die "$DEST — ссылка (на копию для разработки?), её не трогаю"
 	if ! command -v git >/dev/null; then
-		say "нужен git — ставлю"
+		step "ставлю git: через него апдейтер скачивается и обновляется"
 		need_sudo
 		{ sudo pacman -S --needed git; } </dev/tty
+		ok "git" "поставлен"
 	fi
 	if [[ -d $DEST/.git ]]; then
-		git -C "$DEST" fetch --quiet origin "$TAG"
-		git -C "$DEST" reset --quiet --hard FETCH_HEAD
+		pending "получаю последнюю версию"
+		old=$(git -C "$DEST" rev-parse HEAD 2>/dev/null) || old=
+		err=$(git -C "$DEST" fetch --quiet origin "$TAG" 2>&1 && git -C "$DEST" reset --quiet --hard FETCH_HEAD 2>&1) ||
+			die "не удалось обновить ${DEST/#"$HOME"/\~} с GitHub:" "$err"
+		if [[ $(git -C "$DEST" rev-parse HEAD) == "$old" ]]; then
+			ok "апдейтер" "последняя версия уже стоит"
+		else
+			ok "апдейтер" "обновлён до последней версии"
+		fi
 	else
-		say "скачиваю Arch Update by Cactus в $DEST"
-		git -c advice.detachedHead=false clone --quiet --branch "$TAG" "https://github.com/$REPO.git" "$DEST"
+		pending "скачиваю Arch Update by Cactus"
+		err=$(git -c advice.detachedHead=false clone --quiet --branch "$TAG" "https://github.com/$REPO.git" "$DEST" 2>&1) ||
+			die "не удалось скачать апдейтер в ${DEST/#"$HOME"/\~}:" "$err"
+		ok "апдейтер" "скачан в ${DEST/#"$HOME"/\~}"
 	fi
+	export ARCH_UPDATE_BANNER_SHOWN=1
 	if (exec </dev/tty) 2>/dev/null; then
 		exec bash "$DEST/install.sh" "$@" </dev/tty   # curl | bash took stdin: give the questions a keyboard back
 	fi
@@ -102,7 +297,7 @@ backup() {
 	local rel=${1#"$HOME"/}
 	mkdir -p "$BACKUP/$(dirname "$rel")"
 	mv "$1" "$BACKUP/$rel"
-	say "старый ~/$rel сохранён в ${BACKUP/#$HOME/\~}/"
+	warn "старый ~/$rel сохранён в ${BACKUP/#"$HOME"/\~}/"
 }
 
 # yay first: the auto-answers know its questions best (paru and pikaur work, but ask more of you).
@@ -181,29 +376,40 @@ install_packages() {
 	if ! "$ROOT/bin/arch-update-launcher" --terminal >/dev/null; then
 		missing+=(kitty)
 	fi
-	local again="Исправь и запусти установщик снова: что уже стоит, второй раз не ставится"
+	local again="Исправь и запусти установщик снова: что уже стоит, второй раз не ставится."
 	if ((${#missing[@]})); then
-		say "ставлю пакеты: ${missing[*]}"
+		step "ставлю пакеты: ${missing[*]}"
 		need_sudo
 		sudo pacman -S --needed "${missing[@]}" ||
-			die "пакеты не поставились. Если не пустил sudo — проверь: sudo -v. Если pacman не нашёл их на зеркале — сначала обнови систему: sudo pacman -Syu. $again"
+			die "пакеты не поставились." "Если не пустил sudo — проверь: sudo -v" \
+				"Если pacman не нашёл их на зеркале — сначала обнови систему:" "  sudo pacman -Syu" "$again"
+		ok "пакеты" "поставлены"
+	else
+		ok "пакеты" "всё нужное уже стоит"
 	fi
 	# AUR packages: yay, as on the main machine (the auto-answers know its questions best)
 	local helper
-	if ! helper=$(aur_helper); then
-		say "ставлю yay (помощник для пакетов из AUR)"
+	if helper=$(aur_helper); then
+		ok "AUR" "через $helper"
+	else
+		step "ставлю yay — помощник для пакетов из AUR"
 		need_sudo
-		sudo pacman -S --needed base-devel || die "не поставился base-devel (нужен, чтобы собрать yay). $again"
-		makepkg_aur yay-bin || die "yay не собрался: AUR недоступен или сборка упала (её вывод выше). $again"
+		sudo pacman -S --needed base-devel || die "не поставился base-devel (нужен, чтобы собрать yay)." "$again"
+		makepkg_aur yay-bin || die "yay не собрался: AUR недоступен или сборка упала (её вывод выше)." "$again"
 		helper=yay
+		ok "AUR" "yay поставлен"
 	fi
-	command -v arch-update >/dev/null && return 0
+	if command -v arch-update >/dev/null; then
+		ok "arch-update" "уже стоит"
+		return 0
+	fi
 	local pkg=arch-update
 	[[ $(uname -m) == x86_64 ]] && pkg=arch-update-bin      # prebuilt; elsewhere it is built from source
-	say "ставлю $pkg из AUR через $helper"
+	step "ставлю $pkg из AUR через $helper"
 	need_sudo
-	"$helper" -S --needed "$pkg" || die "$pkg не поставился из AUR (вывод $helper выше). $again"
+	"$helper" -S --needed "$pkg" || die "$pkg не поставился из AUR (вывод $helper выше)." "$again"
 	command -v arch-update >/dev/null || die "arch-update не установился"
+	ok "arch-update" "поставлен"
 }
 
 setup_arch_update() {
@@ -218,7 +424,8 @@ setup_arch_update() {
 		fi
 	fi
 	if grep -qE '^[[:space:]]*NoVersion' "$conf"; then
-		warn "в $conf включён NoVersion: без версий апдейтер не увидит список обновлений — закомментируй его"
+		warn "в ${conf/#"$HOME"/\~} включён NoVersion: без версий апдейтер не увидит список обновлений." \
+			"Закомментируй его"
 	fi
 	[[ -f $config/autostart/arch-update-tray.desktop ]] || arch-update --tray --enable >/dev/null || true
 	systemctl --user enable --now --quiet arch-update.timer 2>/dev/null || true
@@ -238,36 +445,92 @@ setup_arch_update() {
 	else
 		setsid -f arch-update --tray >/dev/null 2>&1 </dev/null || true
 	fi
+	ok "arch-update" "настроен, значок в трее"
 }
 
-report() {
-	local term de=${XDG_CURRENT_DESKTOP:-?} timer=0
-	term=$("$ROOT/bin/arch-update-launcher" --terminal 2>/dev/null || echo "не найден")
-	systemctl --user is-enabled --quiet arch-update-cactus-sync.timer 2>/dev/null && timer=1
-	say "готово: Arch Update by Cactus $(git -C "$ROOT" log -1 --format='%h от %cd' --date=format:%d.%m.%Y)"
-	echo "   окружение: $de · терминал: $term · AUR: $(aur_helper || echo нет)"
-	echo "   запуск: иконка Arch-Update в трее или меню приложений; демо: ~/.local/bin/arch-update-launcher --demo"
-	if ((timer)); then
-		echo "   новые версии приезжают сами (раз в час, после входа и при запуске); проверить сейчас:"
+# Update reports (lib/report.py) stay off until the user says yes. The question comes once, on an
+# install at a keyboard: --sync and --check never ask, and without a terminal the choice stays open
+# (Arch Update → Настройки). Only y/yes/д/да say yes: "н" would be the start of "нет".
+ask_reports() {
+	local answer='' choice=no REPLY
+	[[ -t 0 ]] || return 0
+	python3 "$ROOT/lib/report.py" --decided && return 0
+	settle
+	echo
+	BLOCK=("${BOLD}Отчёты об обновлениях$OFF")
+	wrap 4 "После каждого обновления Arch Update может отправлять разработчику отчёт:"
+	BLOCK+=("${WRAPPED[@]}")
+	wrap 4 "так проблему на любой машине видно, не спрашивая журнал."
+	BLOCK+=("${WRAPPED[@]}" "")
+	row 'в отчёте  ' "модель устройства и железо, тип сети без её названия, какие пакеты обновились, итог проверки, журнал обновления"
+	row 'не уходят ' "имя пользователя и компьютера, пароли, адреса, название Wi-Fi"
+	row 'куда      ' "закрытый репозиторий разработчика на GitHub"
+	row 'передумать' "в любой момент: Arch Update → Настройки"
+	block card
+	echo
+	read -r -s -t 0.1 -N 100000 || true      # an Enter pressed while pacman worked is no answer
+	printf '  %s?%s %sОтправлять отчёты?%s %s[y/N]%s ' "$ACCENT" "$OFF" "$BOLD" "$OFF" "$DIM" "$OFF"
+	read -r answer || echo
+	case ${answer,,} in
+	y | yes | д | да | Д | Да | ДА | дА) choice=yes ;;
+	esac
+	if ! python3 "$ROOT/lib/report.py" --consent "$choice"; then
+		warn "ответ не сохранился — выбрать можно в Arch Update → Настройки"
+	elif [[ $choice == yes ]]; then
+		ok "отчёты" "включены — спасибо!"
 	else
-		echo "   новые версии приезжают при запуске; проверить сейчас:"
+		ok "отчёты" "выключены"
 	fi
-	echo "   ~/.local/bin/arch-update-cactus-sync"
+}
+
+summary() {
+	local term de=${XDG_CURRENT_DESKTOP:-?} shown timer=0 reports version i
+	term=$("$ROOT/bin/arch-update-launcher" --terminal 2>/dev/null || echo "не найден")
+	reports=$(python3 "$ROOT/lib/report.py" --status 2>/dev/null) || reports=выключены
+	systemctl --user is-enabled --quiet arch-update-cactus-sync.timer 2>/dev/null && timer=1
+	version=$(git -C "$ROOT" log -1 --format='%h от %cd' --date=format:%d.%m.%Y)
+	shown=$de
+	[[ $de != "?" ]] || shown="не определено"
+	settle
+	echo
+	wrap 4 "Готово — Arch Update by Cactus $version"         # the version wraps on a narrow terminal
+	for i in "${!WRAPPED[@]}"; do
+		if ((i == 0)); then
+			printf '  %s✓%s %sГотово%s — Arch Update by Cactus%s%s%s\n' "$GOOD" "$OFF" "$BOLD" "$OFF" "$MUTED" \
+				"${WRAPPED[0]#"Готово — Arch Update by Cactus"}" "$OFF"
+		else
+			printf '    %s%s%s\n' "$MUTED" "${WRAPPED[i]}" "$OFF"
+		fi
+	done
+	echo
+	row 'окружение ' "$shown · терминал: $term · AUR: $(aur_helper || echo нет)"
+	row 'запуск    ' "значок Arch-Update в трее или меню приложений"
+	# shellcheck disable=SC2088  # a path for the user to type, not one to expand
+	row 'демо      ' "~/.local/bin/arch-update-launcher --demo"
+	if ((timer)); then
+		row 'обновления' "новые версии приезжают сами: раз в час, при входе и при запуске" \
+			"проверить сейчас: ~/.local/bin/arch-update-cactus-sync"
+	else
+		row 'обновления' "новые версии приезжают при запуске" "проверить сейчас: ~/.local/bin/arch-update-cactus-sync"
+	fi
+	row 'отчёты    ' "$reports — переключить: Arch Update → Настройки"
+	block
+	echo
 	if ((!timer)); then
-		warn "фоновые проверки не включились: в этом сеансе нет systemd --user (установщик запущен через su?)."
-		warn "  запусти его ещё раз из терминала на рабочем столе — включатся"
+		warn "фоновые проверки не включились: в этом сеансе нет systemd --user" "(установщик запущен через su?)." \
+			"Запусти его ещё раз из терминала на рабочем столе — включатся"
 	fi
 	if [[ $de == *GNOME* ]] && ! pacman -Q gnome-shell-extension-appindicator >/dev/null 2>&1; then
-		warn "в GNOME значок в трее появится только с расширением AppIndicator:"
-		warn "  sudo pacman -S gnome-shell-extension-appindicator, затем перелогинься и включи его в «Расширениях»"
+		warn "в GNOME значок в трее появится только с расширением AppIndicator:" \
+			"  sudo pacman -S gnome-shell-extension-appindicator" "затем перелогинься и включи его в «Расширениях»"
 	fi
 	if [[ $de == "?" ]]; then
-		warn "окружение без автозапуска? добавь в автозапуск своего WM: sleep 3 && arch-update --tray"
+		warn "окружение без автозапуска? Добавь в автозапуск своего WM:" "  sleep 3 && arch-update --tray"
 	fi
 }
 
 uninstall() {
-	local p
+	local p state=${STATE/#"$HOME"/\~} dest=${DEST/#"$HOME"/\~}
 	if systemctl --user show-environment >/dev/null 2>&1; then
 		systemctl --user disable --now --quiet arch-update-cactus-sync.timer 2>/dev/null || true
 		systemctl --user clean --what=state arch-update-cactus-sync.timer 2>/dev/null || true
@@ -279,12 +542,16 @@ uninstall() {
 	done
 	rm -f "$APPS/arch-update.desktop" "$HOME/.local/share/konsole/ArchUpdate.profile" \
 		"$HOME/.local/share/konsole/ArchUpdate.colorscheme"
-	say "удалено. Сам arch-update, его значок в трее, журналы ($STATE) и папка $DEST остались."
-	say "Папку можно убрать вручную: rm -rf $DEST"
+	ok "удалено" "программы, пункт меню, профиль Konsole, фоновая проверка"
+	mark '' '' "Остались сам arch-update и его значок в трее, журналы и настройки ($state) и папка $dest." \
+		"Её можно убрать вручную:" "  rm -rf $dest"
 }
 
 main() {
 	[[ -n $SRC && -f $SRC ]] && ROOT=$(cd "$(dirname "$(realpath "$SRC")")" && pwd)
+	if [[ -z ${1-} && -z $BANNER_SHOWN ]]; then
+		banner
+	fi
 	if [[ -z ${1-} && $ROOT != "$DEST_REAL" ]]; then
 		bootstrap "$@"
 	fi
@@ -300,12 +567,21 @@ main() {
 	"")
 		[[ $EUID -ne 0 ]] || die "запусти от своего пользователя, не от root"
 		install_packages
-		self_check || die "самопроверка не прошла — установка остановлена"
+		pending "самопроверка"
+		local out
+		if ! out=$(self_check 2>&1); then
+			settle
+			printf '%s\n' "$out" >&2
+			die "самопроверка не прошла — установка остановлена"
+		fi
+		ok "самопроверка" "пройдена"
 		install_files
+		ok "файлы" "программы в ~/.local/bin, пункт в меню приложений"
 		mkdir -p "$STATE"                                   # a clean machine has no state yet
 		git -C "$ROOT" rev-parse HEAD >"$STATE/sync.ok"     # this version passed here
 		setup_arch_update
-		report
+		ask_reports
+		summary
 		;;
 	*) die "неизвестный параметр: $1 (есть --sync, --check, --uninstall)" ;;
 	esac
