@@ -638,13 +638,16 @@ def plural(n, one, few, many):
 # ───────────────────────────── settings: the update reports ─────────────────────────────
 
 SETTINGS_ITEMS = (("reports", "Отчёты об обновлениях"), ("preview", "Что именно уходит"), ("back", "Назад"))
-REPORT_ABOUT = ("После каждого обновления разработчику уходит отчёт: модель устройства, процессор, видеокарта, "
-                "память, ядро, рабочий стол, как подключена сеть (Wi-Fi или кабель, адаптер, сигнал), какие "
-                "пакеты обновились, итог проверки и журнал обновления.",
-                "Имя пользователя и компьютера, пароли, адреса и название Wi-Fi не отправляются. Отчёты видит "
-                "только разработчик (закрытый репозиторий на GitHub).")
-PREVIEW_INTRO = "так выглядит отчёт с этой машины — последний отправленный или собранный сейчас из последнего журнала"
-REPORTS_HINT = "новое: отчёты об обновлениях — в «Настройках» (по умолчанию выключены)"
+# Eight lines at 80 columns: one more and "Назад" would sit in the toast's row.
+REPORT_ABOUT = ("Когда отчёты включены, после каждого обновления разработчику отправляется отчёт: модель "
+                "устройства, процессор, видеокарта, память, ядро, рабочий стол, сеть (Wi-Fi или кабель, адаптер, "
+                "сигнал), какие пакеты обновились, итог проверки и журнал обновления.",
+                "Имя пользователя и компьютера, пароли, адреса и название Wi-Fi не отправляются. Отчёты уходят "
+                "в закрытый репозиторий разработчика на GitHub, через сервер для отчётов на Cloudflare (он видит "
+                "IP-адрес, как любой сайт, но не хранит его).")
+PREVIEW_INTRO = ("так выглядит отчёт с этой машины — последний отправленный или ждущий отправки, а если их нет — "
+                 "собранный сейчас из последнего журнала")
+REPORTS_HINT = "новое: отчёты об обновлениях (выключены) — Arch-Update → Настройки"
 REPORTS_UNDECIDED = {"enabled": False, "decided": False, "id": "", "endpoint": False, "waiting": 0,
                      "last_sent": "", "last_error": ""}
 JSON_KEY = re.compile(r'\s*"(?:[^"\\]|\\.)*":')
@@ -654,7 +657,9 @@ UNPRINTABLE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 def reports_parts(st):
     """What the quiet line under the reports switch says, from report.status()."""
     if not st["enabled"]:
-        return ["сейчас ничего не собирается и не отправляется"]
+        # Whoever wants their reports deleted switches them off first, and then still needs the ID.
+        return ["сейчас ничего не собирается и не отправляется"] + \
+            ([f"ID этой машины в прошлых отчётах: {st['id']}"] if st["id"] else [])
     parts = [f"ID этой машины в отчётах: {st['id'] or '—'}"]
     if not st["endpoint"]:
         return parts + ["сервер для отчётов ещё не подключён — отчёты ждут на этой машине"
@@ -673,8 +678,9 @@ def reports_parts(st):
                      "первый отчёт уйдёт после следующего обновления")
     if refused:
         parts.append("последний отчёт не принят сервером")
-    elif st["last_error"] and st["waiting"]:
-        parts.append(("сервер не ответил" if code else "нет связи с сервером") + " — повторю при следующем запуске")
+    elif st["last_error"] and st["waiting"]:            # 408, 429, 5xx, or no answer at all
+        parts.append(("сервер пока не принимает отчёты" if code else "нет связи с сервером")
+                     + " — повторю при следующем запуске")
     return parts
 
 
@@ -897,7 +903,7 @@ class App:
                      ("manual", "Обычный Arch-Update", "запустить как есть")]
         if self.news:
             items.append(("news", "Читать новости Arch", f"{len(self.news)} последних"))
-        word = "вкл" if self.rep["enabled"] else "выкл" if self.rep["decided"] else "не выбраны"
+        word = "вкл" if self.rep["enabled"] else "выкл" if self.rep["decided"] else "ещё не решено"
         items.append(("settings", "Настройки", f"отчёты об обновлениях: {word}"))
         items.append(("quit", "Выйти", ""))
         return items
@@ -1283,6 +1289,8 @@ class App:
     # ── settings
     def open_settings(self):
         self.state, self.set_sel, self.pv_open = "settings", 0, False
+        if self.toast_text == REPORTS_HINT:  # it pointed here: done
+            self.toast_text = ""
         self.set_key_t = time.time()         # the Enter that opened the screen is no choice (see handle)
         self.pv_gen += 1                     # the preview is put together once per visit
         self.refresh_reports()
@@ -1308,7 +1316,7 @@ class App:
         elif self.rep["endpoint"]:
             self.toast("спасибо! отчёт уйдёт после следующего обновления", secs=3)
         else:                                # no server yet: they wait on this machine (the line below says so)
-            self.toast("спасибо! отчёты включены — уйдут, когда подключат сервер", secs=3)
+            self.toast("спасибо! отчёты включены — уйдут, когда подключат сервер для отчётов", secs=3)
 
     def _load_preview(self, gen):
         try:
@@ -2073,7 +2081,7 @@ class ReportLine:
             return "отчёт не принят сервером"
         if self.state == "waiting":
             if not self.endpoint:            # nothing sends it before a server is set
-                return "отчёт сохранён" if short else "отчёт сохранён — уйдёт, когда подключат сервер"
+                return "отчёт сохранён" if short else "отчёт сохранён — уйдёт, когда подключат сервер для отчётов"
             if now - self.t0 < self.SENDING:
                 return "отчёт: отправляется…"
             return "отчёт ждёт отправки" if short else "отчёт ждёт отправки — уйдёт при следующем запуске"
@@ -2237,9 +2245,12 @@ def self_test():
     # The settings with what report.status() and report.preview() can give, made up here: the
     # self-test reads and writes none of the real ones.
     states = [dict(REPORTS_UNDECIDED), dict(REPORTS_UNDECIDED, decided=True),
+              dict(REPORTS_UNDECIDED, decided=True, id="1a2b3c4d"),
               dict(REPORTS_UNDECIDED, enabled=True, decided=True, id="1a2b3c4d", waiting=2),
               dict(REPORTS_UNDECIDED, enabled=True, decided=True, id="f" * 90, endpoint=True, waiting=12,
                    last_sent="2026-10-30T17:45:45", last_error="URLError: " + "name resolution failed " * 6),
+              dict(REPORTS_UNDECIDED, enabled=True, decided=True, id="1a2b3c4d", endpoint=True, waiting=1,
+                   last_error="HTTP 503"),
               dict(REPORTS_UNDECIDED, enabled=True, decided=True, id="1a2b3c4d", endpoint=True,
                    last_sent="2026-10-30T17:45:45", last_error="HTTP 400: отчёт не принят")]
     sent = ReportLine(lambda: os.path.join(report.OUTBOX, "x.json"))     # queued at once
@@ -2282,6 +2293,12 @@ def self_test():
             for i in range(len(SETTINGS_ITEMS)):
                 app.set_sel = i
                 shot(app.draw_settings)
+        app.rep = states[4]                     # the longest status line, two rows
+        app.draw_settings()
+        last = max((y for y in range(h) if "Назад" in "".join(c.ch[y])), default=h)
+        c.clear()
+        if last >= h - 4:                       # the toast's row, or below
+            raise RuntimeError(f"the settings do not fit into {w}x{h}")
         app.pv_open, app.pv_data = True, None
         shot(app.draw_settings)                 # still being put together
         app.pv_data = (app.pv_gen, preview_source(preview))

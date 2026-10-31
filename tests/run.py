@@ -8,8 +8,9 @@ typed with the Russian layout on (з pauses Tetris; a short extra run leaves the
 The 136x38 run starts with the update reports on, one report from earlier waiting and a server
 address where nobody listens: the demo must still queue, send and mention none.
 Two more short runs (80x24, 200x60) open the settings with Enter pressed twice and held down (the
-reports must stay off), switch them on, look at "Что именно уходит", switch them off again and
-check that nothing was queued or sent.
+reports must stay off, the hint that pointed there must be gone), switch them on, look at "Что именно
+уходит", switch them off again (the machine's ID must still be shown, for whoever wants their
+reports deleted) and check that nothing was queued or sent.
 One run (80x24) takes "Обычный Arch-Update" and types a password ahead while the update gets ready
 (a stand-in pacman makes that take two seconds): it must reach neither the screen nor the journal.
 The output is rendered with pyte; the test fails on a UI exception, a screen that never shows
@@ -250,13 +251,15 @@ class Run:
         self.send(UP, UP)                           # round from the first item to the one before "Выйти"
         if not self.wait("menu-settings", "▸ Настройки", timeout=5):
             return
-        if "отчёты об обновлениях: не выбраны" not in self.text():
-            self.failures.append("меню: нет подписи «отчёты об обновлениях: не выбраны»")
+        if "отчёты об обновлениях: ещё не решено" not in self.text():
+            self.failures.append("меню: нет подписи «отчёты об обновлениях: ещё не решено»")
         # The Enter that opens the settings lands on the switch: pressed twice, or held down (the key
         # repeats after about half a second, then every 40 ms), it must still not switch them on.
         self.send(ENTER + ENTER)
         if not self.still_off("settings-double-enter"):
             return
+        if "новое: отчёты" in self.text():          # the first start's hint pointed here: done with
+            self.failures.append("настройки: подсказка «новое: отчёты…» осталась на экране настроек")
         self.send(ESC)
         if not self.wait("menu-again", "▸ Настройки", timeout=5):
             return
@@ -283,6 +286,13 @@ class Run:
         self.send(UP, ENTER)
         if not self.wait("settings-off", "ВЫКЛ", timeout=5):
             return
+        try:
+            with open(os.path.join(self.home, ".local/state/arch-update-auto/settings.json")) as f:
+                rid = json.load(f).get("report_id")
+        except (OSError, ValueError):
+            rid = None
+        if not rid or f"ID этой машины в прошлых отчётах: {rid}" not in self.text():
+            self.failures.append(f"настройки: выключены, а ID машины ({rid}) не показан")
         self.send(ESC)
         if not self.wait("menu-back", "отчёты об обновлениях: выкл", timeout=5):
             return
