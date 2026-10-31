@@ -2,20 +2,23 @@
 //
 // A machine sends a report after an update only if its user said yes (lib/report.py). The program
 // is public and cannot hold a GitHub token, so this Cloudflare Worker holds one. For each report:
-//   - the log goes to logs/YYYY/MM/<id>-<YYYYMMDD-HHMMSS>.log,
+//   - the log goes to logs/YYYY/MM/<id>-<YYYYMMDD-HHMMSS>.log on the branch logs-<id>, one branch
+//     a machine (made from the default branch), so deleting that branch deletes all its logs,
 //   - an issue says what happened, on which machine, with the end of the log; the issue of a
 //     clean update is closed at once, so the open issues are the ones to look at.
 //
 // Settings of the Worker: REPO ("owner/name") and the secret GITHUB_TOKEN, a fine-grained token for
 // that repository only (Contents and Issues: read and write); PAUSE_MS, the milliseconds between
-// two writes to GitHub, is 1000 unless set. Setup in the browser: relay/README.md.
+// two writes to GitHub, is 1000 unless set. Setup in the browser: relay/README.md (its Workers Logs
+// must be switched off: Cloudflare would keep every sender's address for days).
 // Tests: node --test relay/test.mjs.
 //
-// Against abuse: strict checks of what comes in, limits per sender address and per machine ID,
-// and at most HOURLY reports an hour in all, counted on GitHub itself (a Worker pasted in the
-// dashboard and served from workers.dev has neither the Rate Limiting binding nor a working
-// Cache API; a RATE_LIMITER binding is used when a deploy adds one). The sender's address is never
-// stored or passed on: the limits keep a keyed hash of it, in this isolate's memory only.
+// Against abuse: strict checks of what comes in, limits per sender network (an IPv4 address or an
+// IPv6 /64) and per machine ID, and at most HOURLY reports an hour and DAILY a day in all, counted
+// on GitHub itself (a Worker pasted in the dashboard and served from workers.dev has neither the
+// Rate Limiting binding nor a working Cache API; a RATE_LIMITER binding is used when a deploy adds
+// one). The sender's address is never stored or passed on: the limits keep a keyed hash of it, in
+// this isolate's memory only.
 
 const MAX_BODY = 1.5 * 1024 * 1024; // bytes of one request
 const MAX_LOG = 1024 * 1024; // bytes of the log in it
@@ -27,9 +30,11 @@ const LISTS = { // update.<list>: [most items, longest item]
 const BODY_MAX = 65000; // characters of an issue body (GitHub takes 65,536)
 const TAIL = 200; // lines of the log shown in the issue
 const HOUR = 3600 * 1000;
-const PER_ADDRESS = 20; // requests an hour from one address
+const DAY = 24 * HOUR;
+const PER_ADDRESS = 6; // requests an hour from one network: well below HOURLY
 const PER_ID = 6; // reports an hour from one machine
 const HOURLY = 20; // reports an hour in all
+const DAILY = 60; // reports a day in all: three machines' full outboxes (20 each) still get through
 const API = 'https://api.github.com';
 const API_VERSION = '2026-03-10';
 const REPO_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9._-]{1,100}$/;
@@ -46,7 +51,9 @@ const PLACEHOLDER = /^(?:to be filled by o\.?e\.?m\.?|system (?:manufacturer|pro
 
 const seen = new Map(); // limiter key → times (ms) of its requests in the last hour
 const labelsMade = new Set(); // "repo\nlabel" known to exist
+const branchesMade = new Set(); // "repo\nbranch" known to exist
 let pausedUntil = 0; // GitHub asked to wait until then
+let fullUntil = 0; // HOURLY or DAILY reports were filed: no more until then
 
 export default {
   async fetch(request, env, ctx) {
@@ -82,9 +89,14 @@ async function handle(request, env, ctx) {
   if (length !== null && Number(length) > MAX_BODY) return reply(413, { ok: false, error: 'отчёт больше 1,5 МиБ' });
 
   const now = Date.now();
-  const address = await keyed(token, 'address', request.headers.get('cf-connecting-ip') || '');
+  const address = await keyed(token, 'address', network(request.headers.get('cf-connecting-ip') || ''));
   let wait = limit(`a:${address}`, PER_ADDRESS, now) || await bound(env, `a:${address}`);
   if (wait) return tooMany(wait);
+  // Known already that no report gets through now: said before a byte of this one is read.
+  if (now < fullUntil) return tooMany(secs(fullUntil - now));
+  if (now < pausedUntil) {
+    return reply(503, { ok: false, error: 'GitHub просит подождать' }, { 'Retry-After': String(secs(pausedUntil - now)) });
+  }
 
   const bytes = await readBody(request, MAX_BODY);
   if (!bytes) return reply(413, { ok: false, error: 'отчёт больше 1,5 МиБ' });
@@ -99,9 +111,6 @@ async function handle(request, env, ctx) {
 
   wait = limit(`i:${data.id}`, PER_ID, now) || await bound(env, `i:${data.id}`);
   if (wait) return tooMany(wait);
-  if (now < pausedUntil) {
-    return reply(503, { ok: false, error: 'GitHub просит подождать' }, { 'Retry-After': String(secs(pausedUntil - now)) });
-  }
   const gh = client(repo, token, Number(env.PAUSE_MS ?? 1000));
   // Filed to the end even if the sender hangs up meanwhile (a slow link, a closed lid).
   const work = fileReport(gh, checked.report, checked.logBytes, now).catch(failed);
@@ -208,6 +217,20 @@ function tooMany(wait) {
   return reply(429, { ok: false, error: 'слишком много отчётов, попробуй позже' }, { 'Retry-After': String(wait) });
 }
 
+// What the limits count by: an IPv4 address, or the /64 network of an IPv6 one (a home or a
+// server is given a whole /64, so a sender could take a fresh address for every request).
+function network(ip) {
+  const v4 = /(?:^|:)(\d{1,3}(?:\.\d{1,3}){3})$/.exec(ip);
+  if (v4) return v4[1]; // also an IPv4 address written as IPv6 (::ffff:192.0.2.1)
+  if (!ip.includes(':')) return ip;
+  const [head, tail] = ip.toLowerCase().split('::');
+  const left = head ? head.split(':') : [];
+  const right = tail ? tail.split(':') : [];
+  const groups = tail === undefined ? left
+    : [...left, ...Array(Math.max(0, 8 - left.length - right.length)).fill('0'), ...right];
+  return `${groups.slice(0, 4).map((g) => g.replace(/^0+(?=.)/, '')).join(':')}::/64`;
+}
+
 // A keyed hash: the same address gives the same key, and the key gives nothing back.
 async function keyed(secret, what, value) {
   const enc = new TextEncoder();
@@ -249,11 +272,12 @@ async function bound(env, key) {
 // ───────────────────────────── GitHub ─────────────────────────────
 
 class GitHubError extends Error {
-  constructor(res) {
+  constructor(res, hint = '') {
     super(`GitHub ${res.status} (${res.step})`);
     this.step = res.step;
     this.status = res.status;
     this.retryAfter = limitedFor(res);
+    this.hint = hint; // what the owner can fix, said in the answer instead of the usual words
   }
 }
 
@@ -313,19 +337,24 @@ function failed(e) {
   } else {
     console.error(JSON.stringify({ relay: 'github', step: 'other', error: String(e && e.name) }));
   }
-  return reply(502, { ok: false, error: 'GitHub не принял отчёт, попробуй позже' });
+  return reply(502, { ok: false, error: e?.hint || 'GitHub не принял отчёт, попробуй позже' });
 }
 
 async function fileReport(gh, r, logBytes, now) {
-  const full = await hourIsFull(gh, now);
-  if (full) return tooMany(full);
+  const full = await budgetSpent(gh, now);
+  if (full) {
+    fullUntil = Math.max(fullUntil, now + full * 1000);
+    return tooMany(full);
+  }
   const verdict = outcome(r.update, r.device.chromebook === true);
   await makeLabels(gh, verdict.labels);
   const { Y, MO, D, H, MI, SE } = r.when;
+  const branch = `logs-${r.id}`;
   const path = `logs/${Y}/${MO}/${r.id}-${Y}${MO}${D}-${H}${MI}${SE}.log`;
-  let logUrl = `https://github.com/${gh.repo}/blob/HEAD/${path}`;
+  let logUrl = `https://github.com/${gh.repo}/blob/${branch}/${path}`;
   if (logBytes.length) {
-    const log = await putLog(gh, path, logBytes, r);
+    await makeBranch(gh, branch);
+    const log = await putLog(gh, branch, path, logBytes, r);
     if (log.duplicate) return reply(200, { ok: true, issue: log.duplicate, duplicate: true });
     logUrl = log.url || logUrl;
   }
@@ -346,13 +375,41 @@ async function fileReport(gh, r, logBytes, now) {
   return reply(201, { ok: true, issue: number });
 }
 
-// Seconds until a report may be filed if HOURLY issues were opened in the last hour, else 0:
-// the HOURLY-th newest issue tells, whatever isolate or location this request runs in.
-async function hourIsFull(gh, now) {
-  const res = await gh('count', 'GET', `/issues?state=all&sort=created&direction=desc&per_page=1&page=${HOURLY}`);
-  if (!res.ok) throw new GitHubError(res);
-  const created = Date.parse(Array.isArray(res.data) && isObject(res.data[0]) ? res.data[0].created_at : '');
-  return created > now - HOUR ? secs(created + HOUR - now) : 0;
+// Seconds until a report may be filed if HOURLY issues were opened in the last hour or DAILY in the
+// last day, else 0: the HOURLY-th (DAILY-th) newest issue tells, whatever isolate or location this
+// request runs in.
+async function budgetSpent(gh, now) {
+  for (const [nth, span, step] of [[HOURLY, HOUR, 'hour'], [DAILY, DAY, 'day']]) {
+    const res = await gh(step, 'GET', `/issues?state=all&sort=created&direction=desc&per_page=1&page=${nth}`);
+    if (!res.ok) throw new GitHubError(res);
+    const created = Date.parse(Array.isArray(res.data) && isObject(res.data[0]) ? res.data[0].created_at : '');
+    if (created > now - span) return secs(created + span - now);
+    if (!(created > now - DAY)) return 0; // none, or older than a day: the DAILY-th newest is older still
+  }
+  return 0;
+}
+
+// A branch of the repository, made from the newest commit of the default branch if it is not there
+// yet. A repository with no commit at all has nothing to make it from: the owner adds a README.
+async function makeBranch(gh, branch) {
+  const key = `${gh.repo}\n${branch}`;
+  if (branchesMade.has(key)) return;
+  const empty = (res) => res.status === 409 && /empty/i.test(String(res.data?.message || ''));
+  const hint = 'репозиторий отчётов пустой: создай в нём README (relay/README.md, шаг 1)';
+  const ref = await gh('ref', 'GET', `/git/ref/heads/${branch}`);
+  if (empty(ref)) throw new GitHubError(ref, hint);
+  if (ref.status === 404) {
+    const base = await gh('base', 'GET', '/commits?per_page=1');
+    if (empty(base)) throw new GitHubError(base, hint);
+    const sha = base.ok && Array.isArray(base.data) && isObject(base.data[0]) ? base.data[0].sha : null;
+    if (typeof sha !== 'string' || !/^[0-9a-f]{40,64}$/.test(sha)) throw new GitHubError(base);
+    const made = await gh('branch', 'POST', '/git/refs', { ref: `refs/heads/${branch}`, sha });
+    const there = made.status === 422 && /already exists/i.test(String(made.data?.message || '')); // made meanwhile
+    if (made.status !== 201 && !there) throw new GitHubError(made);
+  } else if (!ref.ok) {
+    throw new GitHubError(ref);
+  }
+  branchesMade.add(key);
 }
 
 async function makeLabels(gh, names) {
@@ -376,10 +433,11 @@ function base64(bytes) {
   return btoa(s);
 }
 
-async function putLog(gh, path, bytes, r) {
+async function putLog(gh, branch, path, bytes, r) {
   // Written by hand: base64 needs no escaping, and JSON.stringify would scan a megabyte for nothing
   // (CPU time is what the free plan counts: 10 ms a request).
-  const body = `{"message":${JSON.stringify(`log ${r.id} ${r.time}`)},"content":"${base64(bytes)}"}`;
+  const message = JSON.stringify(`log ${r.id} ${r.time}`);
+  const body = `{"message":${message},"branch":${JSON.stringify(branch)},"content":"${base64(bytes)}"}`;
   let res = await gh('log', 'PUT', `/contents/${path}`, body);
   if (res.status === 409) res = await gh('log', 'PUT', `/contents/${path}`, body); // another commit came first
   if (res.status === 201 || res.status === 200) {
@@ -390,6 +448,7 @@ async function putLog(gh, path, bytes, r) {
     // The log is there already: the same report again, after the answer to an earlier try was lost.
     return { duplicate: await issueFor(gh, path) };
   }
+  branchesMade.delete(`${gh.repo}\n${branch}`); // deleted meanwhile, perhaps: the next try looks again
   throw new GitHubError(res);
 }
 
@@ -424,8 +483,10 @@ function plural(n, one, few, many) {
 }
 
 // Control characters, terminal colour codes and direction marks would garble what GitHub shows.
-const ANSI = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-Z\\-_])/g;
-const CONTROL = /[\x00-\x08\x0b-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+// An OSC sequence (a window title, a link) goes only with its terminator, within its line: a lone
+// ESC ] loses just those two characters, not the rest of the log.
+const ANSI = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b\n]*(?:\x07|\x1b\\)|[@-Z\\-_])/g;
+const CONTROL = /[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
 
 function clean(s) {
   return String(s).replace(/\r\n?/g, '\n').replace(ANSI, '').replace(CONTROL, '');
@@ -505,8 +566,11 @@ function issueTitle(r, verdict) {
     + `${plural(n, 'пакет', 'пакета', 'пакетов')} · ${r.id}`;
 }
 
+// A Map, not an object: a mode such as "constructor" must not find something of Object's.
+const MODES = new Map([['auto', 'автоответы'], ['manual', 'ручной']]);
+
 function updateRows(u) {
-  const mode = { auto: 'автоответы', manual: 'ручной' }[u.mode] || (str(u.mode) && code(u.mode, 20));
+  const mode = MODES.get(u.mode) || (str(u.mode) && code(u.mode, 20));
   return [
     ['Режим', mode],
     ['Длилось', duration(u.seconds)],
