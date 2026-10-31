@@ -762,6 +762,7 @@ class App:
         # The reports' state, read again only when the settings are open: never once per frame.
         self.rep, self.rep_t = (report.status() if live else dict(REPORTS_UNDECIDED)), time.time()
         self.sender_due = live and not DEMO        # see send_waiting
+        self.report_line = None                    # this update's report (ReportLine), once there is one
         self.hinted = False
         self.set_sel, self.set_key_t = 0, 0.0
         self.pv_open, self.pv_scroll, self.pv_page = False, 0, 10      # "Что именно уходит"
@@ -2031,15 +2032,34 @@ def transition(app, view):
 # ───────────────────────────── summary ─────────────────────────────
 
 class ReportLine:
-    """The summary's quiet line about this update's report: where the report is now. Looked up at
-    most once a second; the sender works in a process of its own."""
+    """This update's report and the summary's quiet line about it. The report is put together in a
+    thread of its own (the device, pacman and the whole log take a moment on a slow machine, and the
+    screen must not stall on it), then queued and sent by a process of its own. Where it is now is
+    looked up at most once a second."""
     SENDING = 10                    # seconds of "отправляется…" before it counts as waiting
+    FINISH = 8                      # seconds the program waits at its end for a report still being put together
 
-    def __init__(self, path):
-        self.path, self.t0, self.state, self.polled = path, time.time(), "waiting", 0.0
+    def __init__(self, build):
+        """build() queues the report and returns its file, or None if it made none; it never raises
+        (report.after_update)."""
+        self.path, self.t0, self.state, self.polled = None, time.time(), "waiting", 0.0
         self.endpoint = bool(report.endpoint())
+        self.thread = threading.Thread(target=self._build, args=(build,), daemon=True)
+        self.thread.start()
+
+    def _build(self, build):
+        path = build()
+        self.t0, self.path = time.time(), path      # "отправляется…" counts from the moment it was queued
+
+    def finish(self, timeout=FINISH):
+        """At the program's end: a report started just before the window closed still gets queued."""
+        self.thread.join(timeout)
 
     def text(self):
+        if self.thread.is_alive():
+            return "отчёт: собираю…"
+        if not self.path:
+            return ""                                # none was made after all
         now = time.time()
         if now - self.polled >= 1:
             self.polled = now
@@ -2059,13 +2079,16 @@ class ReportLine:
 
 
 def queue_report(app, res, mode, elapsed):
-    """This update's report, if the user said yes (never for the demo): queued, and sent by a
-    process of its own. Returns its ReportLine for the summary, or None when none was made."""
+    """This update's report, if the user said yes (never for the demo): put together and queued
+    in a thread, sent by a process of its own. Returns its ReportLine (also kept as app.report_line,
+    for the wait at the end), or None when there is none to make."""
+    if DEMO or not res or not report.enabled():
+        return None
     w, h = term_size()
     mon = app.monitors or None               # counted only for Konsole on KDE: elsewhere unknown, not 0
-    path = report.after_update(res, demo=DEMO, mode=mode, seconds=elapsed,
-                               ui={"screen": f"{w}x{h}", "monitors": mon})
-    return ReportLine(path) if path else None
+    app.report_line = ReportLine(lambda: report.after_update(res, demo=DEMO, mode=mode, seconds=elapsed,
+                                                             ui={"screen": f"{w}x{h}", "monitors": mon}))
+    return app.report_line
 
 
 def summary_view(res, elapsed, sent=None):
@@ -2207,6 +2230,10 @@ def self_test():
                    last_sent="2026-10-30T17:45:45", last_error="URLError: " + "name resolution failed " * 6),
               dict(REPORTS_UNDECIDED, enabled=True, decided=True, id="1a2b3c4d", endpoint=True,
                    last_sent="2026-10-30T17:45:45", last_error="HTTP 400: отчёт не принят")]
+    sent = ReportLine(lambda: os.path.join(report.OUTBOX, "x.json"))     # queued at once
+    gate = threading.Event()
+    building = ReportLine(lambda: gate.wait(60) and None)               # still being put together
+    sent.finish()
     preview = json.dumps({"schema": 1, "id": "1a2b3c4d", "time": "2026-10-31T08:00:00Z",
                           "updater": {"commit": "abc1234", "date": "31.10.2026"},
                           "device": {"model": "очень длинное название модели " * 6, "odd": "\x1b[2J\x9b2J",
@@ -2278,11 +2305,13 @@ def self_test():
         for sv, demo, left in ((summary_view(res, 125), False, None), (summary_view(res, 3), False, 7.5),
                                (summary_view(None, 0), True, None)):
             shot(lambda: draw_summary(app, sv, 2.0, demo, left))
-        sent = ReportLine(os.path.join(report.OUTBOX, "x.json"))
         for state, age, endpoint in (("waiting", 0, True), ("waiting", 60, True), ("waiting", 0, False),
                                      ("sent", 0, True), ("rejected", 0, True)):
             sent.state, sent.t0, sent.polled, sent.endpoint = state, time.time() - age, math.inf, endpoint
             shot(lambda: draw_summary(app, summary_view(res, 125, sent), 2.0, False, 7.5))
+        shot(lambda: draw_summary(app, summary_view(res, 125, building), 2.0, False, 7.5))
+    gate.set()
+    building.finish()
     print("arch-update-ui: self-test ok")
 
 
@@ -2296,7 +2325,7 @@ def run_auto(app):
                                        cmd=DEMO_CMD if DEMO else None, dims=tuple(app.s.size),
                                        on_spawn=lambda ch: setattr(app, "child", ch), demo=DEMO)
     elapsed = time.time() - t0
-    sent = queue_report(app, res, "auto", elapsed)     # now: a game left open must not hold it back
+    sent = queue_report(app, res, "auto", elapsed)     # started now: a game left open must not hold it back
     if not DEMO and not view.raw and res is not None and res.get("started", True):
         view.prog.learn()
     if (view.game or view.hub) and not view.raw and engine.TERM_OK:
@@ -2423,6 +2452,8 @@ def main():
                 pass
         return
     finally:
+        if app and app.report_line:
+            app.report_line.finish()              # one started just before the window closed still gets queued
         if engine.TERM_OK and app:
             app.s.leave()
             try:
