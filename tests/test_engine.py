@@ -99,6 +99,7 @@ class Machine(unittest.TestCase):
         os.makedirs(engine.PRESET_DIR)
         self.dkms = ""
         self.sbctl = ""
+        self.sudo_stat = ""             # what `sudo -n sh -c 'echo sudo-ok; stat …'` prints ("": sudo asks)
         self.owners = {}
         real_run = engine.run
 
@@ -109,6 +110,8 @@ class Machine(unittest.TestCase):
                 return "".join(f"{f} is owned by {self.owners[f]} 1.0-1\n" for f in cmd[2:] if f in self.owners)
             if cmd == ["sudo", "-n", "sbctl", "verify"]:
                 return self.sbctl
+            if cmd[:3] == ["sudo", "-n", "sh"]:
+                return self.sudo_stat
             if cmd[0] in ("sudo", "systemctl", "pacdiff", "pgrep", "findmnt"):
                 return ""
             return real_run(cmd, *a, **k)
@@ -143,6 +146,24 @@ class Machine(unittest.TestCase):
             f.write(data)
         os.chmod(path, mode)
         return path
+
+    def closed_boot(self, *names):
+        """Boot files in a folder the user may not look into: archinstall mounts the ESP at /boot
+        with fmask=0077,dmask=0077, so a stat by the user fails with EACCES, not ENOENT."""
+        d = os.path.join(self.tmp, "boot")
+        os.makedirs(d)
+        paths = [self.boot_file(os.path.join("boot", n)) for n in names]
+        os.chmod(d, 0o600)
+        self.addCleanup(os.chmod, d, 0o700)
+        if os.access(paths[0], os.F_OK):
+            self.skipTest("running as root: every folder is open")
+        return paths
+
+    def pacman_log(self, text):
+        path = os.path.join(self.tmp, "pacman.log")
+        with open(path, "w") as f:
+            f.write(text)
+        self.patch(engine, "PACMAN_LOG", path)
 
     def checks(self):
         return engine.system_checks({}, 0, types.SimpleNamespace(failures=set(), notes=set()), 0)
@@ -211,6 +232,40 @@ class Machine(unittest.TestCase):
         self.kernel("linux", "7.2.11-arch1-1", f'ALL_kver="{self.tmp}/gone"\nPRESETS=(default)\ndefault_image="{image}"\n')
         r = self.checks()
         self.assertTrue(any("НЕ перезагружайся" in p and "/gone" in p for p in r["problems"]), r["problems"])
+
+    def test_a_boot_closed_to_users_is_not_called_missing(self):
+        # A Chromebook updated gnupg and brave and was told its kernel was gone and not to reboot.
+        kernel, image = self.closed_boot("vmlinuz-linux", "initramfs-linux.img")
+        self.kernel("linux", "7.2.11-arch1-1", f'ALL_kver="{kernel}"\nPRESETS=(default)\ndefault_image="{image}"\n')
+        self.pacman_log("[ALPM] upgraded gnupg (2.4.9-3 -> 2.4.9-4)\n")
+        r = self.checks()
+        self.assertEqual(r["problems"], [])
+        self.assertIn("ядро и initramfs этим обновлением не менялись", r["ok"])
+        self.assertNotIn("ядро и initramfs на месте", r["ok"])          # nothing was looked at
+
+    def test_a_closed_boot_rebuilt_by_mkinitcpio_is_judged_by_its_output(self):
+        kernel, image = self.closed_boot("vmlinuz-linux", "initramfs-linux.img")
+        self.kernel("linux", "7.2.11-arch1-1", f'ALL_kver="{kernel}"\nPRESETS=(default)\ndefault_image="{image}"\n')
+        self.pacman_log("[ALPM] running '90-mkinitcpio-install.hook'...\n"
+                        "[ALPM-SCRIPTLET] ==> Image generation successful\n")
+        r = self.checks()
+        self.assertEqual(r["problems"], [])
+        self.assertIn("initramfs собран заново (по выводу mkinitcpio)", r["ok"])
+        self.pacman_log("[ALPM] running '90-mkinitcpio-install.hook'...\n")   # no word on the result
+        r = self.checks()
+        self.assertEqual(r["problems"], [])
+        self.assertTrue(any("sudo ls -l /boot" in w for w in r["warnings"]), r["warnings"])
+
+    def test_a_closed_boot_is_looked_into_through_sudo_when_it_asks_nothing(self):
+        kernel, image = self.closed_boot("vmlinuz-linux", "initramfs-linux.img")
+        self.kernel("linux", "7.2.11-arch1-1", f'ALL_kver="{kernel}"\nPRESETS=(default)\ndefault_image="{image}"\n')
+        self.sudo_stat = f"sudo-ok\n64 {kernel}\n"                           # the image is really gone
+        r = self.checks()
+        self.assertTrue(any("НЕ перезагружайся" in p and image in p for p in r["problems"]), r["problems"])
+        self.sudo_stat = f"sudo-ok\n64 {kernel}\n64 {image}\n"
+        r = self.checks()
+        self.assertEqual(r["problems"], [])
+        self.assertIn("ядро и initramfs на месте", r["ok"])
 
     def test_dkms_module_missing_for_a_kernel(self):
         self.kernel("linux", "7.2.12-arch1-1")

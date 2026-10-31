@@ -94,6 +94,7 @@ NOTHING_DONE = {4: "обновление отменено — система н�
                 17: "уже идёт другое обновление Arch-Update — не перезагружайся, пока оно не закончится; "
                     "это окно ничего не меняло"}
 PACMAN_LOCK = "/var/lib/pacman/db.lck"
+PACMAN_LOG = "/var/log/pacman.log"
 MODULES_DIR = "/usr/lib/modules"          # one directory per installed kernel
 PRESET_DIR = "/etc/mkinitcpio.d"
 DKMS_SRC = "/usr/src"
@@ -170,6 +171,23 @@ def preset_files(pkg):
         if path.startswith("/") and (kind, path) not in files:
             files.append((kind, path))
     return files
+
+
+def boot_file_sizes_as_root(files):
+    """Sizes of boot files the user may not look at (/boot closed to users, as archinstall mounts
+    the ESP: fmask/dmask 0077), through sudo if it asks for no password: {path: size}, missing
+    files left out. None when sudo would ask."""
+    out = run(["sudo", "-n", "sh", "-c", 'echo sudo-ok; for f; do stat -c "%s %n" -- "$f" 2>/dev/null; done',
+               "sh"] + files, timeout=20)
+    lines = out.splitlines()
+    if lines[:1] != ["sudo-ok"]:
+        return None
+    sizes = {}
+    for line in lines[1:]:
+        size, _, path = line.partition(" ")
+        if size.isdigit():
+            sizes[path] = int(size)
+    return sizes
 
 
 def dkms_built():
@@ -1009,6 +1027,12 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
     added = sorted(set(after) - set(before))
     removed = sorted(set(before) - set(after))
     problems, warnings, ok = [], [], []
+    try:
+        with open(PACMAN_LOG, encoding="utf-8", errors="replace") as f:
+            f.seek(pacman_log_offset)
+            pacman_log = f.read()          # what pacman and its hooks did in this update
+    except OSError:
+        pacman_log = None
 
     LOG.event("ПАКЕТЫ", "обновлены: " + (", ".join(f"{p} {before[p]}→{after[p]}" for p in changed) or "—"))
     if added or removed:
@@ -1033,7 +1057,7 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
         problems.append(f"{t} не смонтирован — ядро могло записаться не туда, НЕ перезагружайся")
 
     kernels = kernel_packages()
-    boot_files, checked = [], 0
+    boot_files, checked, closed, unverified = [], 0, [], False
     for pkg, kver in sorted(kernels.items()):
         files = preset_files(pkg)
         if not files:
@@ -1044,6 +1068,9 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
             boot_files.append(f)
             try:
                 size = os.stat(f).st_size
+            except PermissionError:
+                closed.append(f)           # /boot closed to users: unknown, not missing
+                continue
             except OSError:
                 problems.append(f"нет {f} — НЕ перезагружайся, система не загрузится")
                 continue
@@ -1058,7 +1085,26 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
                 if not img_ok:
                     problems.append(f"{f} обрезан или собран не под ядро {kver} — НЕ перезагружайся "
                                     "(сначала: sudo mkinitcpio -P)")
-    if checked and not any("НЕ перезагружайся" in p for p in problems):
+    if closed:
+        sizes = boot_file_sizes_as_root(closed)
+        if sizes is not None:
+            for f in closed:
+                if f not in sizes:
+                    problems.append(f"нет {f} — НЕ перезагружайся, система не загрузится")
+                elif sizes[f] == 0:
+                    problems.append(f"{f} пустой — НЕ перезагружайся (сначала: sudo mkinitcpio -P)")
+        else:
+            # No look inside: judge by what this update did to the boot files.
+            unverified = True
+            log = pacman_log or ""
+            if not any(p in kernels for p in changed + added) and "mkinitcpio" not in log:
+                ok.append("ядро и initramfs этим обновлением не менялись")
+            elif "Image generation successful" in log and not FAILURE_MARKERS.search(log):
+                ok.append("initramfs собран заново (по выводу mkinitcpio)")
+            else:
+                warnings.append("не смог заглянуть в /boot: он закрыт для пользователя — "
+                                "перед перезагрузкой проверь: sudo ls -l /boot")
+    if checked and not unverified and not any("НЕ перезагружайся" in p for p in problems):
         ok.append("ядро и initramfs на месте" if len(kernels) == 1 else f"ядра и initramfs на месте ({checked})")
     # The dkms pacman hook never fails the transaction: a module that didn't build shows up only here.
     for module, kvers in sorted(dkms_built().items()):
@@ -1113,12 +1159,8 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
         LOG.event("ПРОБЛЕМА", p)
     for w in warnings:
         LOG.event("ВНИМАНИЕ", w)
-    try:
-        with open("/var/log/pacman.log", encoding="utf-8", errors="replace") as f:
-            f.seek(pacman_log_offset)
-            LOG.text("\n══════ /var/log/pacman.log за это обновление ══════\n" + f.read())
-    except OSError:
-        pass
+    if pacman_log is not None:
+        LOG.text("\n══════ /var/log/pacman.log за это обновление ══════\n" + pacman_log)
 
     if problems:
         notify("Обновление: нужна проверка", "\n".join(problems), urgent=True)
@@ -1291,7 +1333,7 @@ def run_update(view, manual=False, stop_on_news=True, cmd=None, summary=True, di
                        f"новости: {'останавливаться' if stop_on_news else 'не останавливаться'}, "
                        f"вид: {type(view).__name__}")
     try:
-        pacman_log_offset = os.path.getsize("/var/log/pacman.log")
+        pacman_log_offset = os.path.getsize(PACMAN_LOG)
     except OSError:
         pacman_log_offset = 0
     before = installed_versions()
