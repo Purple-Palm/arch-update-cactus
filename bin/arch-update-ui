@@ -405,6 +405,10 @@ KEYS = {b"\x1b[A": "up", b"\x1bOA": "up", b"\x1b[B": "down", b"\x1bOB": "down", 
 CTRL = {0x0d: "enter", 0x0a: "enter", 0x7f: "bs", 0x08: "bs", 0x1d: "ctrl]", 0x03: "ctrl-c", 0x20: "space",
         0x09: "tab"}
 ESC_SEQ = re.compile(rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|O[ -~])")     # CSI ... final byte, or SS3 x
+# The same key on the Russian layout (й is q): menu and game keys work whichever layout is on.
+# Only for commands; text typed into an answer stays as typed.
+LATIN = dict(zip("йцукенгшщзфывапролдячсмитьЙЦУКЕНГШЩЗФЫВАПРОЛДЯЧСМИТЬ",
+                 "qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM"))
 
 
 def parse_keys(data):
@@ -1123,6 +1127,7 @@ class App:
 
     # ── input
     def handle(self, key):
+        key = LATIN.get(key, key)
         if key in ("left", "right") and not self.confirm and self.monitors > 1 and \
                 not (self.state == "news" and self.article is not None):
             self.move_screen(key)
@@ -1360,7 +1365,7 @@ class LiveView(engine.TerminalView):
             for k in ("left", "right"):
                 if k in keys:
                     self.app.move_screen(k)
-            if any(k in ("g", "G", "п", "П") for k in keys):
+            if any(LATIN.get(k, k) in ("g", "G") for k in keys):
                 self.hub, self.hub_sel = True, 0
                 return None
         if self.modal:
@@ -1383,6 +1388,7 @@ class LiveView(engine.TerminalView):
 
     # ── mini-games
     def game_key(self, k):
+        k = LATIN.get(k, k)
         if self.hub:
             n = len(games.GAMES)
             if k in ("up", "k", "w"):

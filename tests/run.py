@@ -3,9 +3,10 @@
 
 Every run gets its own empty HOME (the real one is never touched) and goes through the whole
 demo in a real pty: splash, menu, the auto mode dashboard, all three mini-games, the question
-modal, a game left open until the update finishes, the summary. The output is rendered with
-pyte; the test fails on a UI exception, a screen that never shows up, or a bad exit. A text
-snapshot of every stage is written to tests/out/<cols>x<rows>/.
+modal, a game left open until the update finishes, the summary. Game and menu keys are also
+typed with the Russian layout on (з pauses Tetris; a short extra run leaves the menu with й).
+The output is rendered with pyte; the test fails on a UI exception, a screen that never shows
+up, or a bad exit. A text snapshot of every stage is written to tests/out/<cols>x<rows>/.
 
   python3 tests/run.py              every size, in parallel
   python3 tests/run.py 80x24 ...    only these sizes
@@ -30,9 +31,9 @@ DOWN, ESC, ENTER = "\x1b[B", "\x1b", "\r"
 
 
 class Run:
-    def __init__(self, cols, rows):
+    def __init__(self, cols, rows, name=None):
         self.cols, self.rows = cols, rows
-        self.name = f"{cols}x{rows}"
+        self.name = name or f"{cols}x{rows}"
         self.home = tempfile.mkdtemp(prefix=f"arch-update-test-{self.name}-")
         self.dir = os.path.join(OUT, self.name)
         shutil.rmtree(self.dir, ignore_errors=True)
@@ -130,6 +131,9 @@ class Run:
             if self.wait(f"game-{number}", title, timeout=5):
                 self.send(*moves)
                 self.snapshot(f"game-{number}-played")
+                if number == "1":                      # Russian layout on: з is the P key
+                    self.send("з")
+                    self.wait("game-1-paused", "ПАУЗА", timeout=5)
             self.send(ESC)
             self.wait("back-to-dashboard", "мини-игры", timeout=5)
         # The demo asks a question pacman would ask (a package conflict): it must come to us.
@@ -145,6 +149,11 @@ class Run:
             return
         time.sleep(1.2)                                # the summary ignores keys for its first second
         self.send(ENTER)
+
+    def quit_from_menu(self):
+        """The Russian layout is on: й, the Q key, still leaves the menu."""
+        if self.wait("menu", "Обновить автоматически", timeout=40):
+            self.send("й")
 
     def finish(self):
         try:
@@ -162,10 +171,10 @@ class Run:
         shutil.rmtree(self.home, ignore_errors=True)
 
 
-def run(size, results):
-    r = Run(*size)
+def run(size, results, name=None, script=Run.play):
+    r = Run(*size, name)
     try:
-        r.play()
+        script(r)
     except Exception as e:                              # a harness problem is a failure too
         r.failures.append(f"тест упал: {e!r}")
     finally:
@@ -177,12 +186,14 @@ def main():
     sizes = [tuple(map(int, a.split("x"))) for a in sys.argv[1:]] or SIZES
     results = {}
     threads = [threading.Thread(target=run, args=(s, results)) for s in sizes]
+    if not sys.argv[1:]:
+        threads.append(threading.Thread(target=run, args=((80, 24), results, "80x24-menu-q", Run.quit_from_menu)))
     for t in threads:
         t.start()
     for t in threads:
         t.join()
     bad = 0
-    for name in sorted(results, key=lambda n: tuple(map(int, n.split("x")))):
+    for name in sorted(results, key=lambda n: (tuple(map(int, n.split("-")[0].split("x"))), n)):
         fails = results[name]
         bad += bool(fails)
         print(f"{'✗' if fails else '✓'} {name}")
