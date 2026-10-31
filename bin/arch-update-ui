@@ -1055,8 +1055,9 @@ class App:
             L.warn_h = nw + 1 if nw else 0                   # warnings stacked, one blank row below
             L.menu_h = 1 + (2 * items if L.menu_subs else items + 1)
             return L.title_h + L.news_h + L.upd_h + L.warn_h + L.menu_h
+        # The package list goes down to one row before the news headline goes: it may be a NEW item.
         shrink = [("menu_subs", False), ("news_rows", min(L.news_rows, 1)), ("pkg_rows", min(L.pkg_rows, 2)),
-                  ("big_title", False), ("news_rows", 0), ("pkg_rows", min(L.pkg_rows, 1))]
+                  ("big_title", False), ("pkg_rows", min(L.pkg_rows, 1)), ("news_rows", 0)]
         L.total = measure()
         while L.total > c.h - 4 and shrink:                  # a free row above the footer
             setattr(L, *shrink.pop(0))
