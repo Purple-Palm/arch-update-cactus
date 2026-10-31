@@ -19,7 +19,7 @@ jobs:
     container: archlinux:latest
     steps:
       - name: Install dependencies
-        run: pacman -Syu --noconfirm --needed git python python-pexpect python-pyte shellcheck
+        run: pacman -Syu --noconfirm --needed git python python-pexpect python-pyte shellcheck nodejs
       - uses: actions/checkout@v7
       - name: Lint shell scripts
         run: shellcheck install.sh bin/arch-update-launcher bin/arch-update-cactus-sync lib/demo-update
@@ -27,6 +27,8 @@ jobs:
         run: "! grep -n '@REPO@' install.sh README.md"
       - name: Self-test
         run: ./install.sh --check
+      - name: Relay tests
+        run: node --test relay/test.mjs
       - name: Engine tests and headless runs at laptop and desktop terminal sizes
         run: |
           useradd -m tester
