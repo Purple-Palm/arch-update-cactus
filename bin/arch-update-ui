@@ -2055,7 +2055,8 @@ class ReportLine:
         """At the program's end: a report started just before the window closed still gets queued."""
         self.thread.join(timeout)
 
-    def text(self):
+    def text(self, short=False):
+        """The line; short: the few words that fit after the journal line's path."""
         if self.thread.is_alive():
             return "отчёт: собираю…"
         if not self.path:
@@ -2066,15 +2067,15 @@ class ReportLine:
             # looked up twice when not found: the sender may move it between two folders just then
             self.state = report.state_of(self.path) or report.state_of(self.path)
         if self.state == "sent":
-            return "отчёт отправлен разработчику"
+            return "отчёт отправлен" if short else "отчёт отправлен разработчику"
         if self.state == "rejected":
             return "отчёт не принят сервером"
         if self.state == "waiting":
             if not self.endpoint:            # nothing sends it before a server is set
-                return "отчёт сохранён — уйдёт, когда подключат сервер"
+                return "отчёт сохранён" if short else "отчёт сохранён — уйдёт, когда подключат сервер"
             if now - self.t0 < self.SENDING:
                 return "отчёт: отправляется…"
-            return "отчёт ждёт отправки — уйдёт при следующем запуске"
+            return "отчёт ждёт отправки" if short else "отчёт ждёт отправки — уйдёт при следующем запуске"
         return ""
 
 
@@ -2114,10 +2115,13 @@ def draw_summary(app, sv, t, demo, left):
     c = app.s.canvas
     W = min(c.w - 8, 84)
     gap = 7 if c.h < 30 else 8                                   # glyph top -> headline
-    note = sv.sent.text() if sv.sent else ""                     # where this update's report is
-    foot = c.h - 5 if note else c.h - 4                          # the journal line, the report's below it
     wraps = [textwrap.wrap(tx, max(10, W - 4), break_on_hyphens=False) or [""] for _, tx, _ in sv.lines]
     need = gap + 3 + sum(min(2, len(w)) for w in wraps)          # glyph, headline, stats, blank, list
+    # Where this update's report is gets a row of its own below the journal line only while every
+    # row of the list still fits with it: no problem or warning ever makes room for it. Else it goes
+    # onto the journal line, in short, if there is room there, or is left out.
+    own_row = sv.sent is not None and need <= c.h - 7
+    foot = c.h - 5 if own_row else c.h - 4                       # the journal line
     top = max(1, (foot - need) // 2)                             # centred above the journal line
     gw = len(sv.glyph[0])
     gx = (c.w - gw) // 2
@@ -2138,10 +2142,10 @@ def draw_summary(app, sv, t, demo, left):
     y += 3
     longest = max([min(len(tx), W - 4) for _, tx, _ in sv.lines] or [0]) + 4
     x0 = (c.w - longest) // 2
-    for i, (icon, _, col) in enumerate(sv.lines[: max(3, foot - y - 2)]):
+    for i, (icon, _, col) in enumerate(sv.lines):
         a = clamp01((t - 0.7 - i * 0.08) / 0.35)
         wrapped = wraps[i]
-        if y + min(2, len(wrapped)) > foot - 1:           # low terminal: the log line stays readable
+        if y + min(2, len(wrapped)) > foot - 1:           # low terminal: the journal line stays readable
             break
         c.put(x0 + 2, y, icon, col, bold=True, alpha=a)
         tcol = TEXT if icon != "✓" else DIM               # one colour per item, its second line too
@@ -2150,8 +2154,13 @@ def draw_summary(app, sv, t, demo, left):
         for extra in wrapped[1:2]:
             c.put(x0 + 4, y, extra, tcol, alpha=a)
             y += 1
-    if sv.log:
-        c.cput(foot, "журнал: " + sv.log.replace(os.path.expanduser("~"), "~"), MUTED)
+    journal = "журнал: " + sv.log.replace(os.path.expanduser("~"), "~") if sv.log else ""
+    note = sv.sent.text(short=not own_row) if sv.sent else ""
+    if note and not own_row:
+        both = f"{journal} · {note}" if journal else note
+        journal, note = (both if len(both) <= c.w - 4 else journal), ""
+    if journal:
+        c.cput(foot, journal, MUTED)
     if note:
         c.cput(foot + 1, note, MUTED)
     mon = "   ·   ←→ монитор" if app.monitors > 1 else ""
@@ -2222,6 +2231,8 @@ def self_test():
     res = {"verdict": 2, "changed": ["a"] * 40, "added": ["b"], "removed": [], "exitstatus": 1,
            "problems": ["очень длинное описание проблемы " * 6], "warnings": ["предупреждение"],
            "ok": ["/boot в порядке"], "log": os.path.join(engine.STATE_DIR, "logs", "x.log")}
+    full = dict(res, problems=[f"проблема {i}: " + "длинное описание " * 6 for i in range(4)],     # more rows
+                warnings=[f"предупреждение {i}" for i in range(6)], ok=[f"проверка {i} прошла" for i in range(8)])
     # The settings with what report.status() and report.preview() can give, made up here: the
     # self-test reads and writes none of the real ones.
     states = [dict(REPORTS_UNDECIDED), dict(REPORTS_UNDECIDED, decided=True),
@@ -2308,8 +2319,17 @@ def self_test():
         for state, age, endpoint in (("waiting", 0, True), ("waiting", 60, True), ("waiting", 0, False),
                                      ("sent", 0, True), ("rejected", 0, True)):
             sent.state, sent.t0, sent.polled, sent.endpoint = state, time.time() - age, math.inf, endpoint
-            shot(lambda: draw_summary(app, summary_view(res, 125, sent), 2.0, False, 7.5))
+            for r in (res, full):               # a row of its own below the journal line, or a place on it
+                shot(lambda: draw_summary(app, summary_view(r, 125, sent), 2.0, False, 7.5))
         shot(lambda: draw_summary(app, summary_view(res, 125, building), 2.0, False, 7.5))
+
+        def items(sv):
+            draw_summary(app, sv, 2.0, False, 7.5)
+            n = sum(ch in "✗⚠✓" for row in c.ch for ch in row)
+            c.clear()
+            return n
+        if items(summary_view(full, 125, sent)) < items(summary_view(full, 125)):
+            raise RuntimeError(f"the summary's report line pushes a problem or a warning off at {w}x{h}")
     gate.set()
     building.finish()
     print("arch-update-ui: self-test ok")
