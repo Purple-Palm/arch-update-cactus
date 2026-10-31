@@ -161,6 +161,12 @@ SECRET_PARAM = re.compile(r"(?i)([?&;#][\w.~%+-]{0,40}?(?:token|auth|key|pass|pw
 # A password typed before its prompt showed is echoed on a line of its own, right above the prompt.
 TYPED_AHEAD = re.compile(r"(?im)^\S{1,128}\n(?=[^\n]*?(?:password|passphrase|пароль))(?=[^\n]*:[^\S\n]*$)")
 TYPED_AHEAD_SAYS = "<ввод до запроса пароля>\n"
+# In a manual update the keys go straight to the program, and whatever is typed before a password prompt
+# is echoed into the journal: with spaces, typed twice, or ahead on the prompt's own line. Such a journal
+# loses, around each password prompt, the start of the prompt's line and up to three lines above it that
+# are not the updater's own notes ("[12:34:56 СТАРТ] …").
+PASSWORD_PROMPT = re.compile(r"(?i)(?:\[sudo\] )?(?:password|passphrase|пароль)[^\n]{0,120}?:[^\S\n]*$")
+OWN_NOTE = re.compile(r"\[\d\d:\d\d:\d\d \S")
 # A templated unit's instance can be a user (syncthing@cactus.service) or a Wi-Fi network (netctl names
 # its profiles "interface-network": netctl@wlp2s0\x2dHome.service); a number (user@1000.service) or a
 # tty (getty@tty1.service) says nothing, if that is all of it (ping@192.168.1.5.service is no number).
@@ -171,6 +177,8 @@ UNIT_INSTANCE = re.compile(r"@(?!(?:\d+|tty\w*)" + UNIT_TYPE + r")[\w:.\\-]{1,25
 # in a folder's name as \x2d) or the unit's end (home-cactus.mount).
 UNIT_AFTER_NAME = (r"(?=(?:-|\\x2d)[\w.\\-]{0,255}\.(?:mount|automount|swap)\b"
                    r"|\.(?:mount|automount|swap|service|socket|timer|path|target)\b)")
+HOME_MOUNT = re.compile(r"(?<![\w-])((?:run-media|home)-)(?!<user>)[^\s,.@\\-]{1,64}(?:\\x2d[^\s,.@\\-]{1,64}){0,8}"
+                        r"(?=(?:-|\\x2d)[\w.\\-]{0,255}\.(?:mount|automount)\b|\.(?:mount|automount)\b)")
 
 
 def _who():
@@ -219,9 +227,15 @@ def scrubber():
     # Before the e-mail rule (bob:secret@example.com is no address) and that before the names
     # (cactus@cactus.dev is an address, not a user at some host).
     rules += [(CREDENTIALS, "://<credentials>@"), (SECRET_PARAM, r"\1<secret>"), (EMAIL, "<email>")]
-    for u in sorted(users, key=len, reverse=True):            # home-cactus.mount, run-media-cactus-USB.mount
-        forms = "|".join(re.escape(f) for f in sorted({u, u.replace("-", r"\x2d")}, key=len, reverse=True))
-        rules.append((re.compile(r"(?i)(?:(?<=[-@])|(?<=\\x2d))(?:" + forms + ")" + UNIT_AFTER_NAME), "<user>"))
+    # Names inside unit names: home-cactus.mount, run-media-cactus-USB.mount, mnt-Ivan.mount; then the account
+    # in a home or removable-media mount whoever it is (another account on the machine too).
+    for words, repl, everyone in ((users, "<user>", True), (hosts, "<host>", False), (names, "<name>", False)):
+        for w in sorted(words, key=len, reverse=True):
+            if not everyone and (len(w) < 3 or w.lower() in COMMON):
+                continue
+            forms = "|".join(re.escape(f) for f in sorted({w, w.replace("-", r"\x2d")}, key=len, reverse=True))
+            rules.append((re.compile(r"(?i)(?:(?<=[-@])|(?<=\\x2d))(?:" + forms + ")" + UNIT_AFTER_NAME), repl))
+    rules.append((HOME_MOUNT, r"\1<user>"))
     # A name ends where a word does: before a "." too (zork-laptop.local, "set to zork-laptop."), but
     # not before a "-" (arch-update-cactus is no user's name).
     plain, guarded = (r"(?<![\w-])", r"(?![\w-])"), (r"(?<![\w<-])", r"(?![\w>-])")
@@ -240,6 +254,36 @@ def scrubber():
             text = rx.sub(repl, text)
         return text
     return scrub
+
+
+def hide_typed_ahead(log):
+    """A manual update's journal without what was typed ahead of its password prompts (see PASSWORD_PROMPT)."""
+    lines = log.split("\n")
+    for i, line in enumerate(lines):
+        m = PASSWORD_PROMPT.search(line)
+        if not m or OWN_NOTE.match(line):
+            continue
+        hidden = m.start() > 0
+        lines[i] = line[m.start():]
+        j = i - 1
+        while j >= 0 and i - j <= 3 and lines[j] is not None and len(lines[j]) <= 128 \
+                and not OWN_NOTE.match(lines[j]) and not PASSWORD_PROMPT.search(lines[j]):
+            lines[j], hidden = None, True
+            j -= 1
+        if hidden:
+            lines[i] = TYPED_AHEAD_SAYS + lines[i]
+    return "\n".join(line for line in lines if line is not None)
+
+
+def clean(report, scrub):
+    """A report as it may leave the machine: every string scrubbed, and a manual update's journal (or one
+    switched to manual with Ctrl+]) without what was typed ahead of a password prompt."""
+    report = scrub_all(report, scrub)
+    if isinstance(report, dict) and isinstance(report.get("log"), str):
+        update = report.get("update") if isinstance(report.get("update"), dict) else {}
+        if update.get("mode") == "manual" or re.search(r"(?m)^\[\d\d:\d\d:\d\d РУЧНОЙ\]", report["log"]):
+            report["log"] = hide_typed_ahead(report["log"])
+    return report
 
 
 def scrub_all(obj, scrub):
@@ -480,7 +524,7 @@ def build(res, mode="auto", seconds=None, ui=None):
                    "warnings": res.get("warnings", []), "ok": res.get("ok", [])},
         "log": _log_text(res.get("log")),
     }
-    return scrub_all(report, scrubber())
+    return clean(report, scrubber())
 
 
 def _prune(folder):
@@ -571,6 +615,7 @@ def _send(waiting, url, timeout):
     agent = "arch-update-cactus/" + updater_version().get("commit", "?")
     scrub = scrubber()
     tries = _tries({os.path.basename(p) for p in waiting})
+    unsure = {}                                         # name → path: 502/504 on it, on it alone or on every report?
     for path in waiting:
         if not enabled():                               # switched off meanwhile
             break
@@ -586,7 +631,7 @@ def _send(waiting, url, timeout):
             _file_away(path, REJECTED)
             continue
         # Through the scrubber once more: one queued by an older version goes out as clean as a new one.
-        report = scrub_all(report, scrub)
+        report = clean(report, scrub)
         data = json.dumps(report, ensure_ascii=False).encode("utf-8", "replace")
         try:
             req = urllib.request.Request(url, data=data, method="POST",
@@ -603,22 +648,36 @@ def _send(waiting, url, timeout):
             tries.pop(name, None)
             _note(last_sent=datetime.datetime.now().isoformat(timespec="seconds"), last_error="", tries=tries)
             _file_away(path, SENT, report)
-        elif code in (408, 429, 503):                   # busy or limited: the others would get the same now
+        elif code in (404, 405, 408, 429, 503):         # not set up, busy or limited: the others would fare alike
             _note(last_error=f"HTTP {code}", tries=tries)
             break
-        elif code >= 500:                               # it failed on this one: the next may go through
-            tries[name] = tries.get(name, 0) + 1
-            if tries[name] < TRIES:
-                _note(last_error=f"HTTP {code}", tries=tries)
-                continue
-            del tries[name]
-            _note(last_error=f"HTTP {code}: отчёт не принят после {TRIES} попыток", tries=tries)
-            _file_away(path, REJECTED, report)
+        elif code in (502, 504):                        # GitHub refused or did not answer: an expired token fails
+            unsure[name] = (path, code)                 # every report alike, so only a report that goes through
+            _note(last_error=f"HTTP {code}", tries=tries)   # later in this round shows it was this one
+            if len(unsure) >= 2 and not sent:
+                break
+        elif code >= 500:                               # the relay failed on this one: the next may go through
+            _failed_try(name, path, code, tries, report)
         else:                                           # refused for good: keep a few to look at
             tries.pop(name, None)
             _note(last_error=f"HTTP {code}: отчёт не принят", tries=tries)
             _file_away(path, REJECTED, report)
+    if sent:                                            # the relay works: those failed on their own
+        for name, (path, code) in unsure.items():
+            _failed_try(name, path, code, tries, None, quiet=True)
     return sent, len(glob.glob(os.path.join(OUTBOX, "*.json")))
+
+
+def _failed_try(name, path, code, tries, report, quiet=False):
+    """One more failed try for this report; after TRIES of them it is set aside, so it holds up no other.
+    quiet: counted after the round, when a later report went through: last_error stays as that left it."""
+    tries[name] = tries.get(name, 0) + 1
+    if tries[name] < TRIES:
+        _note(tries=tries, **({} if quiet else {"last_error": f"HTTP {code}"}))
+        return
+    del tries[name]
+    _note(last_error=f"HTTP {code}: отчёт не принят после {TRIES} попыток", tries=tries)
+    _file_away(path, REJECTED, report)
 
 
 def _file_away(path, dest, report=None):
@@ -666,7 +725,7 @@ def preview():
                   key=os.path.basename)
     report = _read_json(sent[-1]) if sent else {}
     if report:
-        report = scrub_all(report, scrubber())         # as it goes out (see _send)
+        report = clean(report, scrubber())             # as it goes out (see _send)
     else:
         logs = sorted(glob.glob(os.path.join(engine.STATE_DIR, "logs", "20*.log")))
         report = build({"verdict": None, "log": logs[-1] if logs else None}, mode="—")

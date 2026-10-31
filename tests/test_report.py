@@ -117,10 +117,10 @@ class Reports(unittest.TestCase):
     def tries(self):
         return report._read_json(report.STATUS).get("tries")
 
-    def queue_in_order(self, reports):
+    def queue_in_order(self, reports, start=0):
         """Queued oldest first: names of the same second would come in any order."""
         paths = []
-        for n, r in enumerate(reports):
+        for n, r in enumerate(reports, start):
             path = os.path.join(report.OUTBOX, f"20261031-120000-{n:04x}.json")
             os.replace(report.queue(r), path)
             paths.append(path)
@@ -479,7 +479,7 @@ class Reports(unittest.TestCase):
                 self.assertEqual(self.tries(), {})                # and nobody's fault: no try counted
 
     def test_a_report_the_relay_fails_on_does_not_hold_up_the_others(self):
-        for code in (500, 502):
+        for code in (500,):
             with self.subTest(code=code):
                 shutil.rmtree(report.REPORTS, ignore_errors=True)
                 self.relay(lambda r, code=code: code if r.get("n") == 0 else 201)
@@ -498,6 +498,88 @@ class Reports(unittest.TestCase):
                 self.assertEqual(self.tries(), {})
                 self.assertTrue(report.status()["last_error"].startswith(f"HTTP {code}: "))
                 self.assertEqual([r["n"] for r in Relay.got].count(0), report.TRIES)
+
+    def test_github_failing_for_every_report_keeps_them_all(self):
+        # An expired token: the relay answers 502 to every report alike. Nothing is anyone's fault, nothing
+        # is set aside, and two such answers end the round.
+        for code in (502, 504):
+            with self.subTest(code=code):
+                shutil.rmtree(report.REPORTS, ignore_errors=True)
+                self.relay(code)
+                report.set_consent(True)
+                paths = self.queue_in_order([{"schema": 1, "n": n} for n in range(4)])
+                for _ in range(5):
+                    self.assertEqual(report.send_pending(), (0, 4))
+                self.assertEqual([report.state_of(p) for p in paths], ["waiting"] * 4)
+                self.assertEqual(self.tries(), {})
+                self.assertEqual(len(Relay.got), 5 * 2)
+                self.assertEqual(report.status()["last_error"], f"HTTP {code}")
+
+    def test_a_report_github_keeps_refusing_is_set_aside_once_others_go_through(self):
+        # 502 on one report only: it counts a try only in a round where another report went through.
+        self.relay(lambda r: 502 if r.get("n") == 0 else 201)
+        report.set_consent(True)
+        stuck, = self.queue_in_order([{"schema": 1, "n": 0}])
+        name = os.path.basename(stuck)
+        self.assertEqual(report.send_pending(), (0, 1))                 # alone: it cannot tell, nothing counted
+        self.assertEqual(self.tries(), {})
+        for round_ in range(1, report.TRIES + 1):
+            self.queue_in_order([{"schema": 1, "n": round_}], start=round_)
+            self.assertEqual(report.send_pending()[0], 1)
+            if round_ < report.TRIES:
+                self.assertEqual(self.tries(), {name: round_})
+                self.assertEqual(report.status()["last_error"], "")     # the last report went through
+        self.assertEqual(report.state_of(stuck), "rejected")
+        self.assertEqual(self.tries(), {})
+        self.assertIn("не принят", report.status()["last_error"])
+
+    def test_a_relay_at_the_wrong_address_keeps_the_reports(self):
+        for code in (404, 405):
+            with self.subTest(code=code):
+                shutil.rmtree(report.REPORTS, ignore_errors=True)
+                self.relay(code)
+                report.set_consent(True)
+                paths = self.queue_in_order([{"schema": 1, "n": n} for n in range(2)])
+                self.assertEqual(report.send_pending(), (0, 2))
+                self.assertEqual([report.state_of(p) for p in paths], ["waiting", "waiting"])
+
+    def test_a_manual_journal_loses_what_was_typed_ahead_of_a_password_prompt(self):
+        report._who = lambda: WHO
+        typed = ("[12:00:00 СТАРТ] arch-update, режим: ручной\n"
+                 "correct horse battery staple\nhunter2\nhunter2\n"     # typed ahead: with spaces, twice
+                 "hunt[sudo] password for cactus: \n"                     # and on the prompt's own line
+                 "[12:00:03 SUDO] пароль принят\n"
+                 "==> Looking for updates...\n"
+                 "[12:00:04 ТЕБЕ] запрос пароля: «Password:»\n"
+                 "hunter3 Password: \n"
+                 "[12:00:05 ТЫ] ответил: «•••»\n")
+        for mode, log in (("manual", typed), ("auto", typed.replace("режим: ручной", "режим: автоответы")
+                                               + "[12:00:06 РУЧНОЙ] Ctrl+] — ручной режим до конца обновления\n")):
+            with self.subTest(mode=mode):
+                report.set_consent(True)
+                text = report.build(self.result(log), mode=mode)["log"]
+                for gone in ("correct horse", "hunter2", "hunt[", "hunter3"):
+                    self.assertNotIn(gone, text)
+                for kept in ("[12:00:00 СТАРТ]", "[sudo] password for <user>:", "==> Looking for updates...",
+                             "Password:", "[12:00:05 ТЫ] ответил: «•••»"):
+                    self.assertIn(kept, text)
+        # an automatic update's journal is left as it is: there the keys never reach the program
+        text = report.build(self.result("==> Looking for updates...\nok then\n[sudo] password for cactus: \n"))["log"]
+        self.assertIn("ok then", text)
+
+    def test_an_erased_typo_is_not_sent_as_typed(self):
+        # The pty echoes a Backspace as "\b \b": the journal keeps what was finally typed, not "hunterr 2".
+        sys.path.insert(0, os.path.join(ROOT, "lib"))
+        import engine
+        log = engine.RunLog()
+        try:
+            log.output(b"hunterr\x08 \x082\n")
+            log.txt.flush()
+            with open(log.path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "hunter2\n")
+        finally:
+            log.txt.close()
+            log.raw.close()
 
     def test_a_refused_report_is_set_aside_not_retried(self):
         self.relay(400)
