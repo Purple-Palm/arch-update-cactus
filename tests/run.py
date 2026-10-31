@@ -5,6 +5,8 @@ Every run gets its own empty HOME (the real one is never touched) and goes throu
 demo in a real pty: splash, menu, the auto mode dashboard, all three mini-games, the question
 modal, a game left open until the update finishes, the summary. Game and menu keys are also
 typed with the Russian layout on (з pauses Tetris; a short extra run leaves the menu with й).
+Two more short runs (80x24, 200x60) open the settings, switch the update reports on, look at
+"Что именно уходит", switch them off again and check that nothing was queued or sent.
 The output is rendered with pyte; the test fails on a UI exception, a screen that never shows
 up, or a bad exit. A text snapshot of every stage is written to tests/out/<cols>x<rows>/.
 
@@ -13,6 +15,7 @@ up, or a bad exit. A text snapshot of every stage is written to tests/out/<cols>
 
 Needs python-pexpect and python-pyte (pip: pexpect pyte).
 """
+import json
 import os
 import shutil
 import sys
@@ -27,7 +30,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 UI = os.path.join(ROOT, "bin", "arch-update-ui")
 OUT = os.path.join(ROOT, "tests", "out")
 SIZES = [(80, 24), (100, 30), (136, 38), (200, 60)]
-DOWN, ESC, ENTER = "\x1b[B", "\x1b", "\r"
+UP, DOWN, ESC, ENTER = "\x1b[A", "\x1b[B", "\x1b", "\r"
 
 
 class Run:
@@ -40,6 +43,7 @@ class Run:
         os.makedirs(self.dir)
         self.shots = 0
         self.failures = []
+        self.after = []                 # checks of what the run left in its HOME, once it has ended
         self.screen = pyte.Screen(cols, rows)
         self.stream = pyte.ByteStream(self.screen)
         self.lock = threading.Lock()
@@ -155,6 +159,69 @@ class Run:
         if self.wait("menu", "Обновить автоматически", timeout=40):
             self.send("й")
 
+    def gone(self, stage, needle, timeout=20):
+        """Wait until the needle has left the screen."""
+        end = time.time() + timeout
+        while needle in self.text() and time.time() < end:
+            time.sleep(0.1)
+        if needle in self.text():
+            self.snapshot(stage + "-FAILED")
+            self.failures.append(f"{stage}: {needle!r} не исчезло")
+            return False
+        return True
+
+    def settings(self):
+        """Настройки: the update reports go on and off again, "Что именно уходит" shows a report put
+        together on the spot. Afterwards the choice is "no" and not a single report was made."""
+        if not self.wait("menu", "Обновить автоматически", timeout=40):
+            return
+        # The news decide whether there is a news item: once they are in, the item list stays put.
+        if not self.gone("menu-news", "загружаю новости"):
+            return
+        self.send(UP, UP)                           # round from the first item to the one before "Выйти"
+        if not self.wait("menu-settings", "▸ Настройки", timeout=5):
+            return
+        if "отчёты об обновлениях: не выбраны" not in self.text():
+            self.failures.append("меню: нет подписи «отчёты об обновлениях: не выбраны»")
+        self.send(ENTER)
+        if not self.wait("settings", "ВЫКЛ", timeout=5):
+            return
+        self.unpainted("settings")
+        self.send(ENTER)                            # the switch is the first item
+        if not self.wait("settings-on", "ID этой машины", timeout=5):
+            return
+        if "ВКЛ" not in self.text() or "ВЫКЛ" in self.text():
+            self.failures.append("настройки: после Enter отчёты не включились")
+        self.send(DOWN, ENTER)
+        if not self.wait("preview", '"device"', timeout=60):
+            return
+        self.unpainted("preview")
+        self.send(ESC)
+        if not self.wait("settings-back", "Отчёты об обновлениях", timeout=5):
+            return
+        self.send(UP, ENTER)
+        if not self.wait("settings-off", "ВЫКЛ", timeout=5):
+            return
+        self.send(ESC)
+        if not self.wait("menu-back", "отчёты об обновлениях: выкл", timeout=5):
+            return
+        self.send("q")
+        self.after.append(self.nothing_reported)
+
+    def nothing_reported(self):
+        state = os.path.join(self.home, ".local/state/arch-update-auto")
+        try:
+            with open(os.path.join(state, "settings.json")) as f:
+                reports = json.load(f).get("reports")
+        except (OSError, ValueError) as e:
+            reports = e
+        if reports is not False:
+            self.failures.append(f"settings.json: reports = {reports!r}, а должно быть false")
+        for folder in ("outbox", "sent"):
+            path = os.path.join(state, "reports", folder)
+            if os.path.isdir(path) and os.listdir(path):
+                self.failures.append(f"отчёты в reports/{folder}: {sorted(os.listdir(path))}")
+
     def finish(self):
         try:
             self.child.expect(pexpect.EOF, timeout=20)
@@ -168,6 +235,8 @@ class Run:
         if os.path.exists(err):
             with open(err) as f:
                 self.failures.append("ui-error.log:\n" + f.read())
+        for check in self.after:
+            check()
         shutil.rmtree(self.home, ignore_errors=True)
 
 
@@ -188,6 +257,9 @@ def main():
     threads = [threading.Thread(target=run, args=(s, results)) for s in sizes]
     if not sys.argv[1:]:
         threads.append(threading.Thread(target=run, args=((80, 24), results, "80x24-menu-q", Run.quit_from_menu)))
+        for cols, rows in ((80, 24), (200, 60)):
+            threads.append(threading.Thread(target=run, args=((cols, rows), results, f"{cols}x{rows}-settings",
+                                                              Run.settings)))
     for t in threads:
         t.start()
     for t in threads:
