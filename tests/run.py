@@ -5,6 +5,8 @@ Every run gets its own empty HOME (the real one is never touched) and goes throu
 demo in a real pty: splash, menu, the auto mode dashboard, all three mini-games, the question
 modal, a game left open until the update finishes, the summary. Game and menu keys are also
 typed with the Russian layout on (з pauses Tetris; a short extra run leaves the menu with й).
+The 136x38 run starts with the update reports on, one report from earlier waiting and a server
+address where nobody listens: the demo must still queue, send and mention none.
 Two more short runs (80x24, 200x60) open the settings with Enter pressed twice and held down (the
 reports must stay off), switch them on, look at "Что именно уходит", switch them off again and
 check that nothing was queued or sent.
@@ -19,6 +21,7 @@ Needs python-pexpect and python-pyte (pip: pexpect pyte).
 import json
 import os
 import shutil
+import socket
 import sys
 import tempfile
 import threading
@@ -32,11 +35,14 @@ UI = os.path.join(ROOT, "bin", "arch-update-ui")
 OUT = os.path.join(ROOT, "tests", "out")
 SIZES = [(80, 24), (100, 30), (136, 38), (200, 60)]
 UP, DOWN, ESC, ENTER = "\x1b[A", "\x1b[B", "\x1b", "\r"
+REPORTS_ON = (136, 38)          # the play run at this size has the update reports on
+EARLIER_REPORT = "20261030-120000-abcd.json"     # waits in that run's outbox from the start
 
 
 class Run:
-    def __init__(self, cols, rows, name=None):
+    def __init__(self, cols, rows, name=None, reports_on=False):
         self.cols, self.rows = cols, rows
+        self.reports_on = reports_on
         self.name = name or f"{cols}x{rows}"
         self.home = tempfile.mkdtemp(prefix=f"arch-update-test-{self.name}-")
         self.dir = os.path.join(OUT, self.name)
@@ -51,11 +57,26 @@ class Run:
         env = {k: v for k, v in os.environ.items() if not k.startswith(("XDG_", "ARCH_UPDATE"))}
         env.update(HOME=self.home, TERM="xterm-256color", LANG="C.UTF-8", LC_ALL="C.UTF-8")
         # No run reaches the real server for the update reports, whatever lib/report.py has as ENDPOINT.
-        env["ARCH_UPDATE_REPORT_URL"] = ""
+        env["ARCH_UPDATE_REPORT_URL"] = self.seed_reports() if reports_on else ""
         self.child = pexpect.spawn(sys.executable, [UI, "--demo"], env=env, dimensions=(rows, cols))
         # The UI blocks once the pty buffer is full, so somebody must read all the time.
         self.reader = threading.Thread(target=self._drain, daemon=True)
         self.reader.start()
+
+    def seed_reports(self):
+        """The reports on, one from an earlier update still waiting, and a server address where nobody
+        listens (returned): whatever tried to send would leave its error in reports/status.json."""
+        state = os.path.join(self.home, ".local/state/arch-update-auto")
+        os.makedirs(os.path.join(state, "reports", "outbox"))
+        with open(os.path.join(state, "settings.json"), "w") as f:
+            json.dump({"reports": True, "reports_decided": "2026-10-30", "report_id": "1a2b3c4d"}, f)
+        with open(os.path.join(state, "reports", "outbox", EARLIER_REPORT), "w") as f:
+            json.dump({"schema": 1, "id": "1a2b3c4d", "time": "2026-10-30T12:00:00Z"}, f)
+        with socket.socket() as s:                      # a free port, closed again: connections are refused
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        self.after.append(self.demo_sent_nothing)
+        return f"http://127.0.0.1:{port}/report"
 
     def _drain(self):
         while True:
@@ -117,6 +138,8 @@ class Run:
         if not self.wait("menu", "Обновить автоматически", timeout=30):
             return
         self.unpainted("menu")
+        if self.reports_on and "отчёты об обновлениях: вкл" not in self.text():
+            self.failures.append("меню: нет подписи «отчёты об обновлениях: вкл»")
         self.send(ENTER)
         if not self.wait("dashboard", "мини-игры", timeout=20):
             return
@@ -155,6 +178,9 @@ class Run:
         if not self.wait("summary", "это была имитация", timeout=60):
             return
         time.sleep(1.2)                                # the summary ignores keys for its first second
+        if "отчёт" in self.text():                     # the demo never reports, so never says a word of one
+            self.snapshot("summary-FAILED")
+            self.failures.append("итог демо говорит об отчёте")
         self.send(ENTER)
 
     def quit_from_menu(self):
@@ -249,6 +275,15 @@ class Run:
             if os.path.isdir(path) and os.listdir(path):
                 self.failures.append(f"отчёты в reports/{folder}: {sorted(os.listdir(path))}")
 
+    def demo_sent_nothing(self):
+        reports = os.path.join(self.home, ".local/state/arch-update-auto/reports")
+        found = {d: sorted(os.listdir(os.path.join(reports, d)))
+                 for d in ("outbox", "sent", "rejected") if os.path.isdir(os.path.join(reports, d))}
+        if found != {"outbox": [EARLIER_REPORT]}:
+            self.failures.append(f"демо тронуло отчёты: {found}")
+        if os.path.exists(os.path.join(reports, "status.json")):
+            self.failures.append("демо пыталось отправить отчёт (появился reports/status.json)")
+
     def finish(self):
         try:
             self.child.expect(pexpect.EOF, timeout=20)
@@ -267,8 +302,8 @@ class Run:
         shutil.rmtree(self.home, ignore_errors=True)
 
 
-def run(size, results, name=None, script=Run.play):
-    r = Run(*size, name)
+def run(size, results, name=None, script=Run.play, reports_on=False):
+    r = Run(*size, name, reports_on)
     try:
         script(r)
     except Exception as e:                              # a harness problem is a failure too
@@ -281,7 +316,8 @@ def run(size, results, name=None, script=Run.play):
 def main():
     sizes = [tuple(map(int, a.split("x"))) for a in sys.argv[1:]] or SIZES
     results = {}
-    threads = [threading.Thread(target=run, args=(s, results)) for s in sizes]
+    threads = [threading.Thread(target=run, args=(s, results), kwargs={"reports_on": s == REPORTS_ON})
+               for s in sizes]
     if not sys.argv[1:]:
         threads.append(threading.Thread(target=run, args=((80, 24), results, "80x24-menu-q", Run.quit_from_menu)))
         for cols, rows in ((80, 24), (200, 60)):
