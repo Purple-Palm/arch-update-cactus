@@ -7,6 +7,9 @@ you (bell + notification); Ctrl+] switches to manual mode. Closing the window
 never interrupts pacman. Every run is logged to
 ~/.local/state/arch-update-auto/logs/ (latest.log = newest).
 
+It takes no arguments and has no demo (that is arch-update-ui --demo): given any
+argument it refuses and runs nothing, the real update least of all.
+
 Environment:
   ARCH_UPDATE_CMD          command to run (default: arch-update)
   ARCH_UPDATE_AUTO_MODE    "auto" (default) or "manual" (only logging + checks)
@@ -23,6 +26,13 @@ import sys
 import termios
 import time
 import tty
+
+# No arguments: one meant for arch-update-ui (--demo above all) must never end in the real update.
+# Checked before anything else, the fallback to plain arch-update below included.
+if sys.argv[1:]:
+    sys.exit("arch-update-auto: " + ("демо есть только в arch-update-ui" if "--demo" in sys.argv[1:] else
+                                     f"неизвестный параметр «{sys.argv[1]}» — параметров у этой программы нет, "
+                                     "ничего не запускаю"))
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
 try:

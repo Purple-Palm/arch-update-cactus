@@ -6,6 +6,9 @@
 #   arch-update-launcher [--demo]     start the UI (arguments are passed to arch-update-ui)
 #   arch-update-launcher --terminal   print the terminal that would be used (exit 1: none found)
 #
+# Without a working arch-update-ui the plain arch-update-auto runs the update instead. It has no
+# demo, so --demo then only says so and starts nothing.
+#
 # Terminal: $ARCH_UPDATE_TERMINAL if set, else Konsole (with our profile), else the first one
 # installed from TERMINALS. The UI paints its own colours, so any of them looks the same.
 BIN=$(dirname "$(realpath "$0")")
@@ -70,7 +73,19 @@ term=$(pick_terminal) || {
 	exit 1
 }
 prog=$BIN/arch-update-ui
-[[ -x $prog ]] || prog=$BIN/arch-update-auto
+if [[ ! -x $prog ]]; then
+	# The demo must never touch the system: no stand-in for it, the real update least of all.
+	for arg in "$@"; do
+		if [[ $arg == --demo ]]; then
+			msg="Демо есть только в arch-update-ui, а он не запускается ($prog)."
+			msg+=" Повтори команду установки из README — она вернёт файлы на место."
+			echo "arch-update-launcher: $msg" >&2
+			notify-send -a Arch-Update "Arch Update" "$msg" 2>/dev/null
+			exit 1
+		fi
+	done
+	prog=$BIN/arch-update-auto
+fi
 export ARCH_UPDATE_TERMINAL_USED=$term      # for the update report, if the user allows reports
 mapfile -t cmd < <(terminal_cmd "$term" "$prog" "$@")
 exec "${cmd[@]}"
