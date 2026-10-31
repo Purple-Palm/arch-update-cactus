@@ -153,7 +153,7 @@ self_check() {
 		bash -n "$ROOT/$f" || return 1
 	done
 	python3 -m py_compile "$ROOT/bin/arch-update-ui" "$ROOT/bin/arch-update-auto" "$ROOT/lib/engine.py" \
-		"$ROOT/lib/games.py" || return 1
+		"$ROOT/lib/games.py" "$ROOT/lib/report.py" || return 1
 	python3 "$ROOT/bin/arch-update-ui" --self-test || return 1
 }
 

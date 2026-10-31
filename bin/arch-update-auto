@@ -21,11 +21,13 @@ import shutil
 import signal
 import sys
 import termios
+import time
 import tty
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
 try:
     import engine  # noqa: E402
+    import report  # noqa: E402
     from engine import C_BOLD, C_DIM, C_GRN, C_RED, C_YEL, say  # noqa: E402
 except Exception as e:      # no python-pexpect, a damaged file…: run the plain upstream updater instead
     print(f"arch-update-auto: не загрузился движок апдейтера: {e!r}")
@@ -109,6 +111,7 @@ def main():
     if interactive:
         signal.signal(signal.SIGWINCH, on_winch)
     summary = os.environ.get("ARCH_UPDATE_AUTO_SUMMARY", "1") != "0"
+    t0 = time.time()
     try:
         status, res, _ = engine.run_update(view, manual=manual, stop_on_news=stop_on_news, summary=summary,
                                            on_spawn=lambda c: child_holder.update(child=c))
@@ -123,6 +126,10 @@ def main():
     if res:
         print_summary(res)
         verdict = res["verdict"]
+        cols, rows = shutil.get_terminal_size((120, 40))
+        if report.after_update(res, mode="manual" if manual else "auto", seconds=time.time() - t0,
+                               ui={"screen": f"{cols}x{rows}"}):
+            say("Отчёт об этом обновлении уходит разработчику (выключить: Arch Update → Настройки).\n")
     if interactive and engine.TERM_OK:
         wait_close(verdict, status)
     sys.exit(2 if verdict == 2 else (status or 0))

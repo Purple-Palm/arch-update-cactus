@@ -71,5 +71,6 @@ term=$(pick_terminal) || {
 }
 prog=$BIN/arch-update-ui
 [[ -x $prog ]] || prog=$BIN/arch-update-auto
+export ARCH_UPDATE_TERMINAL_USED=$term      # for the update report, if the user allows reports
 mapfile -t cmd < <(terminal_cmd "$term" "$prog" "$@")
 exec "${cmd[@]}"
