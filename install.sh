@@ -498,7 +498,7 @@ setup_arch_update() {
 
 # Update reports (lib/report.py) stay off until the user says yes. The question comes once, on an
 # install at a keyboard: --sync and --check never ask, and without a terminal the choice stays open
-# (Arch Update → Настройки). Only y/yes/д/да say yes: "н" would be the start of "нет".
+# (Arch-Update → Настройки). Only y/yes/д/да say yes: "н" would be the start of "нет".
 ask_reports() {
 	local answer='' choice=no REPLY
 	[[ -t 0 ]] || return 0
@@ -508,12 +508,12 @@ ask_reports() {
 	BLOCK=("${BOLD}Отчёты об обновлениях$OFF")
 	wrap 4 "После каждого обновления Arch Update может отправлять разработчику отчёт:"
 	BLOCK+=("${WRAPPED[@]}")
-	wrap 4 "так проблему на любой машине видно, не спрашивая журнал."
+	wrap 4 "так разработчик видит проблему на любой машине, не прося прислать журнал."
 	BLOCK+=("${WRAPPED[@]}" "")
-	row 'в отчёте  ' "модель устройства и железо, тип сети без её названия, какие пакеты обновились, итог проверки, журнал обновления"
-	row 'не уходят ' "имя пользователя и компьютера, пароли, адреса, название Wi-Fi"
-	row 'куда      ' "закрытый репозиторий разработчика на GitHub"
-	row 'передумать' "в любой момент: Arch Update → Настройки"
+	row 'в отчёте  ' "модель устройства и железо, как подключена сеть (Wi-Fi или кабель, без её названия), какие пакеты обновились, итог проверки, журнал обновления"
+	row 'не уходят ' "имя пользователя и компьютера, пароли, IP- и MAC-адреса, почта, название Wi-Fi"
+	row 'куда      ' "в закрытый репозиторий разработчика на GitHub, через сервер для отчётов на Cloudflare (он видит IP-адрес, как любой сайт, но не хранит его)"
+	row 'передумать' "в любой момент: Arch-Update → Настройки"
 	block card
 	echo
 	read -r -s -t 0.1 -N 100000 || true      # an Enter pressed while pacman worked is no answer
@@ -523,7 +523,7 @@ ask_reports() {
 	y | yes | д | да | Д | Да | ДА | дА) choice=yes ;;
 	esac
 	if ! python3 "$ROOT/lib/report.py" --consent "$choice"; then
-		warn "ответ не сохранился — выбрать можно в Arch Update → Настройки"
+		warn "ответ не сохранился — выбрать можно в Arch-Update → Настройки"
 	elif [[ $choice == yes ]]; then
 		ok "отчёты" "включены — спасибо!"
 	else
@@ -560,7 +560,7 @@ summary() {
 	else
 		row 'обновления' "новые версии приезжают при запуске" "проверить сейчас: ~/.local/bin/arch-update-cactus-sync"
 	fi
-	row 'отчёты    ' "$reports — переключить: Arch Update → Настройки"
+	row 'отчёты    ' "$reports — переключить: Arch-Update → Настройки"
 	block
 	echo
 	if ((!timer)); then

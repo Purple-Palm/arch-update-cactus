@@ -491,9 +491,12 @@ class Install(unittest.TestCase):
         self.assertEqual(status, 0, out)
         self.assertTrue(asked, out)
         card = re.sub(r"\s+", " ", out.replace("┃", " "))                     # lines of the card joined
-        for said in ("модель устройства и железо", "тип сети без её названия", "журнал обновления",
-                     "имя пользователя и компьютера, пароли, адреса, название Wi-Fi",
-                     "закрытый репозиторий разработчика на GitHub", "в любой момент: Arch Update → Настройки"):
+        for said in ("модель устройства и железо", "как подключена сеть (Wi-Fi или кабель, без её названия)",
+                     "журнал обновления",
+                     "имя пользователя и компьютера, пароли, IP- и MAC-адреса, почта, название Wi-Fi",
+                     "в закрытый репозиторий разработчика на GitHub, через сервер для отчётов на Cloudflare "
+                     "(он видит IP-адрес, как любой сайт, но не хранит его)",
+                     "в любой момент: Arch-Update → Настройки"):
             self.assertIn(said, card)
         self.assertEqual(self.reports(), "включены")
         self.assertRegex(out, r"отчёты +включены")
