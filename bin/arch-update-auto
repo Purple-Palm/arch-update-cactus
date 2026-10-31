@@ -62,6 +62,14 @@ def print_summary(res):
     say(f"Лог: {res['log']}\n", C_DIM)
 
 
+def drop_typeahead():
+    """Throw away the keys typed but not read yet. Never raises (it runs as arch-update starts)."""
+    try:
+        termios.tcflush(0, termios.TCIFLUSH)
+    except (termios.error, OSError):        # no terminal any more: the window was closed
+        pass
+
+
 def wait_close(verdict, status):
     try:
         termios.tcflush(0, termios.TCIFLUSH)   # an Enter typed earlier must not skip the summary
@@ -110,6 +118,16 @@ def main():
         old_tty = termios.tcgetattr(0)
         tty.setraw(0)
     child_holder = {}
+    # In manual mode every key goes straight to arch-update's pty, which echoes it onto the screen and
+    # into the journal: keys typed ahead (a password for the sudo question that is bound to come) must
+    # never get there. Nothing has asked for anything yet, so they go now, and again the moment it
+    # starts: run_update gets ready first (pacman -Q, sudo -n), which takes a moment on a slow machine.
+    flush = manual and interactive
+
+    def spawned(child):
+        child_holder["child"] = child
+        if flush:
+            drop_typeahead()
 
     def on_winch(*_):
         child = child_holder.get("child")
@@ -123,8 +141,10 @@ def main():
     summary = os.environ.get("ARCH_UPDATE_AUTO_SUMMARY", "1") != "0"
     t0 = time.time()
     try:
+        if flush:
+            drop_typeahead()
         status, res, _ = engine.run_update(view, manual=manual, stop_on_news=stop_on_news, summary=summary,
-                                           on_spawn=lambda c: child_holder.update(child=c))
+                                           on_spawn=spawned)
     finally:
         signal.signal(signal.SIGWINCH, signal.SIG_DFL)
         if old_tty is not None and engine.TERM_OK:
