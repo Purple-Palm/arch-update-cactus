@@ -305,7 +305,8 @@ put() {
 	local dst=$1 tmp
 	tmp=$(mktemp)
 	cat >"$tmp"
-	if cmp -s "$tmp" "$dst"; then
+	# coreutils only: cmp comes with diffutils, which a plain Arch install does not have
+	if [[ -f $dst && $(sha256sum <"$tmp") == "$(sha256sum <"$dst")" ]]; then
 		rm -f "$tmp"
 		return 1
 	fi
