@@ -84,6 +84,7 @@ FAILURE_MARKERS = re.compile(r"Initcpio image generation FAILED|error: command f
                              r"|You can do this later by running: #? ?dd if=\S+ of=\S+", re.I)
 KERNEL_FLASH = re.compile(r"dd if=\S+ of=\S+")   # depthcharge kernels (ARM Chromebooks): flash by hand
 KEYRING_TROUBLE = re.compile(r"PGP signature|unknown trust|marginal trust", re.I)
+PASSWORD_LINE = re.compile(r"(?i)(?:pass(?:word|phrase)|пароль)[^\n]{0,120}:[^\S\n]*$")
 
 SETTLE = 0.3        # seconds of silence before we treat the current line as a question
 UNKNOWN_IDLE = 12   # seconds of silence on a question-looking line before handing over
@@ -435,7 +436,9 @@ class RunLog:
             elif ch == "\r":
                 self.cr = True      # a redraw ends with '\r': drop the line only once new text follows,
                                     # so pacman's "100%\r" + "\r\n" (or a split read) keeps it
-            elif ch not in "\x07\x08":
+            elif ch == "\x08":
+                self.line = self.line[:-1]      # an echoed Backspace ("\b \b") takes back what it erased
+            elif ch != "\x07":
                 if self.cr:
                     self.line, self.cr = "", False
                 self.line += ch
@@ -826,7 +829,7 @@ def lost_terminal():
     LOG.event("ОКНО", "окно терминала закрыто — продолжаю в фоне, pacman не прерываю")
     notify("Окно Arch-Update закрыто",
            "Обновление не прерываю: довожу до безопасной точки в фоне.\n"
-           "Лог: ~/.local/state/arch-update-auto/logs/latest.log", urgent=True)
+           "Журнал: ~/.local/state/arch-update-auto/logs/latest.log", urgent=True)
 
 
 # ───────────────────────────── responder ─────────────────────────────
@@ -849,9 +852,18 @@ class Responder:
         self.safe_only = False    # window closed during a manual run: never confirm anything for the user
         self.handover_why = ""
         self.secret = False       # the question handed over asks for a password: never show or log the answer
+        self.heard = False        # the program has said something: in manual mode keys reach it from then on
 
     def feed(self, data):
+        self.heard = True
         text = data.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+        if self.mode == "manual" and TERM_OK and PASSWORD_LINE.search(ANSI.sub("", text)):
+            # A password prompt has just come and is not on screen yet: keys still waiting were typed before
+            # it, while the program still echoed them into the journal. A password typed ahead goes no further.
+            try:
+                termios.tcflush(0, termios.TCIFLUSH)
+            except (termios.error, OSError, ValueError):
+                pass
         # Strip colours on the joined tail: a read can end inside an escape sequence.
         self.tail = ANSI.sub("", self.tail + text)[-6000:]
         recent = self.tail[-(len(text) + 200):]
@@ -978,6 +990,8 @@ class Responder:
             say("\n[автоответчик] pacman устанавливает пакеты: Ctrl+C сейчас оборвал бы его до хуков "
                 "(initramfs, NVIDIA, подпись) — не передаю. Копировать: Ctrl+Shift+C. "
                 "Прервать всё равно: Ctrl+], затем Ctrl+C.\n", C_YEL)
+        if self.mode == "manual" and not self.heard:
+            data = b"\x03" if b"\x03" in data else b""      # typed before the program spoke: only Ctrl+C goes
         if self.mode in ("handover", "manual"):
             if data:
                 self.user_typed = True
