@@ -1221,6 +1221,10 @@ class Stubs(Patching):
                             ("orphans", lambda: set()), ("display_manager", lambda: ""),
                             ("own_service", lambda: ""), ("battery", lambda: None)):
             self.patch(engine, name, value)
+        # nothing of the machine's own pacman: its log (CI's container has one, from installing the test's
+        # dependencies) and its hooks (a snapshot hook would make the space check look at this machine's disk)
+        self.patch(engine, "PACMAN_LOG", os.path.join(self.tmp, "no-pacman.log"))
+        self.patch(engine, "HOOK_DIRS", (os.path.join(self.tmp, "no-hooks"),))
 
     def stub(self, name, text):
         write(os.path.join(self.bin, name), text)
@@ -1544,6 +1548,12 @@ class Probe(Stubs):
         self.assertEqual(log.count("ТЕБЕ] запрос пароля"), 1)          # asked once, at the start, never again
         self.assertTrue(any("sudo ls -l /boot" in w for w in res["warnings"]), res["warnings"])
         self.assertTrue(any("sbctl verify" in w for w in res["warnings"]), res["warnings"])
+        # with a pacman.log that says this update changed no kernel and built no initramfs, that is enough
+        write(engine.PACMAN_LOG, "[2026-11-03T06:31:05+0000] [ALPM] upgraded python (3.13.1-1 -> 3.13.2-1)\n",
+              0o644)
+        status, res, log = self.run_update(self.view())
+        self.assertFalse(any("sudo ls -l /boot" in w for w in res["warnings"]), res["warnings"])
+        self.assertIn("ядро и initramfs этим обновлением не менялись", res["ok"])
 
 
 class SudoOnce(unittest.TestCase):
