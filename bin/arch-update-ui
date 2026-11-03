@@ -2962,7 +2962,19 @@ class Actions:
                                    fix_problems(self.app, self.res, self.fixes)))
         finally:
             self.look()
+            if key == "f":
+                self.after_fix()
         return True
+
+    def after_fix(self):
+        """What F did is news for this update's report: with the reports on it goes again by itself, as a report of
+        its own (report.after_fix; the summary's report line follows it); else S is offered again, also when a
+        report went by hand before (it had none of this)."""
+        if self.log and report.follow_up_due(self.log):
+            log, ui = self.log, report_ui(self.app)
+            self.sent = self.app.report_line = ReportLine(lambda: report.after_fix(log, ui=ui))
+        else:
+            self.job = None
 
     def view(self, elapsed, review=None, status=None):
         return summary_view(self.res, elapsed, self.sent, self.keys(), status or self.status, review)
@@ -3037,6 +3049,25 @@ def fit(text, width):
     return text if len(text) <= width else text[:max(0, width - 1)] + "…"
 
 
+def list_fit(wraps, rows):
+    """How a list of wrapped items fits into rows: (lines each item gets, how many items show). Every item gets
+    as many lines as all of them can have alike (3, 2 or 1; one cut short ends in "…"); when not even one line
+    each fits, the first ones show and the last row says how many more there are."""
+    for per in (3, 2, 1):
+        if sum(min(per, len(w)) for w in wraps) <= rows:
+            return per, len(wraps)
+    return 1, max(0, rows - 1)
+
+
+def cut_lines(wrapped, per, width):
+    """The first per lines of a wrapped item; the last of them ends in "…" when the item goes on."""
+    part = list(wrapped[:per])
+    if len(wrapped) > per:
+        last = part[-1]
+        part[-1] = (last if len(last) < width else last[:max(0, width - 1)].rstrip()) + "…"
+    return part
+
+
 def summary_view(res, elapsed, sent=None, keys=(), status=None, review=None):
     """What the summary screen shows for a finished run (res is None when nothing ran; a summary read back
     serves as well); sent: the ReportLine of its report, if one was made; keys: what can be done about it, as
@@ -3074,8 +3105,9 @@ def draw_summary(app, sv, t, demo, left):
     c = app.s.canvas
     W = min(c.w - 8, 84)
     gap = 7 if c.h < 30 else 8                                   # glyph top -> headline
-    wraps = [textwrap.wrap(tx, max(10, W - 4), break_on_hyphens=False) or [""] for _, tx, _ in sv.lines]
-    need = gap + 3 + sum(min(2, len(w)) for w in wraps)          # glyph, headline, stats, blank, list
+    tw = max(10, W - 4)
+    wraps = [textwrap.wrap(tx, tw, break_on_hyphens=False) or [""] for _, tx, _ in sv.lines]
+    head = gap + 3                                               # glyph, headline, stats, blank
     keys = fit_keys(sv.keys, c.w - 4)
     shift = 1 if keys else 0                                     # the keys' row above the closing one
     status = sv.status.line() if sv.status else None
@@ -3083,8 +3115,14 @@ def draw_summary(app, sv, t, demo, left):
     # of its own only while every row of the list still fits with it: no problem or warning ever makes room for
     # it. Else the report's goes onto the journal line, in short, if there is room there, or is left out; what
     # came of a key takes the journal line's place.
-    own_row = (sv.sent is not None or status is not None) and need <= c.h - 7 - shift
+    own_row = (sv.sent is not None or status is not None) and \
+        head + sum(min(2, len(w)) for w in wraps) <= c.h - 7 - shift
     foot = (c.h - 5 if own_row else c.h - 4) - shift             # the journal line
+    # The list ends a row above the journal line. Every item shows, cut alike when it must be (with "…"); only
+    # when not even a line each fits, the last row says how many more the journal has: nothing goes unsaid.
+    per, shown = list_fit(wraps, foot - 2 - head)
+    hidden = len(wraps) - shown
+    need = head + sum(min(per, len(w)) for w in wraps[:shown]) + (1 if hidden else 0)
     top = max(1, (foot - need) // 2)                             # centred above the journal line
     gw = len(sv.glyph[0])
     gx = (c.w - gw) // 2
@@ -3103,20 +3141,17 @@ def draw_summary(app, sv, t, demo, left):
     elif sv.stats:
         c.cput(y + 1, sv.stats, DIM, alpha=clamp01((t - 0.5) / 0.4))
     y += 3
-    longest = max([min(len(tx), W - 4) for _, tx, _ in sv.lines] or [0]) + 4
+    longest = max([min(len(tx), tw) for _, tx, _ in sv.lines] or [0]) + 4
     x0 = (c.w - longest) // 2
-    for i, (icon, _, col) in enumerate(sv.lines):
+    for i, (icon, _, col) in enumerate(sv.lines[:shown]):
         a = clamp01((t - 0.7 - i * 0.08) / 0.35)
-        wrapped = wraps[i]
-        if y + min(2, len(wrapped)) > foot - 1:           # low terminal: the journal line stays readable
-            break
         c.put(x0 + 2, y, icon, col, bold=True, alpha=a)
-        tcol = DIM if icon in ("✓", "›") else TEXT       # one colour per item, its second line too
-        c.put(x0 + 4, y, wrapped[0], tcol, alpha=a)
-        y += 1
-        for extra in wrapped[1:2]:
-            c.put(x0 + 4, y, extra, tcol, alpha=a)
+        tcol = DIM if icon in ("✓", "›") else TEXT       # one colour per item, all its lines
+        for line in cut_lines(wraps[i], per, tw):
+            c.put(x0 + 4, y, line, tcol, alpha=a)
             y += 1
+    if hidden:
+        c.put(x0 + 4, y, f"… и ещё {hidden} — в журнале", MUTED, alpha=clamp01((t - 0.7 - shown * 0.08) / 0.35))
     journal = "журнал: " + sv.log.replace(os.path.expanduser("~"), "~") if sv.log else ""
     jcol, note, ncol = MUTED, "", MUTED
     if status:
@@ -3223,8 +3258,8 @@ def self_test():
     that cannot draw itself never goes live."""
     global save_ui_state
     save_ui_state = lambda **kw: None          # noqa: E731 — the user's ui.json is never touched
-    for name in ("set_consent", "set_option", "after_update", "queue", "start_sender", "send_pending", "send_now",
-                 "delete_local", "ensure_id", "report_state"):
+    for name in ("set_consent", "set_option", "after_update", "after_fix", "follow_up_due", "queue", "start_sender",
+                 "send_pending", "send_now", "delete_local", "ensure_id", "report_state"):
         setattr(report, name, lambda *a, **kw: None)     # nor the reports' settings.json, outbox and journals
     for name in ("mark_resolved", "recheck_boot", "services_restarted", "save_summary", "journal_event", "space_freed"):
         setattr(engine, name, lambda *a, **kw: None)     # nor an update's summary or journal
@@ -3449,6 +3484,15 @@ def self_test():
             return n
         if items(summary_view(full, 125, sent)) < items(summary_view(full, 125)):
             raise RuntimeError(f"the summary's report line pushes a problem or a warning off at {w}x{h}")
+        # Nothing goes unsaid: every item shows (cut alike, with "…"), or the last row says how many more there are.
+        many = dict(full, problems=[f"проблема {i}: " + "длинное описание " * 9 for i in range(14)])
+        for sv in (summary_view(many, 125, sent), summary_view(full, 125, sent)):
+            draw_summary(app, sv, 2.0, False, 7.5)
+            shown = sum(ch in "✗⚠✓›" for row in c.ch for ch in row)
+            told = re.search(r"и ещё (\d+) — в журнале", "\n".join("".join(row) for row in c.ch))
+            c.clear()
+            if shown + (int(told.group(1)) if told else 0) != len(sv.lines):
+                raise RuntimeError(f"the summary leaves items out unsaid at {w}x{h}")
         acts = Actions(app, keyed_full)
         acts.status = statuses[2]
         if items(acts.view(125)) < items(summary_view(keyed_full, 125, keys=acts.keys())):

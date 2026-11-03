@@ -68,7 +68,9 @@ def print_summary(res):
         say("✓ Обновление прошло нормально.\n", C_GRN)
     fixes = res.get("fixes") or []
     if fixes:
-        say("Исправить до перезагрузки — по порядку, в терминале:\n", C_BOLD)
+        # An update that never began changed nothing: a reboot is not what to fix this before, the next try is
+        say("Исправь, потом запусти обновление снова — по порядку, в терминале:\n" if res.get("started") is False
+            else "Исправить до перезагрузки — по порядку, в терминале:\n", C_BOLD)
         for fix in fixes:
             say(f"  {fix.get('how') or shlex.join(fix['argv'])}   # {fix['label']}\n", "")
     waiting = engine.services_command((res.get("services") or {}).get("waiting") or [])

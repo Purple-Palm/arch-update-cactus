@@ -1114,6 +1114,91 @@ class Reports(unittest.TestCase):
         self.assertEqual(report.send_now(path), (True, "этот отчёт уже у разработчика (№ 1)", 1))
         self.assertEqual(Relay.got[1]["time"], Relay.got[0]["time"])
 
+    def fixed(self, path, line="[08:05:13 ИСПРАВЛЕНИЕ] по клавише F: собрать заново initramfs ядра linux: не помогло"
+                                " — вернул всё как было (код 80)"):
+        """What F writes into an update's journal after it ended."""
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        return line
+
+    def test_what_f_did_reaches_the_developer_as_a_report_of_its_own(self):
+        # The relay files one log per machine and time: the same time again is a duplicate, and its log stays as
+        # it was. What F added since the report went is news: a new time, a log and an issue of its own.
+        self.relay()
+        path = self.journal("2026-10-31_17-42-38", BROKEN_BOOT)
+        self.assertEqual(report.send_now(path), (True, "отчёт отправлен разработчику (№ 1)", 1))
+        line = self.fixed(path)
+        self.assertEqual(report.send_now(path), (True, "отчёт отправлен разработчику (№ 2)", 2))
+        self.assertNotEqual(Relay.got[1]["time"], Relay.got[0]["time"])
+        self.assertIn(line, Relay.got[1]["log"])
+        self.assertNotIn(line, Relay.got[0]["log"])
+        # Sent again with nothing new: the same report as the second one.
+        self.assertEqual(report.send_now(path), (True, "этот отчёт уже у разработчика (№ 2)", 2))
+        self.assertEqual(Relay.got[2]["time"], Relay.got[1]["time"])
+
+    def test_with_the_reports_on_what_f_did_goes_by_itself(self):
+        report.set_consent(True)
+        path = self.journal("2026-10-31_17-42-38", BROKEN_BOOT)
+        res = {"verdict": 2, "changed": ["linux"], "added": [], "removed": [], "exitstatus": 0, "problems": ["x"],
+               "warnings": [], "ok": [], "log": path}
+        first = report.after_update(res, mode="auto", seconds=188)
+        self.assertFalse(report.follow_up_due(path))                # nothing new yet
+        self.assertIsNone(report.after_fix(path))
+        line = self.fixed(path)
+        self.assertTrue(report.follow_up_due(path))
+        self.assertIsNone(report.after_fix(path, demo=True))        # never in the demo
+        again = report.after_fix(path)
+        self.assertIsNotNone(again)
+        # The automatic report that still waited goes: the new one has all it had, and what F did.
+        self.assertEqual(self.waiting(), [os.path.basename(again)])
+        self.assertEqual(report.state_of(first), "")
+        follow = report._read_json(again)
+        self.assertIn(line, follow["log"])
+        self.assertIn("отчёт после исправления по клавише F", follow["log"])
+        self.assertFalse(report.follow_up_due(path))                # sent once: not twice
+        self.relay()
+        self.assertEqual(report.send_pending(), (1, 0))
+        self.assertEqual(Relay.got[0]["time"], follow["time"])
+        u, = report.local_updates()
+        self.assertEqual((u["issue"], bool(u["sent"])), (1, True))
+
+    def test_what_f_did_goes_again_after_an_automatic_report_that_went(self):
+        report.set_consent(True)
+        path = self.journal("2026-10-31_17-42-38", BROKEN_BOOT)
+        report.after_update({"verdict": 2, "log": path, "problems": ["x"]}, mode="auto")
+        self.relay()
+        self.assertEqual(report.send_pending(), (1, 0))
+        self.fixed(path)
+        report.after_fix(path)
+        self.assertEqual(report.send_pending(), (1, 0))
+        self.assertEqual(len(Relay.filed), 2)                       # two logs, two issues: the second has F's lines
+        self.assertNotEqual(Relay.got[0]["time"], Relay.got[1]["time"])
+
+    def test_no_report_goes_by_itself_for_an_update_that_had_none(self):
+        # The consent is for each update's report: an update from before it, or switched off, gets none from F.
+        path = self.journal("2026-10-31_17-42-38", BROKEN_BOOT)
+        self.fixed(path)
+        self.assertFalse(report.follow_up_due(path))
+        report.set_consent(True)
+        self.assertFalse(report.follow_up_due(path))
+        self.assertIsNone(report.after_fix(path))
+        self.assertEqual(self.waiting(), [])
+
+    def test_a_record_of_the_version_before_tells_news_by_time(self):
+        # Records kept no size before: a journal written to well after its report was queued has news.
+        report.set_consent(True)
+        path = self.journal("2026-10-31_17-42-38", BROKEN_BOOT)
+        report.after_update({"verdict": 2, "log": path, "problems": ["x"]}, mode="auto")
+        records = report._read_json(report.RECORDS)
+        rec = records["2026-10-31_17-42-38.log"]
+        del rec["size"]
+        report._write_json(report.RECORDS, records)
+        queued_at = report._queued_at(rec["queued"]).timestamp()
+        os.utime(path, (queued_at + 1, queued_at + 1))
+        self.assertFalse(report.follow_up_due(path))
+        os.utime(path, (queued_at + 60, queued_at + 60))
+        self.assertTrue(report.follow_up_due(path))
+
     def test_a_report_sent_by_hand_takes_the_waiting_one_along(self):
         report.set_consent(True)
         path = self.journal("2026-10-31_17-42-38", BROKEN_BOOT)

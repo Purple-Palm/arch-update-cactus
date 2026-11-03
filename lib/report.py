@@ -682,17 +682,59 @@ def after_update(res, demo=False, **info):
     try:
         if not report_id():
             set_consent(True)                       # an ID for a choice made by hand in settings.json
+        size = _size(_journal(res.get("log")))      # before build() reads it
         report = build(res, **info)
         path = queue(report)
     except Exception:
         return None
     # The update's record: its report waits as this file and goes out with this time. One sent by hand later
-    # takes the same time, so that the relay knows it for the same report and files no second issue.
+    # takes the same time, so that the relay knows it for the same report and files no second issue — unless the
+    # journal has grown since (size: how long it was when the report was made; see _grown).
     name = os.path.basename(_journal(res.get("log")) or "")
     if name:
-        _record(name, queued=os.path.basename(path), time=report["time"])
+        _record(name, queued=os.path.basename(path), time=report["time"], size=size)
     start_sender()
     return path
+
+
+def follow_up_due(log):
+    """F added to that update's journal what came of its fixes, and with consent its report goes again with it:
+    the reports are on, a report of this update went out or waits (the consent was for it), and the journal has
+    lines that report did not have."""
+    try:
+        path = _journal(log)
+        if not path or not enabled():
+            return False
+        name = os.path.basename(path)
+        rec = _records().get(name, {})
+        return bool(_str(rec.get("queued")) or _str(rec.get("sent"))) and _grown(name, path, rec)
+    except Exception:
+        return False
+
+
+def after_fix(log, ui=None, demo=False):
+    """With consent (never in the demo), after F: that update's report again, now with what came of the fixes, as
+    a report of its own (a new time: the relay keeps it beside the first one, which never had those lines). Only
+    when follow_up_due. This update's automatic report still waiting goes: the new one has all it had. Returns the
+    queued file, or None. Never raises: a report must not get in the way of anything."""
+    if demo:
+        return None
+    try:
+        path = _journal(log)
+        if not path or not follow_up_due(path):
+            return None
+        name = os.path.basename(path)
+        size = _size(path)                              # before it is read: a line added meanwhile is news again
+        report = build_from_log(path, ui=ui, why="fix")
+        for folder, q in _auto_reports().get(name, []):
+            if folder == OUTBOX:
+                _remove(os.path.join(OUTBOX, q))
+        queued = queue(report)
+        _record(name, queued=os.path.basename(queued), time=report["time"], size=size)
+        start_sender()
+        return queued
+    except Exception:
+        return None
 
 
 def _note(**kw):
@@ -1145,12 +1187,58 @@ def _report_time(name):
     return None
 
 
-def build_from_log(log, ui=None):
+def _size(path):
+    try:
+        return os.path.getsize(path)
+    except (OSError, TypeError):
+        return None
+
+
+def _local_iso(value):
+    try:
+        return datetime.datetime.fromisoformat(value) if isinstance(value, str) and value else None
+    except ValueError:
+        return None
+
+
+def _later_than(known):
+    """Now, as the relay takes a time, and never the time it knows already (a second later then): a report of its
+    own."""
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    try:
+        was = datetime.datetime.strptime(known, fmt).replace(tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        was = None
+    return (now if was is None or now > was else was + datetime.timedelta(seconds=1)).strftime(fmt)
+
+
+def _grown(name, path, rec=None):
+    """The journal of that update has lines its last report did not have (what F did, after the report went):
+    longer than the size its record keeps from then; for a record without one (the version before this one kept
+    none), written to more than a few seconds after that report was made or sent."""
+    rec = _records().get(name, {}) if rec is None else rec
+    size = _size(path)
+    if size is None:
+        return False
+    if type(rec.get("size")) is int:
+        return size > rec["size"]
+    made = [t for t in (_queued_at(_str(rec.get("queued"))), _local_iso(rec.get("sent"))) if t]
+    try:
+        return bool(made) and datetime.datetime.fromtimestamp(os.path.getmtime(path)) > \
+            max(made) + datetime.timedelta(seconds=5)
+    except (OSError, ValueError, OverflowError, TypeError):
+        return False
+
+
+def build_from_log(log, ui=None, why="manual"):
     """The report of one update kept on this machine, put together now from its summary or its journal, everything
     personal taken out as build() does, the names the journal itself shows too (an account or a machine renamed
     since). Its time is the update's own, when it ended, or the one its report had already: the same update sent
-    again is the same report to the relay, which files no second issue for it. The machine and the updater are
-    described as they are now, and the log says so at its top."""
+    again is the same report to the relay, which files no second issue for it — unless its journal has grown since
+    that report (what F did): then it is news, under a time of its own (now), and the relay keeps it beside the
+    first. The machine and the updater are described as they are now, and the log says so at its top, with why it
+    was sent: "manual" (S), "fix" (after F, with consent: after_fix)."""
     u = _update_of(log)
     res = {k: u[k] for k in ("verdict", "started", "exitstatus", "changed", "added", "removed", "problems",
                              "warnings", "notes", "ok")}
@@ -1163,9 +1251,16 @@ def build_from_log(log, ui=None):
     report = build(res, mode=u["mode"], seconds=u["seconds"], ui=ui, scrub=scrubber(users, hosts, homes))
     if u["mode"] is None and not SWITCHED_TO_MANUAL.search(report["log"]):
         report["log"] = hide_typed_ahead(report["log"])      # no telling how it ran: as if by hand (see clean)
-    report["time"] = _report_time(os.path.basename(_journal(log) or "")) or _relay_time(u["ended"] or u["began"])
-    report["log"] = (f"[отчёт отправлен вручную {datetime.datetime.now():%d.%m.%Y %H:%M}; устройство и версия "
-                     "апдейтера в нём — на это время]\n" + report["log"])
+    path = _journal(log) or ""
+    name = os.path.basename(path)
+    known = _report_time(name)
+    if known and _grown(name, path):
+        report["time"] = _later_than(known)
+    else:
+        report["time"] = known or _relay_time(u["ended"] or u["began"])
+    head = "отчёт после исправления по клавише F" if why == "fix" else "отчёт отправлен вручную"
+    report["log"] = (f"[{head} {datetime.datetime.now():%d.%m.%Y %H:%M}; устройство и версия апдейтера в нём — на "
+                     "это время]\n" + report["log"])
     return report
 
 
@@ -1191,6 +1286,7 @@ def _send_now(log, timeout, ui):
     if not url:
         return False, "сервер для отчётов не подключён", None
     rid = ensure_id(save=False)                      # saved once the report went out with it
+    size = _size(path)                               # before it is read: a line added meanwhile is news again
     report = build_from_log(path, ui=ui)
     report["id"] = report["id"] or rid
     try:
@@ -1204,7 +1300,7 @@ def _send_now(log, timeout, ui):
         rec = _records().get(name, {})
         again = answer.get("duplicate") is True                       # the relay has this report already
         issue = _issue_of(answer) or _issue_of(rec)                   # the same time: the same log, the same issue
-        _record(name, sent=_now(), issue=issue, time=report["time"])
+        _record(name, sent=_now(), issue=issue, time=report["time"], size=size)
         for folder, q in _auto_reports().get(name, []):
             if folder == OUTBOX:
                 _remove(os.path.join(OUTBOX, q))     # this update's automatic report, still waiting: it went out now
@@ -1279,7 +1375,8 @@ def _point_latest():
 
 def _records():
     """manual.json: {journal's name: {"sent": when its report went out (ISO, local), "issue": its number, "time": the
-    report's time, "queued": its automatic report in the outbox}}."""
+    report's time, "queued": its automatic report in the outbox, "size": how long the journal was when that report
+    was made (_grown)}}."""
     return {k: v for k, v in _read_json(RECORDS).items() if JOURNAL.fullmatch(k) and isinstance(v, dict)}
 
 
