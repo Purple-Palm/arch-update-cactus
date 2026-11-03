@@ -3,9 +3,13 @@
 
 Splash with the gradient ARCH UPDATE title, update check + Arch news, an
 arrow-key menu, an in-app news reader, settings (the update reports, off until
-the user says yes), a compact live dashboard while the update runs (stages,
-progress, ETA learned from previous runs), a modal for questions that need a
-human, and a summary screen with the system checks.
+the user says yes; restarting the services by itself; the last updates kept on
+this machine, each one's report to look at, send or delete), a compact live
+dashboard while the update runs (stages, progress, ETA learned from previous
+runs), a modal for questions that need a human, and a summary screen with the
+system checks and what can be done about them: send this update's report,
+restart the services it left waiting, fix the problems with booting it found.
+Until such problems are fixed or the machine rebooted, the menu warns about them.
 
 The update itself is run by the shared engine (lib/engine.py next to this
 program): real arch-update in a pty, routine questions answered, risky ones
@@ -22,8 +26,10 @@ import math
 import os
 import re
 import select
+import shlex
 import signal
 import sys
+import tempfile
 import termios
 import textwrap
 import threading
@@ -37,6 +43,7 @@ HERE = os.path.dirname(os.path.realpath(__file__))           # bin/ of the check
 LIB = os.path.join(os.path.dirname(HERE), "lib")
 sys.path.insert(0, LIB)
 try:
+    import pexpect  # noqa: E402
     import engine  # noqa: E402
     import games  # noqa: E402
     import report  # noqa: E402
@@ -637,8 +644,12 @@ def plural(n, one, few, many):
 
 # ───────────────────────────── settings: the update reports ─────────────────────────────
 
-SETTINGS_ITEMS = (("reports", "Отчёты об обновлениях"), ("preview", "Что именно уходит"), ("back", "Назад"))
-# Eight lines at 80 columns: one more and "Назад" would sit in the toast's row.
+SETTINGS_ITEMS = (("reports", "Отчёты об обновлениях"), ("preview", "Что именно уходит"),
+                  ("services", "Перезапускать сервисы сами"), ("updates", "Последние обновления"), ("back", "Назад"))
+SWITCHES = ("reports", "services")
+FRESH = 0.8         # seconds: only a press after a pause longer than a held key waits before it repeats is a choice
+# Under the items: what the chosen one is. Eight lines at 80 columns, and the two of the reports' state below
+# them: one more and they would reach the toast's row.
 REPORT_ABOUT = ("Когда отчёты включены, после каждого обновления разработчику отправляется отчёт: модель "
                 "устройства, процессор, видеокарта, память, ядро, рабочий стол, сеть (Wi-Fi или кабель, адаптер, "
                 "сигнал), какие пакеты обновились, итог проверки и журнал обновления.",
@@ -647,11 +658,91 @@ REPORT_ABOUT = ("Когда отчёты включены, после каждо
                 "IP-адрес, как любой сайт, но не хранит его).")
 PREVIEW_INTRO = ("так выглядит отчёт с этой машины — последний отправленный или ждущий отправки, а если их нет — "
                  "собранный сейчас из последнего журнала")
+SERVICES_ABOUT = ("После обновления часть сервисов работает со старыми файлами, пока их не перезапустят. Когда "
+                  "включено, апдейтер в конце обновления сам перезапускает те из них, что можно перезапустить на ходу. "
+                  "Экран входа, dbus и служба входа в систему (logind) не перезапускаются никогда, как и сеть "
+                  "и сам рабочий стол: они обновятся при следующей загрузке.",
+                  "Когда выключено, в конце обновления их перезапустит клавиша R. В «Обычном Arch-Update» на этот "
+                  "вопрос отвечаешь ты сам.")
+PREVIEW_ABOUT = ("Отчёт с этой машины целиком, как его увидит разработчик: что в нём есть и что из него убрано.",)
+UPDATES_ABOUT = ("Журналы последних обновлений этого компьютера (до пяти) и итог каждого. Отчёт о любом из них "
+                 "можно посмотреть, отправить разработчику — даже когда отчёты выключены — или удалить с этого "
+                 "компьютера вместе с журналом.",)
+UPDATES_OFF = ("отчёты выключены — S отправит разработчику отчёт только о выбранном обновлении, сами отчёты "
+               "от этого не включатся")
+UPDATES_ON = "отчёты включены: отчёт о каждом обновлении уходит сам — здесь его можно отправить ещё раз"
+UPDATE_INTRO = "так он уйдёт разработчику — всё личное из него убрано"
 REPORTS_HINT = "новое: отчёты об обновлениях (выключены) — Arch-Update → Настройки"
 REPORTS_UNDECIDED = {"enabled": False, "decided": False, "id": "", "endpoint": False, "waiting": 0,
                      "last_sent": "", "last_error": ""}
+DEMO_SAYS = "в демо это не делается"
 JSON_KEY = re.compile(r'\s*"(?:[^"\\]|\\.)*":')
 UNPRINTABLE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+# What a problem says after its own "НЕ перезагружайся" (the menu's warning says that first)
+NOT_REBOOT = re.compile(r"(?:\s+—\s+|,\s*)НЕ перезагружайся\b.*$")
+WRITE_ERRORS = {errno.ENOSPC: "нет места на диске", errno.EROFS: "диск только для чтения",
+                errno.EACCES: "нет прав на запись", errno.EPERM: "нет прав на запись"}
+
+
+def fit_keys(parts, width):
+    """Key hints, (long, short) pairs, in one line of at most width: wide apart, closer, or with the longest
+    hints in their short forms, whatever fits first. "" without any."""
+    use = [0] * len(parts)
+    text = ""
+    while parts:
+        for sep in ("   ·   ", "  ·  ", " · "):
+            text = sep.join(p[u] for p, u in zip(parts, use))
+            if len(text) <= width:
+                return text
+        longs = [i for i, u in enumerate(use) if not u and parts[i][0] != parts[i][1]]
+        if not longs:
+            break                                   # keyline() cuts it
+        use[max(longs, key=lambda i: len(parts[i][0]))] = 1
+    return text
+
+
+def first_problem(res):
+    """The problem of an update to name first: one that says not to reboot, else the first one."""
+    problems = [p for p in (res or {}).get("problems") or [] if isinstance(p, str)]
+    worst = [p for p in problems if "НЕ перезагружайся" in p] + problems
+    return worst[0] if worst else ""
+
+
+def short_problem(text):
+    return NOT_REBOOT.sub("", text) or text
+
+
+def verdict_mark(u):
+    """(glyph, words, colour) of an update in the list of the last ones."""
+    if not u.get("started", True):
+        return ("✗", "не начиналось", BAD) if u.get("verdict") == 2 else ("·", "не начиналось", DIM)
+    if u.get("verdict") == 2 and u.get("resolved"):
+        return "✓", "исправлено", GOOD
+    return {0: ("✓", "всё чисто", GOOD), 1: ("⚠", "есть что прочитать", WARN),
+            2: ("✗", "нужна проверка", BAD)}.get(u.get("verdict"), ("·", "без итога", DIM))
+
+
+def when_text(iso, year=True):
+    """"02.11.2026 12:59" (or without the year) from an ISO local time; "" for anything else."""
+    m = re.match(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d)", iso if isinstance(iso, str) else "")
+    if not m:
+        return ""
+    y, mo, d, h, mi = m.groups()
+    return f"{d}.{mo}.{y} {h}:{mi}" if year else f"{d}.{mo} {h}:{mi}"
+
+
+def seconds_of(res):
+    """How long an update took, from its summary's began and ended; None when that is not known."""
+    times = [(res or {}).get(k) for k in ("began", "ended")]
+    m = [re.match(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)", v if isinstance(v, str) else "") for v in times]
+    if not all(m):
+        return None
+    began, ended = (time.mktime(tuple(map(int, x.groups())) + (0, 0, -1)) for x in m)
+    return ended - began if 0 <= ended - began <= 30 * 86400 else None
+
+
+def write_error(e):
+    return WRITE_ERRORS.get(getattr(e, "errno", None), "ошибка записи")
 
 
 def reports_parts(st):
@@ -707,14 +798,17 @@ def wrap_parts(parts, width, rows=2):
 
 
 def preview_source(text):
-    """report.preview() as lines to read: (kind, line). The fields as JSON, then the log line by line
-    (inside the JSON the whole log is one string with \\n in it)."""
-    try:
-        data = json.loads(text)
-    except ValueError:
-        data = None
+    """A report (report.preview()'s text, or report.build_from_log()'s dict) as lines to read: (kind, line).
+    The fields as JSON, then the log line by line (inside the JSON the whole log is one string with \\n in it)."""
+    if isinstance(text, dict):
+        data = dict(text)
+    else:
+        try:
+            data = json.loads(text)
+        except ValueError:
+            data = None
     if not isinstance(data, dict):
-        return [("json", UNPRINTABLE.sub("?", line.expandtabs())) for line in text.split("\n")]
+        return [("json", UNPRINTABLE.sub("?", line.expandtabs())) for line in str(text).split("\n")]
     log = data.pop("log", None)
     out = [("json", UNPRINTABLE.sub("?", line))           # JSON leaves U+0080…U+009F as they are
            for line in json.dumps(data, ensure_ascii=False, indent=1).split("\n")]
@@ -740,6 +834,88 @@ def wrap_source(src, width):
         parts = textwrap.wrap(line, width, subsequent_indent=indent, break_on_hyphens=False) or [line[:width]]
         out += [(kind, p, i == 0) for i, p in enumerate(parts)]
     return out
+
+
+class Reader:
+    """A report to read ("Что именно уходит", or the report of one of the last updates), laid out like a news
+    article. make() returns it (text or dict) and runs in a thread of its own: the device, pacman and the whole
+    journal take a moment on a slow machine. start=False: nothing is made (the self-test fills src itself)."""
+
+    def __init__(self, make, start=True):
+        self.src, self.scroll, self.page, self.wrapped = None, 0, 10, None
+        if start:
+            threading.Thread(target=self._make, args=(make,), daemon=True).start()
+
+    def _make(self, make):
+        try:
+            src = preview_source(make())
+        except Exception as e:               # whatever went wrong, the screen says it instead of waiting
+            src = [("json", f"не удалось собрать отчёт: {e!r}")]
+        self.src = src
+
+    def rows(self, width):
+        """The report wrapped to the width (once per width), or None while it is being put together."""
+        if self.src is None:
+            return None
+        if not self.wrapped or self.wrapped[0] != width:
+            self.wrapped = (width, wrap_source(self.src, width))
+        return self.wrapped[1]
+
+    def key(self, key):
+        """Scrolls by a line or a page (here ←→ page, never move the window); False for any other key."""
+        if key in ("up", "k"):
+            self.scroll = max(0, self.scroll - 1)
+        elif key in ("down", "j", "space"):
+            self.scroll += 1
+        elif key in ("pgup", "left"):
+            self.scroll = max(0, self.scroll - self.page)
+        elif key in ("pgdn", "right"):
+            self.scroll += self.page
+        elif key in ("home", "end"):
+            self.scroll = 0 if key == "home" else 1 << 30     # the next frame clamps it
+        else:
+            return False
+        return True
+
+
+class SendJob:
+    """One update's report sent by hand (report.send_now: the key is the consent for this one report, with the
+    automatic reports off too), in a thread of its own. Its line says «отправляю отчёт…» until the answer, then
+    what came of it."""
+
+    def __init__(self, log, ui=None):
+        self.log, self.result, self.told = log, None, False
+        threading.Thread(target=self._send, args=(log, ui), daemon=True).start()
+
+    def _send(self, log, ui):
+        try:
+            ok, message, _ = report.send_now(log, ui=ui)
+        except Exception:                     # send_now never raises; this is in case it ever does
+            ok, message = False, "не удалось собрать отчёт"
+        self.result = (ok, message)
+
+    @property
+    def done(self):
+        return self.result is not None
+
+    @property
+    def ok(self):
+        return bool(self.result and self.result[0])
+
+    def line(self):
+        if self.result is None:
+            return "отправляю отчёт…", DIM
+        return self.result[1], GOOD if self.result[0] else WARN
+
+
+class Status:
+    """What came of a key pressed on the summary (a restart, a fix): one line in its colour."""
+
+    def __init__(self, text, colour):
+        self.text, self.colour = text, colour
+
+    def line(self):
+        return self.text, self.colour
 
 
 # ───────────────────────────── the app ─────────────────────────────
@@ -773,8 +949,17 @@ class App:
         self.report_line = None                    # this update's report (ReportLine), once there is one
         self.hinted = False
         self.set_sel, self.set_key_t = 0, 0.0
-        self.pv_open, self.pv_scroll, self.pv_page = False, 0, 10      # "Что именно уходит"
-        self.pv_gen, self.pv_data, self.pv_busy, self.pv_wrap = 0, None, None, None
+        self.pv = None                             # "Что именно уходит" (a Reader), while it is open
+        self.services_on = report.option("restart_services", False) if live else False
+        # The last updates kept on this machine (report.local_updates; None while being read), the one chosen,
+        # its report while open (a Reader), and the first D of a delete: (its journal, when).
+        self.up_list, self.up_sel, self.up_reader, self.up_del, self.up_gen = None, 0, None, None, 0
+        self.jobs = []                             # reports sent by hand from the menu or the list: answers to tell
+        self.pressed = {}                          # key → when it was last pressed (a key held down counts once)
+        self.child = None                          # what runs in the plain terminal now (for window resizes)
+        self.bad = None                            # the last update while it says not to reboot (refresh_banner)
+        if live:
+            self.refresh_banner()
         bat = engine.battery() if live else None
         self.low_battery = bat[0] if bat and bat[1] and bat[0] < 30 else None
         self.version = updater_version() if live else None
@@ -905,10 +1090,92 @@ class App:
                      ("manual", "Обычный Arch-Update", "запустить как есть")]
         if self.news:
             items.append(("news", "Читать новости Arch", f"{len(self.news)} последних"))
+        if self.bad:
+            items.append(("last", "Последнее обновление", "НЕ перезагружайся — что не так и что с этим делать"))
         word = "вкл" if self.rep["enabled"] else "выкл" if self.rep["decided"] else "ещё не решено"
         items.append(("settings", "Настройки", f"отчёты об обновлениях: {word}"))
         items.append(("quit", "Выйти", ""))
         return items
+
+    # ── the menu's warning about the last update
+    def refresh_banner(self):
+        """The last update, while it found problems in this very boot and nothing has fixed them
+        (engine.unresolved): until a reboot or a fix the menu warns about it, with its keys (Actions)."""
+        try:
+            data = engine.unresolved()
+        except Exception:                    # a summary nobody can read is no reason not to start
+            note_ui_error(traceback.format_exc())
+            data = None
+        job = self.bad.job if self.bad else None
+        self.bad = Actions(self, data, demo=DEMO) if data else None
+        if self.bad and job and job.log == self.bad.log:
+            self.bad.job = job                   # a report of it on its way: not offered again meanwhile
+
+    def banner_text(self):
+        """What the menu's warning says, (head, the problem), and its keys as (long, short) hints; None without
+        one."""
+        if not self.bad:
+            return None
+        keys = []
+        if self.bad.fixes:
+            keys.append(("F — исправить", "F — исправить"))
+        if self.bad.can_send():
+            keys.append(("S — отправить отчёт", "S — отчёт"))
+        return ("Последнее обновление: НЕ перезагружайся", short_problem(first_problem(self.bad.res))), keys
+
+    @staticmethod
+    def banner_lines(text, width, rows):
+        """The warning in at most rows lines: head and problem in one line when they fit, else the problem in a
+        line of its own; in one line the head gives way to the problem."""
+        head, problem = text
+        if not problem:
+            return [fit(head, width)]
+        one = f"{head} — {problem}"
+        if len(one) <= width:
+            return [one]
+        if rows >= 2:
+            return [fit(head, width), fit(problem, width)]
+        return [fit(f"НЕ перезагружайся — {problem}", width)]
+
+    def banner_key(self, key):
+        """F or S under the menu's warning; "terminal" when it went to the plain terminal and back."""
+        acts, job = self.bad, self.bad.job
+        went = acts.press(key)
+        if acts.job is not job and acts.job:
+            self.jobs.append(acts.job)           # its answer comes as a toast
+            self.toast("отправляю отчёт…", secs=60)
+        if not went:
+            return None
+        self.refresh_banner()
+        self.toast(acts.status.text, secs=6)
+        self.menu_sel = min(self.menu_sel, len(self.menu_items()) - 1)
+        self.menu_t = time.time() - 5
+        return "terminal"
+
+    def show_last(self):
+        """The last update's summary again (the menu's item under its warning): what went wrong, and its keys."""
+        res = self.bad.res
+        summary_screen(self, res, seconds_of(res), demo=DEMO, review=when_text(res.get("began"), year=False),
+                       acts=self.bad)
+        self.refresh_banner()
+        self.menu_sel = min(self.menu_sel, len(self.menu_items()) - 1)
+        self.state, self.menu_t = "menu", time.time() - 5
+
+    def poll_jobs(self):
+        """A report sent by hand from the menu or the list has its answer: a toast says it."""
+        for job in self.jobs:
+            if job.done and not job.told:
+                job.told = True
+                self.toast(job.result[1], secs=5)
+                if self.state == "updates":
+                    self.reload_updates()
+        self.jobs = [j for j in self.jobs if not j.told]
+
+    def fresh_press(self, key):
+        """False for a key held down or pressed twice within FRESH: such a key counts once."""
+        now, last = time.time(), self.pressed.get(key, 0.0)
+        self.pressed[key] = now
+        return now - last > FRESH
 
     # ── drawing helpers
     def now(self):
@@ -1050,6 +1317,9 @@ class App:
         pk, items = self.count, len(self.menu_items())
         if pk:
             L.pkg_rows = min((pk + L.ncol - 1) // L.ncol, max(3, min(8, c.h - 32)))
+        # The warning about the last update: what it says in up to two rows, then its keys
+        L.banner = self.banner_text()
+        L.banner_rows = len(self.banner_lines(L.banner[0], L.W - 2, 2)) if L.banner else 0
 
         def measure():
             L.title_h = (10 if c.w < 92 else 9) if L.big_title else 3
@@ -1058,13 +1328,15 @@ class App:
                 L.upd_h = 1 + L.pkg_rows + (1 if pk > L.pkg_rows * L.ncol else 0) + (1 if self.check_failed else 0) + 1
             else:
                 L.upd_h = 4
-            nw = bool(self.kernel_gpu) + (self.low_battery is not None)
+            nw = bool(self.kernel_gpu) + (self.low_battery is not None) + (L.banner_rows + 1 if L.banner else 0)
             L.warn_h = nw + 1 if nw else 0                   # warnings stacked, one blank row below
             L.menu_h = 1 + (2 * items if L.menu_subs else items + 1)
             return L.title_h + L.news_h + L.upd_h + L.warn_h + L.menu_h
-        # The package list goes down to one row before the news headline goes: it may be a NEW item.
+        # The package list goes down to one row before the news headline goes: it may be a NEW item. The
+        # warning about the last update keeps its second row longest.
         shrink = [("menu_subs", False), ("news_rows", min(L.news_rows, 1)), ("pkg_rows", min(L.pkg_rows, 2)),
-                  ("big_title", False), ("pkg_rows", min(L.pkg_rows, 1)), ("news_rows", 0)]
+                  ("big_title", False), ("pkg_rows", min(L.pkg_rows, 1)), ("news_rows", 0),
+                  ("banner_rows", min(L.banner_rows, 1))]
         L.total = measure()
         while L.total > c.h - 4 and shrink:                  # a free row above the footer
             setattr(L, *shrink.pop(0))
@@ -1166,6 +1438,21 @@ class App:
                 c.put(x0 + 4, y, "часть проверки не удалась — список может быть неполным", WARN, alpha=appear(k))
                 y += 1
             y += 1
+        if L.banner:                    # the last update said not to reboot, and nothing has fixed it since
+            a = appear(k); k += 1
+            tint = lerp(BG, BAD, 0.12 * a)
+            for yy in range(y, y + L.banner_rows + 1):
+                c.fill_bg(x0 - 1, yy, W + 2, tint)
+            c.put(x0, y, "✗", BAD, bold=True, alpha=a)
+            for i, line in enumerate(self.banner_lines(L.banner[0], W - 2, L.banner_rows)):
+                c.put(x0 + 2, y, line, BAD, bold=i == 0, alpha=a)
+                y += 1
+            more = ("Enter на «Последнее обновление» — подробнее", "Enter на «Последнее обновление» — подробнее")
+            keys = fit_keys(L.banner[1] + [more], W - 2)
+            if len(keys) > W - 2:       # a narrow window: the item below explains itself
+                keys = fit_keys(L.banner[1], W - 2)
+            keyline(c, y, keys, x=x0 + 2, alpha=a)
+            y += 1
         if self.kernel_gpu:
             a = appear(k); k += 1
             c.put(x0, y, "⚠", WARN, bold=True, alpha=a)
@@ -1180,7 +1467,7 @@ class App:
             c.put(x0 + 2, y, f"батарея {self.low_battery}% — подключи зарядку, обновление может идти долго"[:W - 2],
                   WARN, alpha=a)
             y += 1
-        if self.kernel_gpu or self.low_battery is not None:
+        if self.kernel_gpu or self.low_battery is not None or L.banner:
             y += 1
 
         # menu: a gradient pill under the selected item
@@ -1289,12 +1576,13 @@ class App:
 
     # ── settings
     def open_settings(self):
-        self.state, self.set_sel, self.pv_open = "settings", 0, False
+        self.state, self.set_sel, self.pv = "settings", 0, None
         if self.toast_text == REPORTS_HINT:  # it pointed here: done
             self.toast_text = ""
         self.set_key_t = time.time()         # the Enter that opened the screen is no choice (see handle)
-        self.pv_gen += 1                     # the preview is put together once per visit
         self.refresh_reports()
+        if self.live:
+            self.services_on = report.option("restart_services", False)
 
     def refresh_reports(self):
         if self.live:
@@ -1306,12 +1594,9 @@ class App:
         try:
             report.set_consent(on)           # off also drops what was still waiting to be sent
         except OSError as e:
-            why = {errno.ENOSPC: "нет места на диске", errno.EROFS: "диск только для чтения",
-                   errno.EACCES: "нет прав на запись", errno.EPERM: "нет прав на запись"}
-            self.toast(f"не удалось сохранить выбор: {why.get(e.errno, 'ошибка записи')}", secs=4)
+            self.toast(f"не удалось сохранить выбор: {write_error(e)}", secs=4)
             return
         self.refresh_reports()
-        self.pv_gen += 1                     # the preview carries this machine's ID only while on
         if not on:
             self.toast("отчёты выключены" + (", неотправленные удалены" if waiting else ""), secs=3)
         elif self.rep["endpoint"]:
@@ -1319,26 +1604,43 @@ class App:
         else:                                # no server yet: they wait on this machine (the line below says so)
             self.toast("спасибо! отчёты включены — уйдут, когда подключат сервер для отчётов", secs=3)
 
-    def _load_preview(self, gen):
+    def toggle_services(self):
+        on = not self.services_on
         try:
-            src = preview_source(report.preview())
-        except Exception as e:               # whatever went wrong, the screen says it instead of waiting
-            src = [("json", f"не удалось собрать отчёт: {e!r}")]
-        if gen == self.pv_gen:               # one for an earlier visit, finished late, is not shown
-            self.pv_data = (gen, src)
+            report.set_option("restart_services", on)      # read by the engine as the next update starts
+        except OSError as e:
+            self.toast(f"не удалось сохранить выбор: {write_error(e)}", secs=4)
+            return
+        self.services_on = on
+        self.toast("сервисы будут перезапускаться сами (кроме тех, что нельзя на ходу)" if on else
+                   "сервисы — только по клавише R в конце обновления", secs=3)
 
-    def preview_rows(self, width):
-        """The preview wrapped to the width, or None while it is being put together (in a thread
-        of its own: the device, pacman and the whole log take a moment on a slow machine)."""
-        data = self.pv_data
-        if data is None or data[0] != self.pv_gen:
-            if self.live and self.pv_busy != self.pv_gen:
-                self.pv_busy = self.pv_gen
-                threading.Thread(target=self._load_preview, args=(self.pv_gen,), daemon=True).start()
-            return None
-        if not self.pv_wrap or self.pv_wrap[:2] != (data[0], width):
-            self.pv_wrap = (data[0], width, wrap_source(data[1], width))     # once per visit and width
-        return self.pv_wrap[2]
+    def settings_desc(self, key, width, room=None):
+        """What the chosen item is, under the items: [(line, colour)], its paragraphs a blank line apart where they
+        fit into room rows. room None: as few rows as it can take, the reports' state counted as its two rows
+        either way (to decide the layout by: it never changes as that line grows)."""
+        about = {"reports": REPORT_ABOUT, "services": SERVICES_ABOUT, "preview": PREVIEW_ABOUT,
+                 "updates": UPDATES_ABOUT}.get(key, ())
+        blocks = [[(line, DIM) for line in textwrap.wrap(para, width, break_on_hyphens=False)] for para in about]
+        if key == "reports":
+            state = [(line, MUTED) for line in wrap_parts(reports_parts(self.rep), width)]
+            blocks.append((state + [("", MUTED)] * 2)[:2] if room is None else state)
+        lines = [line for block in blocks for line in block]
+        if room is not None and len(lines) + len(blocks) - 1 <= room:
+            lines = [line for i, block in enumerate(blocks) for line in ([("", DIM)] if i else []) + block]
+        return lines
+
+    def settings_layout(self, c, W):
+        """(rows from one item to the next, the row the chosen item's description starts at): two apart and a
+        blank row below them while the longest description still ends above the toast's row; one apart on a
+        low terminal (80x24)."""
+        n = len(SETTINGS_ITEMS)
+        cached = getattr(self, "_set_layout", None)
+        if not cached or cached[0] != (W, c.h):  # it depends on the size alone: worked out once per size
+            tallest = max(len(self.settings_desc(k, W - 4)) for k, _ in SETTINGS_ITEMS)
+            cached = self._set_layout = ((W, c.h), (2, 4 + 2 * n) if 4 + 2 * n + tallest <= c.h - 4 else
+                                         (1, 4 + n + 1))
+        return cached[1]
 
     def draw_settings(self):
         c, t = self.s.canvas, math.floor(self.now() * 10) / 10
@@ -1347,47 +1649,45 @@ class App:
         W = min(c.w - 8, 100)
         x0 = (c.w - W) // 2
         c.cput(2, "НАСТРОЙКИ", grad(PAL_ARCH, -t * 0.1), bold=True)
-        if self.pv_open:
-            return self.draw_preview(c, t, W, x0)
-        y = 4
+        if self.pv:
+            return self.draw_reader(c, t, W, x0, self.pv, "Что именно уходит", PREVIEW_INTRO,
+                                    "↑↓ прокрутка   ←→ страница   Esc назад")
+        step, y_desc = self.settings_layout(c, W)
         for i, (key, title) in enumerate(SETTINGS_ITEMS):
+            y = 4 + i * step
             sel = i == self.set_sel
             if sel:
                 pill(c, x0, y, W, lambda xx: shade(grad(PAL_ARCH, xx / W * 0.5 - t * 0.1), 0.45),
                      grad(PAL_ARCH, -t * 0.1))
             c.put(x0 + 1, y, ("▸ " if sel else "  ") + title, (255, 255, 255) if sel else TEXT, bold=sel)
-            if key == "reports":
-                word = "ВКЛ" if self.rep["enabled"] else "ВЫКЛ"
-                badge(c, x0 + W - len(word) - 3, y, word, GOOD if self.rep["enabled"] else DIM)
-                for para in REPORT_ABOUT:
-                    for line in textwrap.wrap(para, W - 4):
-                        y += 1
-                        c.put(x0 + 3, y, line, DIM)
-                for j, line in enumerate(wrap_parts(reports_parts(self.rep), W - 4)):
-                    c.put(x0 + 3, y + 2 + j, line, MUTED)
-                y += 3                       # two rows for it either way: the items below never jump
-            y += 2
+            on = {"reports": self.rep["enabled"], "services": self.services_on}.get(key)
+            if on is not None:
+                word = "ВКЛ" if on else "ВЫКЛ"
+                badge(c, x0 + W - len(word) - 3, y, word, GOOD if on else DIM)
+        desc = self.settings_desc(SETTINGS_ITEMS[self.set_sel][0], W - 4, room=c.h - 4 - y_desc)
+        for j, (line, colour) in enumerate(desc):
+            c.put(x0 + 3, y_desc + j, line, colour)
         self.hint("↑↓ выбор", "Enter переключить/открыть", "Esc назад")
         BACKDROP.draw(c, t, PAL_ARCH)        # after the content, before the toast
         self.draw_toast()
 
-    def draw_preview(self, c, t, W, x0):
-        """What a report from this machine holds, laid out like a news article."""
-        c.cput(4, "Что именно уходит", grad(PAL_ARCH, 0.2 - t * 0.08), bold=True)
+    def draw_reader(self, c, t, W, x0, reader, title, intro, footer):
+        """A report laid out like a news article: its title, a line about it, the text with ▲▼ and where it is."""
+        c.cput(4, fit(title, W), grad(PAL_ARCH, 0.2 - t * 0.08), bold=True)
         y = 5
-        for line in textwrap.wrap(PREVIEW_INTRO, W):
+        for line in textwrap.wrap(intro, W):
             c.cput(y, line, DIM)
             y += 1
         y += 1
         view_h = max(1, c.h - y - 5)        # the row below the text says where it is; the toast's row stays free
-        self.pv_page = max(1, view_h - 2)
-        rows = self.preview_rows(W)
+        reader.page = max(1, view_h - 2)
+        rows = reader.rows(W)
         if rows is None:
             c.cput(y + 2, self.spinner(t) + "  собираю…", grad(PAL_ARCH, t * 0.3))
         else:
-            self.pv_scroll = max(0, min(self.pv_scroll, len(rows) - view_h))
+            reader.scroll = max(0, min(reader.scroll, len(rows) - view_h))
             c.blank(x0, y, W, view_h, BG)    # the text column stays clear of stars
-            for i, (kind, text, first) in enumerate(rows[self.pv_scroll:self.pv_scroll + view_h]):
+            for i, (kind, text, first) in enumerate(rows[reader.scroll:reader.scroll + view_h]):
                 if kind == "rule":
                     c.put(x0, y + i, "─" * W, FAINT, bg=BG)
                     c.put(x0 + 2, y + i, f" {text} ", MUTED, bg=BG)
@@ -1397,20 +1697,158 @@ class App:
                 if m:
                     c.put(x0, y + i, m.group(), DIM, bg=BG)
             if len(rows) > view_h:
-                c.put(x0 + W + 2, y, "▲" if self.pv_scroll else " ", DIM)
-                c.put(x0 + W + 2, y + view_h - 1, "▼" if self.pv_scroll + view_h < len(rows) else " ", DIM)
-                pos = f"{self.pv_scroll + 1}–{min(len(rows), self.pv_scroll + view_h)} из {len(rows)}"
+                c.put(x0 + W + 2, y, "▲" if reader.scroll else " ", DIM)
+                c.put(x0 + W + 2, y + view_h - 1, "▼" if reader.scroll + view_h < len(rows) else " ", DIM)
+                pos = f"{reader.scroll + 1}–{min(len(rows), reader.scroll + view_h)} из {len(rows)}"
                 c.put(x0 + W - len(pos), y + view_h, pos, MUTED)
-        self.footer("↑↓ прокрутка   ←→ страница   Esc назад")       # here ←→ page, never move the window
+        self.footer(footer)                  # here ←→ page, never move the window
         BACKDROP.draw(c, t, PAL_ARCH)
+        self.draw_toast()
+
+    # ── the last updates kept on this machine
+    DELETE_SECS = 6                          # the second D within that long deletes
+
+    def open_updates(self):
+        self.state, self.up_sel, self.up_reader, self.up_del = "updates", 0, None, None
+        self.reload_updates(fresh=True)
+
+    def reload_updates(self, fresh=False):
+        """The list, read in a thread of its own (a few journals: a moment on a slow machine). fresh: "being read"
+        until then; else the list on the screen stays until the new one is in."""
+        self.up_gen += 1
+        if not self.live:
+            return
+        if fresh:
+            self.up_list = None
+        gen = self.up_gen
+
+        def work():
+            try:
+                got = report.local_updates()
+            except Exception:
+                note_ui_error(traceback.format_exc())
+                got = []
+            if gen == self.up_gen:           # a list asked for later is newer
+                self.up_list = got
+        threading.Thread(target=work, daemon=True).start()
+
+    def chosen_update(self):
+        items = self.up_list or []
+        if not items:
+            return None
+        self.up_sel = max(0, min(self.up_sel, len(items) - 1))
+        return items[self.up_sel]
+
+    def send_update(self, u):
+        if not self.fresh_press("s"):
+            return
+        if DEMO:
+            self.toast(DEMO_SAYS)
+        elif any(not j.done for j in self.jobs):
+            self.toast("уже отправляю отчёт — дождись ответа")
+        else:
+            self.jobs.append(SendJob(u["log"], report_ui(self)))
+            self.toast("отправляю отчёт…", secs=60)
+
+    def delete_update(self, u):
+        """D, and D again (a press of its own, not the key held down): the update gone from this machine, its
+        journal and summary with it (report.delete_local)."""
+        fresh = self.fresh_press("d")
+        if DEMO:
+            if fresh:
+                self.toast(DEMO_SAYS)
+            return
+        armed = self.up_del and self.up_del[0] == u["log"] and time.time() - self.up_del[1] < self.DELETE_SECS
+        if not armed:
+            self.up_del = (u["log"], time.time())
+            return
+        if not fresh:
+            return
+        self.up_del = None
+        if report.delete_local(u["log"]):
+            self.up_list = [x for x in self.up_list or [] if x["log"] != u["log"]]
+            self.toast("обновление удалено с этого компьютера", secs=3)
+        else:
+            self.toast("не удалось удалить это обновление", secs=3)
+        self.reload_updates()
+        if self.live:
+            self.refresh_banner()            # the menu warned about that one, maybe
+
+    def update_detail(self, u):
+        """The line under the chosen update: what to read first in it."""
+        first = short_problem(first_problem(u)) or next(iter(strs(u.get("warnings")) + strs(u.get("notes"))), "")
+        if first:
+            return first
+        return "итога нет: обновление не дошло до проверки" if u.get("verdict") is None else "проблем не нашлось"
+
+    def draw_updates(self):
+        c, t = self.s.canvas, math.floor(self.now() * 10) / 10
+        W = min(c.w - 8, 100)
+        x0 = (c.w - W) // 2
+        c.cput(2, "ПОСЛЕДНИЕ ОБНОВЛЕНИЯ", grad(PAL_ARCH, -t * 0.1), bold=True)
+        u = self.chosen_update()
+        if self.up_reader and u:
+            return self.draw_reader(c, t, W, x0, self.up_reader, f"Отчёт об обновлении {when_text(u['time'])}",
+                                    UPDATE_INTRO, "↑↓ прокрутка   ←→ страница   S отправить   Esc назад")
+        W = min(c.w - 8, 84)                 # the list: as wide as its columns, centred
+        x0 = (c.w - W) // 2
+        y = 4
+        for line in textwrap.wrap(UPDATES_ON if self.rep["enabled"] else UPDATES_OFF, W)[:2]:
+            c.cput(y, line, DIM)
+            y += 1
+        y += 1
+        items = self.up_list
+        if items is None:
+            c.cput(y + 1, self.spinner(t) + "  читаю журналы…", grad(PAL_ARCH, t * 0.3))
+        elif not items:
+            c.cput(y + 1, "пока ни одного обновления", DIM)
+        else:
+            wide = W >= 84                   # room for the year
+            gap = 1 if y + 2 * len(items) + 1 <= c.h - 4 else 0
+            for i, it in enumerate(items):
+                sel = i == self.up_sel
+                if sel:
+                    pill(c, x0, y, W, lambda xx: shade(grad(PAL_ARCH, xx / W * 0.5 - t * 0.1), 0.45),
+                         grad(PAL_ARCH, -t * 0.1))
+                quiet = (220, 220, 235) if sel else DIM
+                date = when_text(it.get("time"), year=wide) or "—"
+                c.put(x0 + 1, y, ("▸ " if sel else "  ") + date, (255, 255, 255) if sel else TEXT, bold=sel)
+                glyph, words, col = verdict_mark(it)
+                vx = x0 + 3 + (16 if wide else 11) + 3
+                c.put(vx, y, glyph, col, bold=True)
+                c.put(vx + 2, y, words, col)
+                n = it.get("packages") or 0
+                known = it.get("started", True) and it.get("verdict") is not None
+                c.put(vx + 23, y, f"{n} {plural(n, 'пакет', 'пакета', 'пакетов')}" if known else "—", quiet)
+                if it.get("sent"):
+                    sent, scol = "отправлен" + (f" (№ {it['issue']})" if it.get("issue") else ""), GOOD
+                elif it.get("waiting"):
+                    sent, scol = "ждёт отправки", WARN
+                else:
+                    sent, scol = "не отправлен", quiet if sel else MUTED
+                c.put(vx + 36, y, fit(sent, x0 + W - vx - 36), scol)
+                y += 1
+                if sel:
+                    armed = self.up_del and self.up_del[0] == it["log"] and \
+                        time.time() - self.up_del[1] < self.DELETE_SECS
+                    line, lcol = ("нажми D ещё раз, чтобы удалить", WARN) if armed else (self.update_detail(it), DIM)
+                    c.put(x0 + 5, y, fit(line, W - 6), lcol)
+                    y += 1
+                y += gap
+        if items:
+            self.hint("↑↓ выбор", "Enter отчёт", "S отправить", "D удалить", "Esc назад")
+        else:
+            self.hint("Esc назад")
+        BACKDROP.draw(c, t, PAL_ARCH)        # after the content, before the toast
         self.draw_toast()
 
     # ── input
     def handle(self, key):
         key = LATIN.get(key, key)
+        letter = key.lower() if len(key) == 1 else key          # S, R, F, D with Shift or without
         if key in ("left", "right") and not self.confirm and self.monitors > 1 and \
                 not (self.state == "news" and self.article is not None) and \
-                not (self.state == "settings" and self.pv_open):
+                not (self.state == "settings" and self.pv) and not (self.state == "updates" and self.up_reader):
             self.move_screen(key)
             return None
         if self.state == "splash":
@@ -1439,6 +1877,8 @@ class App:
                 return self.handle("enter")
             elif key in ("q", "esc"):
                 return "quit"
+            elif letter in ("f", "s") and self.bad:      # the keys of the warning about the last update
+                return self.banner_key(letter)
             elif key == "enter":
                 action = items[self.menu_sel][0]
                 if action == "auto" and self.kernel_gpu:
@@ -1450,6 +1890,8 @@ class App:
                 if action == "settings":
                     self.open_settings()
                     return None
+                if action == "last":
+                    return "last"
                 if action == "recheck":
                     self.repo, self.state, self.t0 = None, "splash", time.time() - 2.0
                     threading.Thread(target=self._load_updates, daemon=True).start()
@@ -1481,19 +1923,9 @@ class App:
                     self.article = None
             return None
         if self.state == "settings":
-            if self.pv_open:
-                if key in ("up", "k"):
-                    self.pv_scroll = max(0, self.pv_scroll - 1)
-                elif key in ("down", "j", "space"):
-                    self.pv_scroll += 1
-                elif key in ("pgup", "left"):
-                    self.pv_scroll = max(0, self.pv_scroll - self.pv_page)
-                elif key in ("pgdn", "right"):
-                    self.pv_scroll += self.pv_page
-                elif key in ("home", "end"):
-                    self.pv_scroll = 0 if key == "home" else 1 << 30     # the next frame clamps it
-                elif key in ("esc", "q", "enter"):
-                    self.pv_open = False
+            if self.pv:
+                if not self.pv.key(key) and key in ("esc", "q", "enter"):
+                    self.pv = None
                 return None
             if key in ("up", "k"):
                 self.set_sel = (self.set_sel - 1) % len(SETTINGS_ITEMS)
@@ -1501,19 +1933,47 @@ class App:
                 self.set_sel = (self.set_sel + 1) % len(SETTINGS_ITEMS)
             elif key in ("enter", "space"):
                 what = SETTINGS_ITEMS[self.set_sel][0]
-                if what == "reports":
+                if what in SWITCHES:
                     # As in the kernel/NVIDIA confirm, only a fresh press after a pause (longer than a
                     # held key waits before it repeats) is a choice: the Enter that opened this screen,
-                    # pressed twice or held down, never flips the switch.
-                    fresh, self.set_key_t = time.time() - self.set_key_t > 0.8, time.time()
+                    # pressed twice or held down, never flips a switch.
+                    fresh, self.set_key_t = time.time() - self.set_key_t > FRESH, time.time()
                     if fresh:
-                        self.toggle_reports()
+                        (self.toggle_reports if what == "reports" else self.toggle_services)()
                 elif what == "preview":
-                    self.pv_open, self.pv_scroll = True, 0
+                    self.pv = Reader(report.preview, start=self.live)
+                elif what == "updates":
+                    self.open_updates()
                 else:
                     self.state, self.menu_t = "menu", time.time() - 5
             elif key in ("esc", "q"):
                 self.state, self.menu_t = "menu", time.time() - 5
+            return None
+        if self.state == "updates":
+            u = self.chosen_update()
+            if self.up_reader:
+                if self.up_reader.key(key):
+                    return None
+                if letter == "s" and u:
+                    self.send_update(u)
+                elif key in ("esc", "q", "enter"):
+                    self.up_reader = None
+                return None
+            if letter != "d":
+                self.up_del = None           # the second D must follow the first
+            if key in ("up", "k") and u:
+                self.up_sel = (self.up_sel - 1) % len(self.up_list)
+            elif key in ("down", "j", "tab") and u:
+                self.up_sel = (self.up_sel + 1) % len(self.up_list)
+            elif key == "enter" and u:
+                ui = report_ui(self)
+                self.up_reader = Reader(lambda log=u["log"]: report.build_from_log(log, ui=ui), start=self.live)
+            elif letter == "s" and u:
+                self.send_update(u)
+            elif letter == "d" and u:
+                self.delete_update(u)
+            elif key in ("esc", "q"):
+                self.state = "settings"
             return None
         return None
 
@@ -1528,7 +1988,7 @@ class App:
         t = time.perf_counter()
         self.check_resize()
         {"splash": self.draw_splash, "menu": self.draw_menu, "news": self.draw_news,
-         "settings": self.draw_settings}[self.state]()
+         "settings": self.draw_settings, "updates": self.draw_updates}[self.state]()
         self.s.flush()
         PACE.measure(time.perf_counter() - t)
 
@@ -1537,6 +1997,7 @@ class App:
         while not self.quit:
             self.frame()
             self.send_waiting()
+            self.poll_jobs()
             if AUTOPLAY and self.state == "menu" and time.time() - self.menu_t > 3.5:
                 return "auto"
             r = select.select([0], [], [], PACE.interval)[0]
@@ -1549,8 +2010,14 @@ class App:
                     return "quit"
                 for key in parse_keys(data):
                     action = self.handle(key)
+                    if action == "last":
+                        self.show_last()
+                    if action in ("last", "terminal"):
+                        break                # what was typed with it is no answer to what came next
                     if action:
                         return action
+            if not engine.TERM_OK:           # the window closed while a fix ran in the plain terminal
+                return "quit"
         return "quit"
 
 
@@ -2039,6 +2506,302 @@ def transition(app, view):
         time.sleep(PACE.interval)
 
 
+# ───────────────────────────── in the plain terminal: services restarted, problems fixed ─────────────────────────────
+
+class QuietLog:
+    """engine.LOG while a restart or a fix runs: its output stays out of the update's journal (what was typed
+    there, a password typed ahead too, has no place in a report). What came of it is one event line instead."""
+    broken, path = False, None
+
+    def output(self, data):
+        pass
+
+    def event(self, kind, msg):
+        pass
+
+    def text(self, msg):
+        pass
+
+
+def note_ui_error(tb):
+    try:
+        os.makedirs(engine.STATE_DIR, exist_ok=True)
+        with open(os.path.join(engine.STATE_DIR, "ui-error.log"), "a") as f:
+            f.write(time.strftime("\n== %F %T ==\n") + tb)
+    except OSError:
+        pass
+
+
+def say_plain(s, text, colour=None, bold=False):
+    """A line of ours in the plain terminal, in the terminal's own text colour (a light theme stays readable) or
+    an accent. The terminal is in raw mode: every newline goes out as \\r\\n."""
+    pre = ("\x1b[1m" if bold else "") + ("\x1b[38;2;%d;%d;%dm" % colour if colour else "")
+    s.write(pre + text.replace("\r\n", "\n").replace("\n", "\r\n") + "\x1b[0m\r\n")
+
+
+def run_in_terminal(app, argv, intro):
+    """argv in the plain terminal (the canvas left, as for «Обычный Arch-Update»), in a pty of its own and run as
+    the engine runs a manual update: sudo asks for the password there, pacman asks before it changes anything, the
+    output shows as it comes. Keys typed before it said anything never reach it (a password typed ahead), Ctrl+C
+    never reaches pacman while it installs, and if the window closes meanwhile a question still waiting gets only
+    the safe answer (no to pacman, a password prompt cancelled). intro: [(text, colour, bold)] said first.
+    Returns its exit status, None if it could not start; the caller says what came of it (back_to_canvas)."""
+    s = app.s
+    s.leave()
+    s.write("\x1b[H\x1b[2J")
+    for text, colour, bold in intro:
+        say_plain(s, text, colour, bold)
+    s.write("\r\n")
+    view = engine.TerminalView()
+    saved = engine.VIEW, engine.LOG
+    engine.VIEW, engine.LOG = view, QuietLog()
+    try:
+        drop_typeahead()
+        cols, rows = term_size()
+        try:     # in English, as the update runs: the engine's safe answers know those questions
+            child = pexpect.spawn(argv[0], argv[1:], env=engine.child_env(), dimensions=(rows, cols), echo=True)
+        except (pexpect.ExceptionPexpect, OSError) as e:
+            say_plain(s, f"не удалось запустить {argv[0]}: {e}", BAD)
+            return None
+        app.child = child                       # window resizes reach it (main's SIGWINCH handler)
+        try:
+            pump_through(child, engine.Responder(child, stop_on_news=False, manual=True), view)
+        finally:
+            app.child = None
+        child.wait()                            # its pty is at EOF: only reaped, never killed
+        child.close()
+        return child.exitstatus if child.exitstatus is not None else 128 + (child.signalstatus or 0)
+    finally:
+        engine.VIEW, engine.LOG = saved
+
+
+def pump_through(child, responder, view):
+    """engine.pump until the command is done. As in run_update, an error in it never leaves the command running
+    unwatched (pacman may be at work): the plain pass-through goes on, and failing that the output alone."""
+    for auto in (True, False):
+        try:
+            engine.pump(child, responder, auto=auto)
+            return
+        except Exception:
+            note_ui_error(traceback.format_exc())
+    while True:
+        try:
+            data = os.read(child.child_fd, 65536)
+        except OSError:
+            data = b""
+        if not data:
+            return
+        view.out(data)
+
+
+def back_to_canvas(app, lines):
+    """What came of it under the output, which stays readable until Enter; then back to the canvas."""
+    s = app.s
+    for text, colour, bold in lines:
+        say_plain(s, text, colour, bold)
+    say_plain(s, "\nEnter — вернуться в Arch-Update", None, True)
+    drop_typeahead()                            # an Enter typed while it ran is no answer to this
+    while engine.TERM_OK:
+        try:
+            if not select.select([0], [], [], 0.5)[0]:
+                continue
+            data = os.read(0, 64)
+        except (OSError, ValueError):
+            data = b""
+        if not data:
+            engine.lost_terminal()
+            break
+        if any(k in ("enter", "esc") for k in parse_keys(data)):
+            break
+    s.enter()
+    s.resize()
+    drop_typeahead()
+
+
+def merge(res, data):
+    """The update's summary as the engine left it after a restart or a fix, into the result on the screen.
+    False when there is none."""
+    if not isinstance(data, dict) or not data:
+        return False
+    for k in ("problems", "warnings", "notes", "ok", "verdict", "services", "boot", "fixes", "resolved"):
+        if k in data:
+            res[k] = data[k]
+    return True
+
+
+def restart_services(app, res, argv):
+    """R: the services the update left waiting (those safe to restart while the machine runs: argv is
+    engine.services_command's) restarted now, in the plain terminal, where sudo may ask for the password. The
+    update's summary follows (engine.services_restarted): the restarted ones become an ok line, one that failed
+    a warning; when none was tried (the password refused, the question cancelled) they stay waiting.
+    Returns what came of it: (text, colour)."""
+    units = argv[argv.index("--") + 1:] if "--" in argv else []
+    log = res.get("log")
+    status = run_in_terminal(app, argv, [
+        (("[Arch-Update] Перезапускаю сервис: " if len(units) == 1 else "[Arch-Update] Перезапускаю сервисы: ")
+         + engine.unit_list(units, 20), None, True),
+        ("  " + shlex.join(argv), DIM, False)])
+    failed, done = [], list(units)
+    if status != 0:
+        # One that failed is in the failed state now (it was running before: that is why it was waiting); then
+        # the restart was tried, and the others went through. None failed: no telling whether any was tried.
+        states = engine.run(["systemctl", "is-failed", "--", *units], timeout=10).split()
+        failed = [u for u, st in zip(units, states) if st == "failed"] if len(states) == len(units) else []
+        done = [u for u in units if u not in failed] if failed else []
+    data = None
+    if done:
+        data = engine.services_restarted(log, done, ok=True)
+    if failed:
+        data = engine.services_restarted(log, failed, ok=False)
+    if not merge(res, data) and (done or failed):          # no summary to follow: at least nothing waits twice
+        svc = res.get("services") if isinstance(res.get("services"), dict) else {}
+        svc["waiting"] = [u for u in svc.get("waiting") or [] if u not in done + failed]
+    if failed:
+        text, colour = engine.not_restarted_text(failed, "systemctl status " + " ".join(failed[:3])), WARN
+    elif done:
+        text, colour = engine.restarted_text(done), GOOD
+    else:
+        engine.journal_event(log, "СЕРВИСЫ", f"перезапуск по клавише R не прошёл (код {status}): " + ", ".join(units))
+        text = ("сервис не перезапущен" if len(units) == 1 else "сервисы не перезапущены") + \
+            (f" (код {status})" if status is not None else "")
+        colour = WARN
+    back_to_canvas(app, [("", None, False), (("✓ " if colour == GOOD else "✗ ") + text, colour, True)])
+    return text, colour
+
+
+def fix_problems(app, res, fixes):
+    """F: the fixes the engine knows for the problems with booting the update found (engine.fix_commands), in
+    order, in the plain terminal, then a fresh look at the boot files (engine.recheck_boot, with what the probe
+    right after the fixes saw as root). When it finds no problem with booting any more, the update is marked fixed
+    (engine.mark_resolved): the menu stops warning. Returns what came of it: (text, colour); res follows the
+    update's summary."""
+    log = res.get("log")
+    try:
+        fd, out = tempfile.mkstemp(prefix="arch-update-probe-")     # 0600: this user's only
+        os.close(fd)
+    except OSError:
+        out = None
+    intro = [("[Arch-Update] Исправляю до перезагрузки" + (", по порядку:" if len(fixes) > 1 else ":"), None, True)]
+    for i, fix in enumerate(fixes, 1):
+        intro += [(f"  {i}. {fix['label']}" if len(fixes) > 1 else f"  {fix['label']}", None, False),
+                  ("     " + shlex.join(fix["argv"]), DIM, False)]
+    asks = "sudo спросит пароль, если нужно" + ("; pacman спросит, прежде чем что-то менять"
+                                                if any("pacman" in f["argv"] for f in fixes) else "")
+    intro.append((asks + ".", DIM, False))
+    status = run_in_terminal(app, engine.fixes_command(fixes, out or os.devnull), intro)
+    engine.journal_event(log, "ИСПРАВЛЕНИЕ", "по клавише F: " + "; ".join(f["label"] for f in fixes)
+                         + (f" — код {status}" if status is not None else " — не запустилось"))
+    say_plain(app.s, "\nПроверяю файлы загрузки ещё раз…", DIM)
+    old = {i.get("text") for i in res.get("boot") or [] if isinstance(i, dict)}
+    try:
+        left = engine.recheck_boot(log, probe=out)
+    except Exception:
+        note_ui_error(traceback.format_exc())
+        left = None
+    finally:
+        if out:
+            try:
+                os.remove(out)
+            except OSError:
+                pass
+    if left == [] and log:
+        engine.mark_resolved(log)
+    data = engine.read_json(engine.summary_path(log)) if log else {}
+    if not merge(res, data) and left is not None:           # no summary to follow: as the look found them now
+        res["problems"] = [p for p in res.get("problems") or [] if p not in old] + left
+        res["boot"] = res.get("boot") if left else []
+        res["verdict"] = 2 if res["problems"] else (1 if res.get("warnings") else 0)
+    if left is None:
+        text = "не удалось проверить — НЕ перезагружайся, сначала: sudo ls -l /boot"
+        lines = [("✗ " + text, BAD, True)]
+        colour = BAD
+    elif left:
+        more = f" (и ещё {len(left) - 1})" if len(left) > 1 else ""
+        text, colour = f"НЕ перезагружайся: всё ещё {short_problem(left[0])}{more}", BAD
+        lines = [("✗ Всё ещё: " + short_problem(p), BAD, False) for p in left] + \
+            [("НЕ перезагружайся, пока это не исправлено.", BAD, True)]
+    else:
+        text = "исправлено: проблем с загрузкой больше не нашёл" + (f" (код {status})" if status else "")
+        lines, colour = [("✓ Проблем с загрузкой больше не нашёл.", GOOD, True)], GOOD
+    back_to_canvas(app, lines)
+    return text, colour
+
+
+def report_ui(app):
+    """The screen and the monitors, for a report of this machine (counted only for Konsole on KDE: elsewhere
+    unknown, not 0)."""
+    w, h = term_size()
+    return {"screen": f"{w}x{h}", "monitors": app.monitors or None}
+
+
+class Actions:
+    """What can be done about one finished update, on its summary and from the menu's warning about it: S sends its
+    report by hand when it was not queued by itself; R restarts the services it left waiting, those safe to restart
+    while the machine runs (engine.services_command); F runs the fixes the engine knows for the problems with
+    booting it found (engine.fix_commands). Each one only where it applies, and in the demo each only says that it
+    is not done there. A key held down or pressed twice counts once."""
+
+    def __init__(self, app, res, sent=None, demo=False):
+        self.app, self.res, self.sent, self.demo = app, res if isinstance(res, dict) else None, sent, demo
+        self.job, self.status, self.pressed = None, None, {}
+        self.look()
+
+    def look(self):
+        """What applies now: again after a restart or a fix."""
+        res = self.res or {}
+        log = res.get("log")
+        self.log = log if isinstance(log, str) and log else None
+        svc = res.get("services") if isinstance(res.get("services"), dict) else {}
+        waiting = [u for u in svc.get("waiting") or [] if isinstance(u, str)]
+        self.restart = engine.services_command(waiting) if waiting else []
+        self.units = self.restart[self.restart.index("--") + 1:] if "--" in self.restart else []
+        self.fixes = engine.fix_commands(res) if res.get("boot") else []
+
+    def can_send(self):
+        if not self.log or (self.job and (not self.job.done or self.job.ok)):
+            return False                        # on its way, or gone
+        sent = self.sent                        # this update's report queued by itself, as the reports are on
+        return sent is None or not (sent.thread.is_alive() or sent.path)
+
+    def keys(self):
+        """The hints of what applies, as (long, short) pairs."""
+        out = []
+        if self.can_send():
+            out.append(("S — отправить отчёт", "S — отчёт"))
+        if self.units:
+            out.append(("R — перезапустить сервис" + ("" if len(self.units) == 1 else "ы"), "R — сервисы"))
+        if self.fixes:
+            more = f" и ещё {len(self.fixes) - 1}" if len(self.fixes) > 1 else ""
+            out.append((f"F — {self.fixes[0]['label']}{more}", "F — исправить"))
+        return out
+
+    def press(self, key):
+        """A key: True when it went to the plain terminal and back (R, F)."""
+        key = key.lower() if len(key) == 1 else key
+        applies = {"s": self.can_send, "r": lambda: bool(self.units), "f": lambda: bool(self.fixes)}.get(key)
+        if not applies or not applies():
+            return False
+        now, last = time.time(), self.pressed.get(key, 0.0)
+        self.pressed[key] = now
+        if now - last <= FRESH:                 # held down, or pressed twice: once is enough
+            return False
+        if self.demo:
+            self.app.toast(DEMO_SAYS)
+            return False
+        if key == "s":
+            self.job = self.status = SendJob(self.log, report_ui(self.app))
+            return False
+        try:
+            self.status = Status(*(restart_services(self.app, self.res, self.restart) if key == "r" else
+                                   fix_problems(self.app, self.res, self.fixes)))
+        finally:
+            self.look()
+        return True
+
+    def view(self, elapsed, review=None):
+        return summary_view(self.res, elapsed, self.sent, self.keys(), self.status, review)
+
+
 # ───────────────────────────── summary ─────────────────────────────
 
 class ReportLine:
@@ -2095,29 +2858,49 @@ def queue_report(app, res, mode, elapsed):
     for the wait at the end), or None when there is none to make."""
     if DEMO or not res or not report.enabled():
         return None
-    w, h = term_size()
-    mon = app.monitors or None               # counted only for Konsole on KDE: elsewhere unknown, not 0
-    app.report_line = ReportLine(lambda: report.after_update(res, demo=DEMO, mode=mode, seconds=elapsed,
-                                                             ui={"screen": f"{w}x{h}", "monitors": mon}))
+    ui = report_ui(app)
+    app.report_line = ReportLine(lambda: report.after_update(res, demo=DEMO, mode=mode, seconds=elapsed, ui=ui))
     return app.report_line
 
 
-def summary_view(res, elapsed, sent=None):
-    """What the summary screen shows for a finished run (res is None when nothing ran);
-    sent: the ReportLine of its report, if one was made."""
-    verdict = res["verdict"] if res else 0
-    n = len(res["changed"]) + len(res["added"]) if res else 0
+def strs(value):
+    return [x for x in value if isinstance(x, str)] if isinstance(value, list) else []
+
+
+def fit(text, width):
+    return text if len(text) <= width else text[:max(0, width - 1)] + "…"
+
+
+def summary_view(res, elapsed, sent=None, keys=(), status=None, review=None):
+    """What the summary screen shows for a finished run (res is None when nothing ran; a summary read back
+    serves as well); sent: the ReportLine of its report, if one was made; keys: what can be done about it, as
+    (long, short) hints; status: what came of the last of those (its line()); review: when the update began, for
+    an earlier one opened from the menu. Notes are grey and come last: they never change the verdict."""
+    res = res if isinstance(res, dict) else None
+    verdict = res.get("verdict") if res else 0
+    verdict = verdict if verdict in (0, 1, 2) and type(verdict) is int else 1
+    n = len(strs((res or {}).get("changed"))) + len(strs((res or {}).get("added")))
     lines = []
     if res:
-        lines += [("✗", p, BAD) for p in res["problems"]]
-        lines += [("⚠", w, WARN) for w in res["warnings"]]
-        lines += [("✓", o, GOOD) for o in res["ok"]]
+        lines += [("✗", p, BAD) for p in strs(res.get("problems"))]
+        lines += [("⚠", w, WARN) for w in strs(res.get("warnings"))]
+        lines += [("✓", o, GOOD) for o in strs(res.get("ok"))]
+        lines += [("›", x, MUTED) for x in strs(res.get("notes"))]
+    packages = f"{n} {plural(n, 'пакет', 'пакета', 'пакетов')}"
+    took = f" за {fmt_dur(elapsed)}" if elapsed else ""
+    if not res:
+        stats = ""
+    elif review is not None:
+        stats = (f"обновление {review} · " if review else "") + packages + took
+    else:
+        stats = packages + f" за {fmt_dur(elapsed or 0)}"
+    log = res.get("log") if res else None
     return types.SimpleNamespace(
         verdict=verdict, pal=[PAL_OK, PAL_WARN, PAL_BAD][verdict], glyph=[CHECK, BANG, CROSS][verdict],
         head=(res or {}).get("head") or
         ["Обновление завершено", "Готово — есть что прочитать", "Нужна проверка — не перезагружайся"][verdict],
-        stats=f"{n} {plural(n, 'пакет', 'пакета', 'пакетов')} за {fmt_dur(elapsed)}" if res else "",
-        lines=lines, log=res["log"] if res else None, sent=sent)
+        stats=stats, lines=lines, log=log if isinstance(log, str) else None, sent=sent, keys=list(keys),
+        status=status, review=review)
 
 
 def draw_summary(app, sv, t, demo, left):
@@ -2127,11 +2910,15 @@ def draw_summary(app, sv, t, demo, left):
     gap = 7 if c.h < 30 else 8                                   # glyph top -> headline
     wraps = [textwrap.wrap(tx, max(10, W - 4), break_on_hyphens=False) or [""] for _, tx, _ in sv.lines]
     need = gap + 3 + sum(min(2, len(w)) for w in wraps)          # glyph, headline, stats, blank, list
-    # Where this update's report is gets a row of its own below the journal line only while every
-    # row of the list still fits with it: no problem or warning ever makes room for it. Else it goes
-    # onto the journal line, in short, if there is room there, or is left out.
-    own_row = sv.sent is not None and need <= c.h - 7
-    foot = c.h - 5 if own_row else c.h - 4                       # the journal line
+    keys = fit_keys(sv.keys, c.w - 4)
+    shift = 1 if keys else 0                                     # the keys' row above the closing one
+    status = sv.status.line() if sv.status else None
+    # The note below the journal line (where this update's report is, or what came of a key pressed) gets a row
+    # of its own only while every row of the list still fits with it: no problem or warning ever makes room for
+    # it. Else the report's goes onto the journal line, in short, if there is room there, or is left out; what
+    # came of a key takes the journal line's place.
+    own_row = (sv.sent is not None or status is not None) and need <= c.h - 7 - shift
+    foot = (c.h - 5 if own_row else c.h - 4) - shift             # the journal line
     top = max(1, (foot - need) // 2)                             # centred above the journal line
     gw = len(sv.glyph[0])
     gx = (c.w - gw) // 2
@@ -2158,35 +2945,51 @@ def draw_summary(app, sv, t, demo, left):
         if y + min(2, len(wrapped)) > foot - 1:           # low terminal: the journal line stays readable
             break
         c.put(x0 + 2, y, icon, col, bold=True, alpha=a)
-        tcol = TEXT if icon != "✓" else DIM               # one colour per item, its second line too
+        tcol = DIM if icon in ("✓", "›") else TEXT       # one colour per item, its second line too
         c.put(x0 + 4, y, wrapped[0], tcol, alpha=a)
         y += 1
         for extra in wrapped[1:2]:
             c.put(x0 + 4, y, extra, tcol, alpha=a)
             y += 1
     journal = "журнал: " + sv.log.replace(os.path.expanduser("~"), "~") if sv.log else ""
-    note = sv.sent.text(short=not own_row) if sv.sent else ""
+    jcol, note, ncol = MUTED, "", MUTED
+    if status:
+        note, ncol = status
+    elif sv.sent:
+        note = sv.sent.text(short=not own_row)
     if note and not own_row:
-        both = f"{journal} · {note}" if journal else note
-        journal, note = (both if len(both) <= c.w - 4 else journal), ""
+        if status:
+            journal, jcol, note = note, ncol, ""
+        else:
+            both = f"{journal} · {note}" if journal else note
+            journal, note = (both if len(both) <= c.w - 4 else journal), ""
     if journal:
-        c.cput(foot, journal, MUTED)
+        c.cput(foot, fit(journal, c.w - 4), jcol)
     if note:
-        c.cput(foot + 1, note, MUTED)
+        c.cput(foot + 1, fit(note, c.w - 4), ncol)
+    if keys:
+        keyline(c, c.h - 3, keys)
     mon = "   ·   ←→ монитор" if app.monitors > 1 else ""
     if left is not None:
         keyline(c, c.h - 2, f"закроется через {int(math.ceil(left))} с   ·   Enter — закрыть{mon}   ·   "
                             "любая клавиша — оставить")
+    elif sv.review is not None:
+        keyline(c, c.h - 2, "Enter — назад в меню" + mon)
     else:
         keyline(c, c.h - 2, "Enter — закрыть" + mon)
 
 
-def summary_screen(app, res, elapsed, demo=False, sent=None):
+def summary_screen(app, res, elapsed, demo=False, sent=None, review=None, acts=None):
+    """The summary of a run until Enter, with its keys (Actions): S sends its report by hand, R restarts the
+    services it left waiting, F fixes what it found wrong with booting. review: when an earlier update began,
+    for one opened from the menu (Enter or Esc goes back there; it never closes by itself); acts: the menu's
+    Actions for that update."""
     s = app.s
-    sv = summary_view(res, elapsed, sent)
-    countdown = sv.verdict == 0 and not (res or {}).get("exitstatus")
+    acts = acts or Actions(app, res, sent, demo)
+    countdown = review is None and acts.view(elapsed).verdict == 0 and not (res or {}).get("exitstatus")
     drop_typeahead()                           # an Enter typed during the run/checks must not close it
     t0, keep, deadline = time.time(), not countdown, time.time() + 10
+    calm = t0 + 1.0                            # keys count from then on: late typeahead, the verdict read first
     while True:
         app.check_resize()
         left = None
@@ -2194,7 +2997,7 @@ def summary_screen(app, res, elapsed, demo=False, sent=None):
             left = max(0, deadline - time.time())
             if left <= 0:
                 return
-        draw_summary(app, sv, time.time() - t0, demo, left)
+        draw_summary(app, acts.view(elapsed, review), time.time() - t0, demo, left)
         app.draw_toast()
         s.flush()
         if select.select([0], [], [], PACE.interval)[0]:
@@ -2204,16 +3007,22 @@ def summary_screen(app, res, elapsed, demo=False, sent=None):
                 return
             if not data:
                 return
-            if time.time() - t0 < 1.0:            # late typeahead: the verdict must be readable first
+            if time.time() < calm:
                 continue
-            keys = parse_keys(data)
-            if "enter" in keys:
+            keys = [LATIN.get(k, k) for k in parse_keys(data)]
+            if "enter" in keys or (review is not None and ("esc" in keys or "q" in keys)):
                 return
             moves = [k for k in keys if k in ("left", "right")] if app.monitors > 1 else []
             for k in moves:
                 app.move_screen(k)
             if len(moves) < len(keys):        # any other key keeps the window open
                 keep = True
+            for k in keys:
+                if acts.press(k):              # it went to the plain terminal and back: what was typed meanwhile
+                    calm = time.time() + 1.0   # is no answer here
+                    break
+            if not engine.TERM_OK:
+                return
 
 
 # ───────────────────────────── self-test ─────────────────────────────
@@ -2224,8 +3033,13 @@ def self_test():
     that cannot draw itself never goes live."""
     global save_ui_state
     save_ui_state = lambda **kw: None          # noqa: E731 — the user's ui.json is never touched
-    for name in ("set_consent", "after_update", "queue", "start_sender", "send_pending"):
-        setattr(report, name, lambda *a, **kw: None)     # nor the reports' settings.json and outbox
+    for name in ("set_consent", "set_option", "after_update", "queue", "start_sender", "send_pending", "send_now",
+                 "delete_local", "ensure_id"):
+        setattr(report, name, lambda *a, **kw: None)     # nor the reports' settings.json, outbox and journals
+    for name in ("mark_resolved", "recheck_boot", "services_restarted", "save_summary", "journal_event"):
+        setattr(engine, name, lambda *a, **kw: None)     # nor an update's summary or journal
+    # What R would run, made up here: the self-test asks no display manager and runs nothing.
+    engine.services_command = lambda names: ["sudo", "systemctl", "restart", "--", *names] if names else []
     Screen.write = lambda self, s: None
     app = App(live=False)
     app.repo = [("linux", "6.18.1-1", "6.18.2-1"), ("mesa", "1:26.2.5-1", "1:26.2.6-1")] + \
@@ -2243,6 +3057,38 @@ def self_test():
            "ok": ["/boot в порядке"], "log": os.path.join(engine.STATE_DIR, "logs", "x.log")}
     full = dict(res, problems=[f"проблема {i}: " + "длинное описание " * 6 for i in range(4)],     # more rows
                 warnings=[f"предупреждение {i}" for i in range(6)], ok=[f"проверка {i} прошла" for i in range(8)])
+    # An update that left services waiting and a broken initramfs (all three keys), with notes; the same one
+    # read back as the menu's warning about it.
+    boot = [{"kind": "image", "pkg": "linux", "path": "/boot/initramfs-linux.img", "how": "missing",
+             "text": "нет /boot/initramfs-linux.img — НЕ перезагружайся, система не загрузится"}]
+    keyed = dict(res, problems=[boot[0]["text"]], boot=boot, warnings=["сервисы ждут перезапуска: cups, sshd"],
+                 notes=["обновилось ядро — перезагрузись, когда будет удобно (обновились: linux)",
+                        ".pacnew от прошлых обновлений: 2 — посмотреть: pacdiff -o"],
+                 services={"waiting": ["cups.service", "sshd.service"]}, began="2026-11-02T12:50:12",
+                 ended="2026-11-02T12:57:55")
+    keyed_full = dict(full, boot=boot, services={"waiting": ["cups.service"]}, notes=["заметка " * 12] * 3)
+    banners = [dict(keyed, problems=["в выводе: «error: command failed to execute correctly»"] + keyed["problems"]),
+               dict(keyed, problems=["не исправлено после обновления в 12:34: " + "очень длинное описание " * 8]),
+               dict(keyed, boot=[], problems=["arch-update завершился с кодом 1"], log=None)]
+    statuses = [None, Status("отправляю отчёт…", DIM), Status("отчёт отправлен разработчику (№ 12)", GOOD),
+                Status("сервер просит подождать — попробуй позже: до 6 отчётов в час с компьютера", WARN),
+                Status("не перезапустились сервисы: cups — посмотри: systemctl status cups.service " * 2, WARN),
+                Status("НЕ перезагружайся: всё ещё нет /boot/initramfs-linux.img", BAD)]
+    updates = [{"log": "/x/2026-11-03_12-50-12.log", "time": "2026-11-03T12:50:12", "verdict": 2, "started": True,
+                "packages": 27, "problems": [boot[0]["text"]], "warnings": [], "notes": [], "sent": "",
+                "issue": None, "waiting": False},
+               {"log": "/x/2026-11-02_12-59-25.log", "time": "2026-11-02T12:59:25", "verdict": 1, "started": True,
+                "packages": 1, "problems": [], "warnings": ["предупреждение " * 12], "notes": [],
+                "sent": "2026-11-02T13:00:00", "issue": 12345, "waiting": False},
+               {"log": "/x/2026-10-31_17-42-38.log", "time": "2026-10-31T17:42:38", "verdict": 0, "started": True,
+                "packages": 3, "problems": [], "warnings": [], "notes": ["заметка"], "sent": "", "issue": None,
+                "waiting": True},
+               {"log": "/x/2026-10-30_10-00-00.log", "time": "2026-10-30T10:00:00", "verdict": None,
+                "started": True, "packages": 0, "problems": [], "warnings": [], "notes": [], "sent": "",
+                "issue": None, "waiting": False},
+               {"log": "/x/2026-10-29_10-00-00.log", "time": "2026-10-29T10:00:00", "verdict": 2, "started": False,
+                "packages": 0, "problems": ["/boot не смонтирован"], "warnings": [], "notes": [],
+                "sent": "2026-10-29T10:01:00", "issue": None, "waiting": False, "resolved": True}]
     # The settings with what report.status() and report.preview() can give, made up here: the
     # self-test reads and writes none of the real ones.
     states = [dict(REPORTS_UNDECIDED), dict(REPORTS_UNDECIDED, decided=True),
@@ -2275,13 +3121,29 @@ def self_test():
             draw()
             c.rows()
             c.clear()
+
+        def bottom(draw, above=h - 2):
+            """The lowest row above the footer (or the given row) a screen's own content reaches: the stars and
+            the toast left out."""
+            BACKDROP.draw, toast, app.toast_text = (lambda *a, **kw: None), app.toast_text, ""
+            try:
+                draw()
+                return max((y for y in range(above) if "".join(c.ch[y]).strip()), default=0)
+            finally:
+                del BACKDROP.draw
+                app.toast_text = toast
+                c.clear()
         app.state, app.confirm = "splash", None
         for age in (0.0, 1.3, 3.0, 20.0):
             app.t0 = time.time() - age
             shot(app.draw_splash)
         app.state, app.menu_t, app.from_splash = "menu", time.time() - 5, True
-        if app.menu_layout().total > h - 4:     # every item and warning, a free row above the footer
-            raise RuntimeError(f"the menu does not fit into {w}x{h}")
+        for bad in [None] + banners:            # with the warning about the last update, in one row or two
+            app.bad = Actions(app, bad) if bad else None
+            if app.menu_layout().total > h - 4:     # every item and warning, a free row above the footer
+                raise RuntimeError(f"the menu does not fit into {w}x{h}" + (" with the warning" if bad else ""))
+            app.menu_sel = len(app.menu_items()) - 3
+            shot(app.draw_menu)
         for st in states:
             app.rep, app.menu_sel = st, len(app.menu_items()) - 2
             shot(app.draw_menu)
@@ -2290,25 +3152,43 @@ def self_test():
         shot(app.draw_menu)
         app.confirm = time.time()
         shot(app.draw_menu)
-        app.confirm, app.state = None, "settings"
-        for st in states:
-            app.rep = st
-            for i in range(len(SETTINGS_ITEMS)):
+        app.confirm, app.state, app.bad = None, "settings", None
+        for st in states:                       # what the reports' state says, under their switch
+            app.rep, app.set_sel = st, 0
+            shot(app.draw_settings)
+        for on in (False, True):                # every other item chosen, the services' switch either way
+            app.services_on = on
+            for i in range(1, len(SETTINGS_ITEMS)):
                 app.set_sel = i
                 shot(app.draw_settings)
         app.rep = states[4]                     # the longest status line, two rows
-        app.draw_settings()
-        last = max((y for y in range(h) if "Назад" in "".join(c.ch[y])), default=h)
-        c.clear()
-        if last >= h - 4:                       # the toast's row, or below
-            raise RuntimeError(f"the settings do not fit into {w}x{h}")
-        app.pv_open, app.pv_data = True, None
+        for i in range(len(SETTINGS_ITEMS)):    # every description ends above the toast's row
+            app.set_sel = i
+            if bottom(app.draw_settings) >= h - 4:
+                raise RuntimeError(f"the settings do not fit into {w}x{h} ({SETTINGS_ITEMS[i][0]})")
+        app.pv = Reader(None, start=False)
         shot(app.draw_settings)                 # still being put together
-        app.pv_data = (app.pv_gen, preview_source(preview))
+        app.pv.src = preview_source(preview)
         for scroll in (0, 40, 1 << 30):
-            app.pv_scroll = scroll
+            app.pv.scroll = scroll
             shot(app.draw_settings)
-        app.pv_open, app.state, app.article = False, "news", None
+        app.pv, app.state = None, "updates"
+        for got in (None, [], updates):         # being read, none yet, five
+            app.up_list = got
+            for sel in (0, 2, 4):
+                app.up_sel = sel
+                shot(app.draw_updates)
+        app.up_del, app.up_sel = (updates[4]["log"], time.time()), 4      # the last one chosen, a D pressed
+        if bottom(app.draw_updates) >= h - 4:
+            raise RuntimeError(f"the last updates do not fit into {w}x{h}")
+        shot(app.draw_updates)
+        app.up_del, app.up_reader = None, Reader(None, start=False)
+        shot(app.draw_updates)                  # its report still being put together
+        app.up_reader.src = preview_source(json.loads(preview))
+        for scroll in (0, 1 << 30):
+            app.up_reader.scroll = scroll
+            shot(app.draw_updates)
+        app.up_reader, app.state, app.article = None, "news", None
         shot(app.draw_news)
         app.article, app.scroll = app.news[0], 3
         shot(app.draw_news)
@@ -2344,6 +3224,18 @@ def self_test():
                 shot(lambda: draw_summary(app, summary_view(r, 125, sent), 2.0, False, 7.5))
         shot(lambda: draw_summary(app, summary_view(res, 125, building), 2.0, False, 7.5))
 
+        for r in (keyed, keyed_full):           # its keys, the notes, what came of a key; and opened from the menu
+            acts = Actions(app, r)
+            if len(acts.keys()) != 3:
+                raise RuntimeError(f"the summary offers {len(acts.keys())} of its 3 keys")
+            for st in statuses:
+                acts.status = st
+                shot(lambda: draw_summary(app, acts.view(463), 2.0, False, None))
+                shot(lambda: draw_summary(app, acts.view(seconds_of(r), review="02.11 12:50"), 2.0, False, None))
+            acts.sent = sent                    # queued by itself: no S
+            shot(lambda: draw_summary(app, acts.view(463), 2.0, False, 7.5))
+            shot(lambda: draw_summary(app, acts.view(463), 2.0, True, None))
+
         def items(sv):
             draw_summary(app, sv, 2.0, False, 7.5)
             n = sum(ch in "✗⚠✓" for row in c.ch for ch in row)
@@ -2351,6 +3243,12 @@ def self_test():
             return n
         if items(summary_view(full, 125, sent)) < items(summary_view(full, 125)):
             raise RuntimeError(f"the summary's report line pushes a problem or a warning off at {w}x{h}")
+        acts = Actions(app, keyed_full)
+        acts.status = statuses[2]
+        if items(acts.view(125)) < items(summary_view(keyed_full, 125, keys=acts.keys())):
+            raise RuntimeError(f"the summary's status line pushes a problem or a warning off at {w}x{h}")
+        if bottom(lambda: draw_summary(app, acts.view(125), 2.0, False, 7.5), above=h - 3) >= h - 4:
+            raise RuntimeError(f"the summary runs into its keys at {w}x{h}")     # a blank row between them
     gate.set()
     building.finish()
     print("arch-update-ui: self-test ok")
@@ -2447,12 +3345,7 @@ def main():
                 summary_screen(app, res, elapsed, demo=DEMO, sent=sent)
     except Exception:
         tb = traceback.format_exc()
-        try:
-            os.makedirs(engine.STATE_DIR, exist_ok=True)
-            with open(os.path.join(engine.STATE_DIR, "ui-error.log"), "a") as f:
-                f.write(time.strftime("\n== %F %T ==\n") + tb)
-        except OSError:
-            pass
+        note_ui_error(tb)
         if app:
             app.s.leave()
         try:
@@ -2466,6 +3359,8 @@ def main():
                 print("✗", p)
             for w in res["warnings"]:
                 print("⚠", w)
+            for n in res.get("notes") or []:
+                print("·", n)
             print("✓ проблем не найдено" if not res["problems"] else "НЕ перезагружайся, пока не разберёмся")
             print("журнал:", res["log"])
         # Nothing has run yet (and this is not the demo, which must never touch the system):
