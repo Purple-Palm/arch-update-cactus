@@ -5,7 +5,10 @@ The logic lives in lib/engine.py next to this program (shared with the
 full-screen arch-update-ui). Risky or unrecognised questions are handed back to
 you (bell + notification); Ctrl+] switches to manual mode. Closing the window
 never interrupts pacman. Every run is logged to
-~/.local/state/arch-update-auto/logs/ (latest.log = newest).
+~/.local/state/arch-update-auto/logs/ (latest.log = newest). With
+"restart_services" on in settings.json (Arch-Update → Настройки) the services
+safe to restart are restarted when arch-update asks; the summary prints the
+commands for what is left (services waiting, fixes before a reboot).
 
 It takes no arguments and has no demo (that is arch-update-ui --demo): given any
 argument it refuses and runs nothing, the real update least of all.
@@ -20,6 +23,7 @@ Environment:
 """
 import os
 import select
+import shlex
 import shutil
 import signal
 import sys
@@ -53,12 +57,23 @@ def print_summary(res):
         say(f"✗ {p}\n", C_RED)
     for w in res["warnings"]:
         say(f"⚠ {w}\n", C_YEL)
+    for n in res.get("notes") or []:          # not this update's problem, or nothing to do now
+        say(f"· {n}\n", C_DIM)
     if res.get("head"):
         say(f"{res['head']}.\n", C_YEL)
     elif res["verdict"] == 0:
-        say("✓ Всё прошло чисто, перезагрузка не нужна.\n", C_GRN)
+        say("✓ Всё прошло чисто — перезагрузись, когда будет удобно.\n" if res.get("reboot") else
+            "✓ Всё прошло чисто, перезагрузка не нужна.\n", C_GRN)
     elif res["verdict"] == 1:
         say("✓ Обновление прошло нормально.\n", C_GRN)
+    fixes = res.get("fixes") or []
+    if fixes:
+        say("Исправить до перезагрузки — по порядку, в терминале:\n", C_BOLD)
+        for fix in fixes:
+            say(f"  {shlex.join(fix['argv'])}   # {fix['label']}\n", "")
+    waiting = engine.services_command((res.get("services") or {}).get("waiting") or [])
+    if waiting:
+        say(f"Перезапустить сервисы сейчас: {shlex.join(waiting)}\n", "")
     say(f"Журнал: {res['log']}\n", C_DIM)
 
 
