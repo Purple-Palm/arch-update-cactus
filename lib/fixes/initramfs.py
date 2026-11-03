@@ -10,14 +10,16 @@ fix reinstalls in this same run: pacman's own hook builds its images then (and w
 cannot).
 
 Kept first: every image and UKI of the preset (in /tmp, room checked first), and the "<image>.tmp" mkinitcpio
-writes first when it guesses there is room for it and leaves behind when the build fails (kept as missing: it goes
-first on a rollback, so that its room is there for the copies). An image that is no good anyway (missing modules,
-cut short, for another kernel) is removed before the build (its copy is kept): mkinitcpio then writes the new one
-in its place with all the room there is — on a small /boot the old one without modules, 13 MB, and the new one, 24
-MB, do not fit side by side. Verified: mkinitcpio ended well and said nothing of errors, and every image is there,
-built for its kernel and with that kernel's module list in it (lsinitcpio); every UKI is there. Otherwise all of
-them back as they were, each checked against its copy; when a file system ran out of room for the build, the fix
-says which one."""
+writes first when it guesses there is room for it and leaves behind when the build fails: kept as missing whatever
+is there (it goes first on a rollback, so that its room is there for the copies, and a stale one never comes back).
+A stale one (a build that failed before: by hand, in an update's hook, in F's kernel reinstall) is removed before the
+build, said: mkinitcpio only ever writes that file and renames it when the build went well, and on a small /boot it
+holds the room the new image needs. So is an image that is no good anyway (missing modules, cut short, for another
+kernel; its copy is kept): mkinitcpio then writes the new one in its place with all the room there is — on a small
+/boot the old one without modules, 13 MB, and the new one, 24 MB, do not fit side by side. Verified: mkinitcpio ended
+well and said nothing of errors, and every image is there, built for its kernel and with that kernel's module list
+in it (lsinitcpio); every UKI is there. Otherwise all of them back as they were, each checked against its copy; when
+a file system ran out of room for the build, the fix says which one (ran_full)."""
 
 import glob
 import os
@@ -70,20 +72,21 @@ def plan(ctx):
 SCRIPT = r"""
 # initramfs p:<preset>… i:<image spec>… u:<unified kernel image>…
 initramfs_backup() {
-    local a f files=()
+    local a files=() tmps=()
     for a; do
         case $a in
-            i:*) f=${a#i:*:*:} ;;
-            u:*) f=${a#u:} ;;
-            *) continue ;;
+            i:*) files+=("${a#i:*:*:}") ;;
+            u:*) files+=("${a#u:}") ;;
         esac
-        files+=("$f" "$f.tmp")
     done
-    room_for "${files[@]}" && keep "${files[@]}" && : >"$work/mkinitcpio.out"
+    mapfile -t tmps < <(tmps_of "$@")
+    room_for "${files[@]}" && keep "${files[@]}" && keep_missing "${tmps[@]}" && : >"$work/mkinitcpio.out"
 }
 initramfs_apply() {
     local a f p why out="$work/mkinitcpio.out"
-    # an image that is no good anyway goes first (its copy is kept): mkinitcpio then writes the new one in its
+    # what a build that failed before left (kept as missing) goes first: its room is what this one needs
+    drop_tmps "$@" || return 1
+    # an image that is no good anyway goes next (its copy is kept): mkinitcpio then writes the new one in its
     # place with all the room there is (it writes beside the old one while it guesses there is room for 1.25 times
     # the old one's size; a new one with modules is twice the size of an old one without). Never a UKI.
     for a; do
@@ -105,47 +108,15 @@ initramfs_apply() {
         # the first preset that failed ends it: no more images rebuilt on a disk that may be full
         if [ "${PIPESTATUS[0]}" -ne 0 ]; then
             bad "mkinitcpio -p $p закончил с ошибкой"
-            initramfs_full "$out" "$@"
+            ran_full 'для initramfs' "$out" "$@"
             return 1
         fi
         if grep -qiE "$INITCPIO_TROUBLE" "$out"; then
             bad "mkinitcpio сообщил об ошибках — с таким initramfs система может не загрузиться"
-            initramfs_full "$out" "$@"
+            ran_full 'для initramfs' "$out" "$@"
             return 1
         fi
     done
-}
-# initramfs_full <mkinitcpio's output> <specs…>: after a build that failed, whether a file system ran out of room for
-# it: the images' or mkinitcpio's build folder's (in /tmp). Looked at right away, before the copies give the room
-# back: under 1 MiB free there, or else the one "No space left on device" names (mkinitcpio removes its build folder
-# as it stops), or the one with the least room. Said, and noted with the fix (full:<mount point>).
-initramfs_full() {
-    local out=$1 a d m avail low='' lowest='' least='' dirs=()
-    shift
-    for a; do
-        case $a in
-            i:*) dirs+=("$(dirname -- "${a#i:*:*:}")") ;;
-            u:*) dirs+=("$(dirname -- "${a#u:}")") ;;
-        esac
-    done
-    dirs+=("${TMPDIR:-/tmp}")
-    for d in "${dirs[@]}"; do
-        avail=$(free_bytes "$d")
-        [ -n "$avail" ] || continue
-        if [ "$avail" -lt 1048576 ]; then low=$d; break; fi
-        if [ -z "$least" ] || [ "$avail" -lt "$least" ]; then least=$avail lowest=$d; fi
-    done
-    if [ -z "$low" ] && grep -qi 'No space left on device' "$out"; then
-        for d in "${dirs[@]}"; do
-            if grep -i 'No space left on device' "$out" | grep -qF -- "$d/"; then low=$d; break; fi
-        done
-        low=${low:-$lowest}
-    fi
-    [ -n "$low" ] || return 0
-    m=$(stat -c %m -- "$low" 2>/dev/null) || m=$low
-    avail=$(free_bytes "$low")
-    bad "на $m не хватило места для initramfs: свободно $(size "${avail:-0}")"
-    case $m in /*[[:space:]]*|'') ;; /*) note_extra="${note_extra:+$note_extra }full:$m" ;; esac
 }
 initramfs_verify() {
     local a ok=0

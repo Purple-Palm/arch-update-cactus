@@ -7,8 +7,12 @@ and mkinitcpio need room to write). Only while / really has less free than wante
 an AUR build, a /boot partition) is not freed by this, and nothing is deleted for nothing.
 
 Two amounts: what is wanted (the update's need, or 2 GiB after a disk that ran full) and the least the fixes after
-this one need to work (LOW). Ending above the least but below the wanted is "partial": the fixes after it still
-run (an unbootable machine is mended first), and the owner is told the update needs more room.
+this one need to work: LOW (512 MiB) when one of them writes much to /: a kernel reinstall (pacman -U writes the
+package there, and a snapshot keeps the files it replaces), a DKMS build (under /var/lib/dkms), an initramfs rebuilt
+onto the root file system; else FEW (64 MiB): the module lists depmod writes, an initramfs on a /boot of its own
+(mkinitcpio builds in /tmp, and the fix checks the room for its copies itself), a mount or a signature need next to
+nothing on /. Ending above the least but below the wanted is "partial": the fixes after it still run (an
+unbootable machine is mended first), and the owner is told the update needs more room.
 
 What, in order, each step only while there is still too little room (and none at all when there is enough from
 the start):
@@ -29,14 +33,17 @@ Nothing to put back: what goes is caches, old journal entries and, if the user a
 the free space it leaves; when that is too little, it lists what else takes room on this machine.
 """
 
+import os
 import shutil
 
 import engine
 from fixes import GIB, fix
 
 KEY = "space"
-LOW = 512 * 2 ** 20          # below this free on / the other fixes get this one first; and the least they need
+LOW = 512 * 2 ** 20          # below this free on / the other fixes get this one first; the least the heavy ones need
+FEW = 64 * 2 ** 20           # the least the others need (depmod's lists, a /boot of its own, mount, sbctl)
 AFTER_FULL = 2 * GIB         # wanted free after the disk ran full during an update
+HEAVY = ("kernel", "dkms")   # fixes that write much to / whatever the machine (pacman -U, a DKMS build)
 
 
 def plan(ctx):
@@ -59,13 +66,57 @@ def plan(ctx):
 
 
 def finish(ctx):
-    """After all fixes are planned: the least this one has to leave is what the fixes after it need (LOW), or the
-    whole amount wanted when it is the only one (room for the update)."""
+    """After all fixes are planned: the least this one has to leave is what the fixes after it need (least()), or
+    the whole amount wanted when it is the only one (room for the update)."""
     for f in ctx.planned:
         if f["key"] == KEY and len(f["args"]) == 1:
             want = int(f["args"][0])
-            alone = all(g["key"] == KEY for g in ctx.planned)
-            f["args"].append(str(want if alone else min(want, LOW)))
+            others = [g for g in ctx.planned if g["key"] != KEY]
+            f["args"].append(str(min(want, least(others)) if others else want))
+
+
+def least(fixes):
+    """What the fixes after this one need free on / at the least: LOW when one of them writes much there (HEAVY, or
+    an initramfs fix whose image or UKI is on the root file system, and not under a partition a mount fix before it
+    puts there), else FEW. A least that is too high leaves an unbootable machine unmended for want of room it would
+    not use; one too low is caught all the same: each fix checks the room for its copies and puts everything back
+    when it runs out."""
+    mounted = [t for f in fixes if f["key"] == "mount" for t in f["args"]]
+    for f in fixes:
+        if f["key"] in HEAVY:
+            return LOW
+        if f["key"] == "initramfs" and any(on_root(p) and not any(p.startswith(t.rstrip("/") + "/") for t in mounted)
+                                           for p in boot_files(f["args"])):
+            return LOW
+    return FEW
+
+
+def boot_files(args):
+    """The images and UKIs an initramfs fix's arguments name (i:<kver>:<0|1>:<image>, u:<UKI>)."""
+    out = []
+    for a in args:
+        if a.startswith("i:") and a.count(":") >= 3:
+            out.append(a.split(":", 3)[3])
+        elif a.startswith("u:"):
+            out.append(a[2:])
+    return out
+
+
+def on_root(path):
+    """Whether that file (or, while it is not there, or this user may not look into its folder, the nearest folder
+    of it that can be looked at) is on the root file system; True when there is no telling (LOW then, as before)."""
+    try:
+        root = os.stat("/").st_dev
+    except OSError:
+        return True
+    p = path if isinstance(path, str) and path.startswith("/") else "/"
+    while True:
+        try:
+            return os.stat(p).st_dev == root
+        except OSError:
+            if p == "/":
+                return True
+            p = os.path.dirname(p)
 
 
 def free(path="/"):

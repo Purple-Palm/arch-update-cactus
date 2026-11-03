@@ -64,7 +64,7 @@ def mount_point(path):
 
 # mkinitcpio -p <preset>: writes the images in $T/images-<preset> (else $IMAGES) as $T/mode-mkinitcpio-<preset> (else
 # $T/mode-mkinitcpio, else good) says; notes each call ($T/mkinitcpio-calls), the images and UKIs there when it began
-# ($T/existed) and its umask
+# ($T/existed), the "<image>.tmp" there then ($T/tmp-existed) and its umask
 MKINITCPIO = r'''
 p=$2
 echo "$p" >>"$T/mkinitcpio-calls"
@@ -75,8 +75,14 @@ images=$(cat "$T/images-$p" 2>/dev/null || echo "$IMAGES")
 listing=$(cat "$T/good-listing-$p" 2>/dev/null || cat "$T/good-listing")
 for f in $images $(cat "$T/ukis" 2>/dev/null); do
     if [ -e "$f" ]; then echo "$f" >>"$T/existed"; fi
+    if [ -e "$f.tmp" ]; then echo "$f.tmp" >>"$T/tmp-existed"; fi
 done
-for f in $(cat "$T/ukis" 2>/dev/null); do printf 'UKI-NEW\n' >"$f"; done
+for f in $(cat "$T/ukis" 2>/dev/null); do
+    if [ "$mode" = objcopyfull ]; then        # objcopy: the old UKI unlinked, the new one cut off and unlinked too
+        rm -f "$f"; echo "objcopy: $f[.linux]: No space left on device"; exit 1
+    fi
+    printf 'UKI-NEW\n' >"$f"
+done
 for f in $images; do
     case $mode in
         good) printf 'NEW\n%s' "$listing" >"$f" ;;
@@ -86,6 +92,9 @@ for f in $images; do
         fullboot) printf 'NEW-PARTIAL' >"$f.tmp"; printf 'HALF' >"$f"
                   echo "zstd: error 70 : Write error : cannot write block : No space left on device"
                   echo "==> ERROR: Initcpio image generation FAILED: 'zstd' reported an error"; exit 1 ;;
+        inplace) printf 'HALF' >"$f"            # no room beside it guessed: written in place, and cut off
+                 echo "zstd: error 70 : Write error : cannot write block : No space left on device"
+                 echo "==> ERROR: Initcpio image generation FAILED: 'zstd' reported an error"; exit 1 ;;
         tmpfull) echo "cp: error writing '$TMPDIR/mkinitcpio.Ab12Cd/root/usr/lib/libc.so.6': No space left on device"
                  echo "==> ERROR: Initcpio image generation FAILED"; exit 1 ;;
         slow) sleep 2; printf 'NEW\n%s' "$listing" >"$f" ;;
@@ -370,6 +379,63 @@ class Runner(unittest.TestCase):
         self.assertEqual(status, fixes.ROLLED_BACK, out)
         self.assertEqual(results.full, [mount_point(build)])
 
+    def test_room_a_writer_gave_back_is_not_called_free(self):
+        """objcopy ran out of room for a bigger UKI on /boot and unlinked what it had written: when the fix looks,
+        the old UKI's room is free again. It says /boot ran full, without "свободно 39 МБ" beside it (that
+        contradicts itself); the figure only when it was measured under 1 MiB."""
+        uki = os.path.join(self.boot, "arch-linux.efi")
+        write(uki, "UKI-OLD\n", 0o644)
+        before = digest(uki)
+        write(os.path.join(self.t, "ukis"), uki, 0o644)
+        write(os.path.join(self.t, "mode-mkinitcpio"), "objcopyfull", 0o644)
+        self.df_stub(f"echo {41 * 2 ** 20}")
+        status, out, results = self.run_fixes(("initramfs@linux", ["p:linux", self.image_spec(), f"u:{uki}"]))
+        self.assertEqual(status, fixes.ROLLED_BACK, out)
+        where = mount_point(self.boot)
+        self.assertEqual(results.full, [where])
+        said = [line.strip() for line in engine.ANSI.sub("", out).splitlines() if "не хватило места" in line]
+        self.assertEqual(said, [f"✗ на {where} не хватило места для initramfs"])
+        self.assertEqual(digest(uki), before)
+
+    def test_a_stale_tmp_goes_before_the_build_and_never_comes_back(self):
+        """What a build that failed before left ("<image>.tmp": by hand, in an update's hook, in F's own kernel
+        reinstall) holds room and nothing else: mkinitcpio only ever writes that file and renames it when the build
+        went well. It goes before the build (said), and a rollback never brings it back."""
+        stale = self.image + ".tmp"
+        for mode, want in (("good", fixes.OK), ("nomodules", fixes.ROLLED_BACK)):
+            write(self.image, "OLD\n" + listing(), 0o600)
+            before = digest(self.image)
+            write(stale, "STALE-PARTIAL\n" * 1000, 0o600)
+            write(os.path.join(self.t, "mode-mkinitcpio"), mode, 0o644)
+            status, out, results = self.run_fixes(("initramfs@linux", ["p:linux", self.image_spec()]))
+            self.assertEqual(status, want, out)
+            self.assertIn(f"Убираю {stale}: его оставил mkinitcpio, который не дописал образ", out)
+            self.assertFalse(os.path.exists(os.path.join(self.t, "tmp-existed")), mode)  # gone when mkinitcpio began
+            self.assertFalse(os.path.exists(stale), mode)
+            if want == fixes.ROLLED_BACK:
+                self.assertEqual(digest(self.image), before)
+                self.assertIn("сверил с копиями", out)
+            self.assertEqual(self.leftovers(), [])
+
+    def test_a_stale_tmp_that_cannot_go_is_no_failed_rollback(self):
+        """A leftover that cannot be removed (the ESP remounted read-only after errors): the fix stops before it
+        changes anything, and the rollback says so in a line; nothing booting needs that file, so it is not "could
+        not put everything back" (НЕ перезагружайся, copies kept) on a machine left exactly as it was."""
+        if os.geteuid() == 0:
+            self.skipTest("root removes files from a read-only folder")
+        stale = self.image + ".tmp"
+        write(stale, "STALE-PARTIAL\n", 0o600)
+        before = digest(self.image), digest(stale)
+        os.chmod(self.boot, 0o555)
+        status, out, results = self.run_fixes(("initramfs@linux", ["p:linux", self.image_spec()]))
+        os.chmod(self.boot, 0o755)
+        self.assertEqual((status, results), (fixes.ROLLED_BACK, [("initramfs@linux", "rolledback")]), out)
+        self.assertIn(f"не смог убрать {stale} — для загрузки он не нужен, но занимает место", out)
+        self.assertNotIn("НЕ перезагружайся", out)
+        self.assertFalse(os.path.exists(os.path.join(self.t, "mkinitcpio-calls")))
+        self.assertEqual((digest(self.image), digest(stale)), before)
+        self.assertEqual(self.leftovers(), [])
+
     def test_no_room_for_copies_changes_nothing(self):
         before = digest(self.image)
         self.stub("df", 'printf "Avail\\n1024\\n"\n')
@@ -434,6 +500,39 @@ class Runner(unittest.TestCase):
         self.assertIn(f"sudo cp -- {kept}/0 {self.image}", out)
         self.assertTrue(read(os.path.join(kept, "0")).startswith("OLD"))
         shutil.rmtree(kept)
+
+    def test_a_good_image_cut_in_place_on_a_full_boot_comes_back(self):
+        """A /boot with under 1 MiB free (the state after it ran full) and a good image that the build rewrote in
+        place, bigger, and cut short (mkinitcpio writes in place when it guesses there is no room beside it; sbctl
+        signs in place): the cut file holds all the room the image had. The copy goes back in its place when the room
+        then free is its size in whole blocks of that file system and one block more (an ext4 extent block) — not
+        its size and 1 MiB more, which left the cut image there and the only good one in /tmp."""
+        write(self.image, "OLD\n" + listing() + "x" * 100_000 + "\n", 0o600)
+        good = read(self.image)
+        size = os.path.getsize(self.image)
+        bs = os.statvfs(self.boot).f_frsize
+        need = -(-size // bs) * bs + bs
+        self.assertLess(need, size + 2 ** 20)
+        write(os.path.join(self.t, "mode-mkinitcpio"), "inplace", 0o644)
+        self.cp_stub('[[ $dst == *.arch-update-new ]]')        # no room beside it
+        for left, want in ((need, fixes.ROLLED_BACK), (size + 2 ** 20 - 1, fixes.ROLLED_BACK),
+                           (need - bs, fixes.ROLLBACK_FAILED)):
+            write(self.image, good, 0o600)
+            # free on /boot: what is left once the file the build cut short is gone, less that file's blocks
+            self.df_stub(f'echo $(( {left} - $(stat -c %b "$IMAGES") * $(stat -c %B "$IMAGES") ))')
+            status, out, results = self.run_fixes(("initramfs@linux", ["p:linux", self.image_spec()]))
+            self.assertEqual(status, want, (left, out))
+            if want == fixes.ROLLED_BACK:
+                self.assertEqual(read(self.image), good, left)
+                self.assertEqual(mode_of(self.image), 0o600)
+                self.assertIn("сверил с копиями", out)
+                self.assertEqual(self.leftovers(), [])
+            else:                               # one block short: the cut file stays, the copy and the way back too
+                self.assertEqual(read(self.image), "HALF")
+                self.assertIn(f"нет места, чтобы вернуть {self.image}", out)
+                self.assertIn("— не хватает 4 КБ" if bs == 4096 else "— не хватает", out)
+                self.assertIn(f"sudo cp -- {results.kept}/0 {self.image}", out)
+                shutil.rmtree(results.kept)
 
     def test_ctrl_c_does_not_cut_a_fix_off(self):
         import pexpect
@@ -595,6 +694,142 @@ class Runner(unittest.TestCase):
         self.assertEqual(fixes.outcome(status, results, plan),
                          ("incomplete", "«переустановить ядро linux»: файл ядра на месте, но хук pacman закончился с "
                                         "ошибкой — загрузка может не пройти"))
+
+    def own_kernel(self):
+        """The package's own kernel (/usr/lib/modules/<version>/vmlinuz, what pacman's hook copies to /boot): its
+        v: spec."""
+        self.vmlinuz = os.path.join(self.t, "modules", KVER, "vmlinuz")
+        write(self.vmlinuz, "KERNEL-PKG\n" + "k" * 40_000, 0o644)
+        return f"v:{self.vmlinuz}"
+
+    def test_a_kernel_file_counts_only_whole(self):
+        """The kernel file is back only when it is not shorter than the package's own kernel: pacman's hook copies
+        that file, and on a /boot with less room than the kernel GNU install leaves the part it wrote ("No space left
+        on device"): that is no kernel, and the fix that left it did not work — put back, the kernel file missing
+        again (not "incomplete", which keeps it and calls it there). sbctl signs the kernel in place and makes it
+        larger: that one is whole (never compared byte for byte)."""
+        v = self.own_kernel()
+        g = self.kernel_log()
+        args = ["r:linux", g, v, f"k:{self.kernel}", self.image_spec()]
+        hook = PACLOG + ('log "[ALPM] transaction started"\nlog "[ALPM] transaction completed"\n'
+                         'log "[ALPM] running \'90-mkinitcpio-install.hook\'..."\n')
+        # signed in place by sbctl's hook: larger than the package's, and whole
+        os.remove(self.kernel)
+        self.stub("pacman", hook + f'cat "{self.vmlinuz}" >"{self.kernel}"\n'
+                                   f'printf "NEW\\n%s" "$(cat "$T/good-listing")" >"{self.image}"\n'
+                                   'log "[ALPM] running \'zz-sbctl.hook\'..."\n'
+                                   f'printf "SIGNATURE" >>"{self.kernel}"\n')
+        status, out, results = self.run_fixes(("kernel@linux", args))
+        self.assertEqual((status, results), (fixes.OK, [("kernel@linux", "ok")]), out)
+        self.assertEqual(read(self.kernel), read(self.vmlinuz) + "SIGNATURE")
+        # cut short on a full /boot: the hook stopped there (set -e), mkinitcpio never ran
+        os.remove(self.kernel)
+        write(self.image, "OLD\n" + listing(), 0o600)
+        before = digest(self.image)
+        self.df_stub("echo 0")
+        self.stub("pacman", hook + f'head -c 20000 "{self.vmlinuz}" >"{self.kernel}"\n'
+                                   f'log "[ALPM-SCRIPTLET] install: error writing \'{self.kernel}\': No space left on '
+                                   'device"\necho "error: command failed to execute correctly" >&2\n')
+        plan = [fixes.fix("kernel", "переустановить ядро linux", ["sudo"], [], scope="linux")]
+        status, out, results = self.run_fixes(("kernel@linux", args))
+        self.assertEqual((status, results), (fixes.ROLLED_BACK, [("kernel@linux", "rolledback")]), out)
+        self.assertIn(f"{self.kernel} обрезан: 19 КБ из 39 КБ", out)
+        self.assertNotIn("файл ядра на месте", out)
+        self.assertFalse(os.path.exists(self.kernel))                 # missing again, as it was: still a problem
+        self.assertEqual(digest(self.image), before)
+        where = mount_point(self.boot)
+        self.assertEqual(results.full, [where])                       # the UI names /boot, not pacman's cache
+        self.assertIn(f"на {where} не хватило места: свободно 0 КБ", out)
+        self.assertEqual(fixes.outcome(status, results, plan),
+                         ("rolledback", f"«переустановить ядро linux» не помогло: на {where} не хватило места — "
+                                        "вернул всё как было"))
+        # cut short with nothing said at all: the check after it finds it
+        self.stub("pacman", hook + f'head -c 100 "{self.vmlinuz}" >"{self.kernel}"\n')
+        status, out, results = self.run_fixes(("kernel@linux", args))
+        self.assertEqual((status, results), (fixes.ROLLED_BACK, [("kernel@linux", "rolledback")]), out)
+        self.assertIn(f"{self.kernel} обрезан", out)
+        self.assertFalse(os.path.exists(self.kernel))
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_kernel_back_whose_image_ran_out_of_room_leaves_no_tmp_behind(self):
+        """The kernel file came back whole, but /boot ran out while the hook's mkinitcpio wrote "<image>.tmp": not
+        put back (that would take the kernel away again), so what mkinitcpio left goes (it would hold the room the
+        next build needs: the next F could never succeed), never the kernel file; and which file system ran full is
+        said and noted, measured before that room came back."""
+        v = self.own_kernel()
+        g = self.kernel_log()
+        os.remove(self.kernel)
+        before = digest(self.image)
+        tmp = self.image + ".tmp"
+        self.df_stub(f'if [ -e "{tmp}" ]; then echo 0; else echo 99999999999; fi')
+        self.stub("pacman", PACLOG + f'log "[ALPM] transaction started"\ncat "{self.vmlinuz}" >"{self.kernel}"\n'
+                                     'log "[ALPM] transaction completed"\n'
+                                     'log "[ALPM] running \'90-mkinitcpio-install.hook\'..."\n'
+                                     f'printf "NEW-PARTIAL" >"{tmp}"\n'
+                                     'log "[ALPM-SCRIPTLET] zstd: error 70 : Write error : cannot write block : No '
+                                     'space left on device"\n'
+                                     'log "[ALPM-SCRIPTLET] ==> ERROR: Initcpio image generation FAILED: \'zstd\' '
+                                     'reported an error"\n'
+                                     'echo "error: command failed to execute correctly" >&2\n')
+        status, out, results = self.run_fixes(("kernel@linux", ["r:linux", g, v, f"k:{self.kernel}",
+                                                                self.image_spec()]))
+        self.assertEqual((status, results), (fixes.INCOMPLETE, [("kernel@linux", "incomplete")]), out)
+        self.assertEqual(read(self.kernel), read(self.vmlinuz))
+        self.assertFalse(os.path.exists(tmp))
+        self.assertIn(f"Убираю {tmp}: его оставил mkinitcpio, который не дописал образ", out)
+        self.assertEqual(digest(self.image), before)
+        where = mount_point(self.boot)
+        self.assertEqual(results.full, [where])
+        self.assertIn(f"на {where} не хватило места: свободно 0 КБ", out)
+        self.assertLess(out.index("не хватило места"), out.index("Убираю"))   # measured before it was given back
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_full_root_is_not_blamed_on_boot(self):
+        """The ENOSPC came from pacman's depmod hook, writing the module lists on /: the file system named is the
+        one of the path that line names, not /boot because it has the least room of the boot files' folders (that
+        would send the owner to clean /boot while / is full)."""
+        v = self.own_kernel()
+        g = self.kernel_log()
+        os.remove(self.kernel)
+        self.df_stub(f"echo {50 * 2 ** 20}")                          # /boot: 50 MB free, its own file system
+        self.stub("stat", f'if [ "$1" = -c ] && [ "$2" = %m ]; then\n    for last; do :; done\n'
+                          '    case $last in "$T"/boot|"$T"/boot/*) echo "$T/boot"; exit 0 ;; esac\nfi\n'
+                          f'exec {REAL["stat"]} "$@"\n')
+        lists = os.path.join(os.path.dirname(self.vmlinuz), "modules.dep.tmp")
+        self.stub("pacman", PACLOG + f'log "[ALPM] transaction started"\ncat "{self.vmlinuz}" >"{self.kernel}"\n'
+                                     'log "[ALPM] transaction completed"\n'
+                                     'log "[ALPM] running \'60-depmod.hook\'..."\n'
+                                     f'log "[ALPM-SCRIPTLET] depmod: FATAL: could not open {lists}: No space left '
+                                     'on device"\necho "error: command failed to execute correctly" >&2\n')
+        status, out, results = self.run_fixes(("kernel@linux", ["r:linux", g, v, f"k:{self.kernel}",
+                                                                self.image_spec()]))
+        self.assertEqual((status, results), (fixes.INCOMPLETE, [("kernel@linux", "incomplete")]), out)
+        self.assertEqual(results.full, [mount_point(self.t)])
+        self.assertNotIn(f"на {self.boot} не хватило места", out)
+
+    def test_a_stale_tmp_goes_before_the_kernel_reinstall(self):
+        """A "<image>.tmp" an earlier build left goes before pacman (its hook's build needs that room), said; a
+        rollback never brings it back."""
+        g = self.kernel_log()
+        stale = self.image + ".tmp"
+        write(stale, "STALE-PARTIAL\n" * 1000, 0o600)
+        before = digest(self.kernel), digest(self.image)
+        self.stub("pacman", PACLOG + f'if [ -e "{stale}" ]; then echo there >"$T/tmp-at-pacman"; fi\n'
+                                     'echo ":: Proceed with installation? [Y/n] n"\nexit 1\n')
+        status, out, results = self.run_fixes(("kernel@linux", ["r:linux", g, f"k:{self.kernel}", self.image_spec()]))
+        self.assertEqual((status, results), (fixes.UNCHANGED, [("kernel@linux", "unchanged")]), out)
+        self.assertIn(f"Убираю {stale}: его оставил mkinitcpio, который не дописал образ", out)
+        self.assertFalse(os.path.exists(os.path.join(self.t, "tmp-at-pacman")))
+        self.assertFalse(os.path.exists(stale))
+        # a reinstall that failed halfway: all put back, but not the stale file
+        write(stale, "STALE-PARTIAL\n" * 1000, 0o600)
+        self.stub("pacman", PACLOG + f'log "[ALPM] transaction started"\n: >"{self.kernel}"\n'
+                                     'log "[ALPM] transaction failed"\nexit 1\n')
+        status, out, results = self.run_fixes(("kernel@linux", ["r:linux", g, f"k:{self.kernel}", self.image_spec()]))
+        self.assertEqual((status, results), (fixes.ROLLED_BACK, [("kernel@linux", "rolledback")]), out)
+        self.assertEqual((digest(self.kernel), digest(self.image)), before)
+        self.assertFalse(os.path.exists(stale))
+        self.assertEqual(self.leftovers(), [])
 
     def test_pacman_installing_nothing_for_one_kernel_leaves_the_other_alone(self):
         lts = self.two_kernels()
@@ -867,19 +1102,26 @@ else printf 'Avail\n99999999999\n'; fi
         self.assertIn("кэш yay: ~/.cache/yay", out)
 
     def test_room_for_the_fixes_is_enough_for_them_to_go_on(self):
-        """The Chromebook: not 2 GB free after all, but 1 GB: depmod and mkinitcpio need far less, they run."""
-        self.space_machine(10 ** 9, snapper=False)
+        """The Chromebook: not 2 GB free after all, but 1 GB, or even 100 MB: a mount (as depmod's lists, an image on
+        its ESP) needs next to nothing on /, the least is 64 MiB then: it runs. A kernel reinstall needs 512 MiB
+        (pacman -U writes to /, a snapshot keeps the old files): below that it is not begun."""
         self.stub("mountpoint", 'test -e "$T/mounted"\n')
         self.stub("mount", ': >"$T/mounted"\n')
-        status, out, results = self.run_fixes(("space", [str(2 * 10 ** 9), str(512 * 2 ** 20)]), ("mount", ["/boot"]))
-        self.assertEqual(status, fixes.OK, out)
-        self.assertEqual(results, [("space", "partial"), ("mount", "ok")])
-        self.assertIn("для исправлений хватает, для обновления нужно около", out)
-        # below even that: the fixes after it do not run (they would fail for want of room)
-        os.remove(os.path.join(self.t, "mounted"))
+        for free in (10 ** 9, 100 * 2 ** 20):
+            self.space_machine(free, snapper=False)
+            if os.path.exists(os.path.join(self.t, "mounted")):
+                os.remove(os.path.join(self.t, "mounted"))
+            status, out, results = self.run_fixes(("space", [str(2 * 10 ** 9), str(fixes.space.FEW)]),
+                                                  ("mount", ["/boot"]))
+            self.assertEqual(status, fixes.OK, out)
+            self.assertEqual(results, [("space", "partial"), ("mount", "ok")])
+            self.assertIn("для исправлений хватает, для обновления нужно около", out)
+        # below what a kernel reinstall needs: it is not begun
         self.space_machine(100 * 2 ** 20, snapper=False)
-        status, out, results = self.run_fixes(("space", [str(2 * 10 ** 9), str(512 * 2 ** 20)]), ("mount", ["/boot"]))
-        self.assertEqual((status, results), (fixes.NOT_ENOUGH, [("space", "notenough"), ("mount", "skipped")]))
+        status, out, results = self.run_fixes(("space", [str(2 * 10 ** 9), str(fixes.space.LOW)]),
+                                              ("kernel@linux", ["r:linux", f"k:{self.kernel}", self.image_spec()]))
+        self.assertEqual((status, results), (fixes.NOT_ENOUGH, [("space", "notenough"), ("kernel@linux", "skipped")]))
+        self.assertIn("места всё ещё мало: свободно 100 МБ, нужно хотя бы 512 МБ", out)
 
     # ── the driver ──
 
@@ -939,7 +1181,9 @@ class Plans(unittest.TestCase):
         self.patch(engine, "installed_versions", lambda: {"linux": "7.2.14.arch1-1"})
         self.patch(engine, "cached_package", lambda p, v: None)
         self.patch(engine, "run", lambda cmd, **k: "")
+        self.patch(engine, "MODULES_DIR", os.path.join(self.t, "modules"))   # no package's own kernel, unless made
         self.patch(fixes.space, "free", lambda path="/": 50 * 2 ** 30)       # room enough, unless a test says not
+        self.patch(fixes.space, "on_root", lambda path: False)               # /boot a file system of its own (ESP)
 
     def tearDown(self):
         for (obj, name), value in self.saved.items():
@@ -974,8 +1218,9 @@ class Plans(unittest.TestCase):
         self.patch(fixes.space, "free", lambda path="/": 300 * 2 ** 20)      # its disk, nearly full
         plan = fixes.plan(res)
         self.assertEqual([f["id"] for f in plan], ["space", "depmod", "initramfs@linux"])
-        # 2 GiB wanted for the update, but the boot fixes go on from 512 MiB
-        self.assertEqual(plan[0]["args"], [str(fixes.space.AFTER_FULL), str(fixes.space.LOW)])
+        # 2 GiB wanted for the update, but the boot fixes go on from 64 MiB: depmod's lists and an image on the ESP
+        # need next to nothing on / (not 512 MiB: at 300 MiB free that left the machine unmended)
+        self.assertEqual(plan[0]["args"], [str(fixes.space.AFTER_FULL), str(fixes.space.FEW)])
         self.assertEqual(plan[1]["args"][-1], KVER)
         self.assertEqual(plan[2]["args"], ["p:linux", f"i:{KVER}:1:/boot/initramfs-linux.img"])
         self.assertEqual((plan[2]["label"], plan[2]["how"]),
@@ -994,11 +1239,60 @@ class Plans(unittest.TestCase):
         self.patch(fixes.space, "free", lambda path="/": 4 * 10 ** 9)
         self.assertEqual(fixes.plan({"space": {"need": 3 * 10 ** 9, "free": 10 ** 9}}), [])
         self.assertEqual(self.keys({"problems": [engine.DISK_FULL]}), [])     # it ran full elsewhere
-        # a nearly full disk under other fixes: room for them first (1 GiB wanted, 512 MiB enough to go on)
+        # a nearly full disk under other fixes: room for them first (1 GiB wanted, 64 MiB enough for a mount to go on)
         self.patch(fixes.space, "free", lambda path="/": 300 * 2 ** 20)
         plan = fixes.plan({"boot": [{"kind": "unmounted", "target": "/boot", "text": "t"}]})
         self.assertEqual([(f["key"], f["args"]) for f in plan],
-                         [("space", [str(2 ** 30), str(fixes.space.LOW)]), ("mount", ["/boot"])])
+                         [("space", [str(2 ** 30), str(fixes.space.FEW)]), ("mount", ["/boot"])])
+
+    def test_the_least_room_follows_what_the_fixes_after_it_write(self):
+        """512 MiB only for a fix that writes much to /: a kernel reinstall (pacman -U; a snapshot keeps the old
+        files), a DKMS build, an image rebuilt onto the root file system. A mount, a signature, module lists or an
+        image on a /boot of its own need next to nothing there: 64 MiB."""
+        self.patch(fixes.space, "free", lambda path="/": 300 * 2 ** 20)
+        few, low = [str(fixes.space.AFTER_FULL), str(fixes.space.FEW)], [str(fixes.space.AFTER_FULL),
+                                                                         str(fixes.space.LOW)]
+
+        def space_args(*issues):
+            plan = fixes.plan({"problems": [engine.DISK_FULL], "boot": list(issues)})
+            self.assertEqual(plan[0]["key"], "space")
+            return plan[0]["args"]
+        mount = {"kind": "unmounted", "target": "/boot", "text": "t"}
+        depmod = {"kind": "depmod", "kvers": [KVER], "text": "t"}
+        image = {"kind": "image", "pkg": "linux", "path": "/boot/initramfs-linux.img", "how": "broken", "text": "t"}
+        unsigned = {"kind": "unsigned", "files": ["/boot/vmlinuz-linux"], "text": "t"}
+        kernel = {"kind": "kernel", "pkg": "linux", "path": "/boot/vmlinuz-linux", "how": "missing", "text": "t"}
+        dkms = {"kind": "dkms", "module": "nvidia", "kvers": [KVER], "text": "t"}
+        for issues in ([mount], [depmod, image], [unsigned], [image, unsigned]):
+            self.assertEqual(space_args(*issues), few, issues)
+        for issues in ([kernel], [dkms], [mount, kernel]):
+            self.assertEqual(space_args(*issues), low, issues)
+        # /boot on the root file system: the image is written there
+        self.patch(fixes.space, "on_root", lambda path: path == "/boot/initramfs-linux.img")
+        self.assertEqual(space_args(image), low)
+        # … unless that /boot is a partition the mount before it puts there
+        self.assertEqual(space_args(mount, image), few)
+        self.assertEqual(space_args(), [str(fixes.space.AFTER_FULL)] * 2)        # alone: room for the update
+
+    def test_what_is_on_the_root_file_system(self):
+        self.assertEqual(fixes.space.boot_files(["p:linux", f"i:{KVER}:1:/boot/a.img", "u:/efi/b.efi", "k:/boot/v"]),
+                         ["/boot/a.img", "/efi/b.efi"])
+        on_root = self.saved[(fixes.space, "on_root")]          # the real one: /proc is never on /
+        self.assertTrue(on_root("/"))
+        self.assertTrue(on_root("/no-such-folder-of-arch-update/image.img"))           # its nearest folder that is
+        self.assertFalse(on_root("/proc/self/status"))
+        self.assertFalse(on_root("/proc/no-such-thing/image.img"))
+
+    def test_the_kernel_fix_measures_by_the_packages_own_kernel(self):
+        """v: the package's own kernel, what pacman's hook copies to /boot: a kernel file shorter than that is no
+        kernel (cut short on a full /boot). Not planned for a package with none there (nothing to measure by)."""
+        kernel = {"kind": "kernel", "pkg": "linux", "path": "/boot/vmlinuz-linux", "how": "missing", "text": "t"}
+        rest = ["k:/boot/vmlinuz-linux", f"i:{KVER}:1:/boot/initramfs-linux.img"]
+        self.assertEqual(fixes.plan({"boot": [kernel]})[0]["args"], ["r:linux", f"g:{engine.PACMAN_LOG}", *rest])
+        own = os.path.join(engine.MODULES_DIR, KVER, "vmlinuz")
+        write(own, "KERNEL", 0o644)
+        self.assertEqual(fixes.plan({"boot": [kernel]})[0]["args"],
+                         ["r:linux", f"g:{engine.PACMAN_LOG}", f"v:{own}", *rest])
 
     def test_the_space_fix_by_hand_is_a_shell_line(self):
         """What arch-update-auto prints to run by hand: commands only, snapper's cleanup when there is snapper."""

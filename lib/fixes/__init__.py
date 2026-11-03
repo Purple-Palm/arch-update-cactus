@@ -23,11 +23,12 @@ A fix module has:
   KEY      its name: in the runner (the bash functions <KEY>_backup, <KEY>_apply, <KEY>_verify and, when putting
            the kept files back is not the way to undo it, <KEY>_rollback), in the ids, the result file and the
            journal
-  SCRIPT   those bash functions; they may use the helpers of RUNNER (step, good, warn, bad, keep, kept_same,
-           room_for, put_back, image_ok, image_trouble, nonempty, free_bytes, size, drain) and set failed_as to end
-           without a rollback ("notenough": it did what it could, "incomplete": done but not whole, "unchanged":
-           nothing was changed), done_as for a success of another kind ("partial"), and add words to note_extra
-           for the result file (a reason, the mount point that ran full)
+  SCRIPT   those bash functions; they may use the helpers of RUNNER (step, good, warn, bad, keep, keep_missing,
+           kept_same, room_for, put_back, tmps_of, drop_tmps, ran_full, image_ok, image_trouble, nonempty,
+           free_bytes, size, drain) and set failed_as to end without a rollback ("notenough": it did what it could,
+           "incomplete": done but not whole, "unchanged": nothing was changed), done_as for a success of another
+           kind ("partial"), and add words to note_extra for the result file (a reason, the mount point that ran
+           full)
   plan(ctx) what it would do about the result in ctx: a list of fix() dicts, [] when it does not apply
 The order of CATALOGUE is the order they run in: the space first (the others need it), then what the next one
 builds on (the module lists before the initramfs that holds the modules, the initramfs before its signature).
@@ -504,6 +505,21 @@ keep() {
     done
 }
 
+# keep_missing <file>…: remembered as missing whatever is there now (no copy): putting back removes it. For
+# mkinitcpio's "<image>.tmp" (tmps_of): one that is there is what a build that failed left, never a file to bring back,
+# and nothing booting needs: one that cannot be removed (a read-only ESP) is said, not a rollback that failed.
+keep_missing() {
+    local f i
+    for f; do
+        if [ -d "$f" ] && [ ! -L "$f" ]; then bad "$f — папка, а не файл"; return 1; fi
+        i=${#kept[@]}
+        kept+=("$f")
+        printf '%s\n' "$f" >"$work/$i.path" || return 1
+        : >"$work/$i.missing" || return 1
+        : >"$work/$i.leftover" || return 1
+    done
+}
+
 # kept_same: every kept file still as it was (a missing one still missing): nothing to put back
 kept_same() {
     local i f
@@ -529,14 +545,19 @@ copy_back() {
 # put_back: every kept file as it was, each checked against its copy. First what the fix made where there was
 # nothing (mkinitcpio's "<image>.tmp" among them: the room it holds may be what the copies need), then the others,
 # each replaced in one step (written beside it, then moved over it). With no room beside it, the file the fix left
-# goes first, but only when the copy then fits: otherwise it stays, and the commands that put the copies back by
-# hand are printed.
+# goes first, but only when the copy then fits in what is free with that file gone: the copy's size in whole blocks
+# of that file system and one block more (ext4 may need one for the file's extents when the room is in pieces; a
+# full /boot is the usual case here, and a file a writer cut short there holds all the room the copy had before).
+# Otherwise it stays, and the commands that put the copies back by hand are printed.
 put_back() {
-    local i f d s freed avail m failed=() left
+    local i f d s freed avail m failed=() left bs need
     for i in "${!kept[@]}"; do
         [ -e "$work/$i.missing" ] || continue
         f=${kept[$i]}
-        if { [ -e "$f" ] || [ -L "$f" ]; } && ! rm -f -- "$f"; then failed+=("$i"); fi
+        if { [ -e "$f" ] || [ -L "$f" ]; } && ! rm -f -- "$f"; then
+            if [ -e "$work/$i.leftover" ]; then warn "не смог убрать $f — для загрузки он не нужен, но занимает место"
+            else failed+=("$i"); fi
+        fi
     done
     for i in "${!kept[@]}"; do
         [ -e "$work/$i.missing" ] && continue
@@ -561,9 +582,13 @@ put_back() {
             fi
             avail=$(free_bytes "$d")
             left=$((${avail:-0} + freed))
-            if [ -z "$avail" ] || [ "$left" -lt $((s + 1048576)) ]; then
+            bs=$(stat -f -c %S -- "$d" 2>/dev/null) || bs=
+            case $bs in ''|*[!0-9]*|0) bs=4096 ;; esac
+            need=$(( (s + bs - 1) / bs * bs + bs ))
+            if [ -z "$avail" ] || [ "$left" -lt "$need" ]; then
                 m=$(stat -c %m -- "$d" 2>/dev/null) || m=$d
-                bad "на $m нет места, чтобы вернуть $f: нужно $(size "$s"), а будет свободно $(size "$left")"
+                bad "на $m нет места, чтобы вернуть $f: нужно $(size "$need"), а будет свободно $(size "$left")" \
+                    "— не хватает $(size $((need - left)))"
                 failed+=("$i")
                 continue
             fi
@@ -597,6 +622,74 @@ put_back() {
 clear_kept() {
     if [ -n "$work" ] && [ "$keep_work" != 1 ]; then rm -rf -- "${work:?}"/*; fi
     kept=()
+}
+
+# tmps_of <specs…>: the "<image>.tmp" of every image (i:) and UKI (u:) there, one a line. mkinitcpio writes the new
+# image into it first when it guesses there is room for 1.25 times the old one, renames it when the build went well,
+# and leaves it behind (often all the room there was) when the build failed: one that is there is never anything
+# but such a leftover.
+tmps_of() {
+    local a
+    for a; do
+        case $a in
+            i:*) printf '%s.tmp\n' "${a#i:*:*:}" ;;
+            u:*) printf '%s.tmp\n' "${a#u:}" ;;
+        esac
+    done
+}
+# drop_tmps <specs…>: those leftovers removed, each said (kept with keep_missing first): their room is what the next
+# build needs. Status 1 when one could not be removed.
+drop_tmps() {
+    local f rc=0
+    while IFS= read -r f; do
+        if [ -e "$f" ] || [ -L "$f" ]; then
+            step "Убираю $f: его оставил mkinitcpio, который не дописал образ"
+            rm -f -- "$f" || rc=1
+        fi
+    done < <(tmps_of "$@")
+    return "$rc"
+}
+
+# ran_full <for what> <output> <specs…>: after a step that failed, whether a file system ran out of room for it, and
+# which: the one a path a "No space left on device" line of that output names is on (the nearest folder of it that
+# is there: what failed may be gone); else, of the boot files' folders in the specs (i:, u:, k:), then the folder of
+# the package's own kernel (v:, where pacman writes) and the build folder (in /tmp), one with under 1 MiB free, or,
+# when the output said so with no path (zstd), the one with the least room. Looked at right away, before a rollback or
+# anything else gives the room back. Said (the free figure only when it was measured under 1 MiB: objcopy and
+# mkinitcpio give their room back as they stop, and "ran out, 39 MB free" would contradict itself), and noted with
+# the fix (full:<mount point>).
+ran_full() {
+    local what=$1 out=$2 a d p m avail low='' lowest='' least='' said='' full dirs=()
+    shift 2
+    full=$(grep -i 'No space left on device' -- "$out" 2>/dev/null)
+    while IFS= read -r p; do
+        while [ -n "$p" ] && [ ! -e "$p" ]; do p=${p%/*}; done
+        low=${p:-/}
+        break
+    done < <(grep -oE "(^|[[:space:]'\"(=])/[^[:space:]'\"(),:[]+" <<<"$full" | sed 's|^[^/]*||')
+    if [ -z "$low" ]; then
+        for a; do
+            case $a in
+                i:*) dirs+=("$(dirname -- "${a#i:*:*:}")") ;;
+                u:*|k:*) dirs+=("$(dirname -- "${a#?:}")") ;;
+            esac
+        done
+        for a; do case $a in v:/*) dirs+=("$(dirname -- "${a#v:}")") ;; esac; done
+        dirs+=("${TMPDIR:-/tmp}")
+        for d in "${dirs[@]}"; do
+            avail=$(free_bytes "$d")
+            [ -n "$avail" ] || continue
+            if [ "$avail" -lt 1048576 ]; then low=$d; break; fi
+            if [ -z "$least" ] || [ "$avail" -lt "$least" ]; then least=$avail lowest=$d; fi
+        done
+        if [ -z "$low" ] && [ -n "$full" ]; then low=$lowest; fi
+    fi
+    [ -n "$low" ] || return 0
+    m=$(stat -c %m -- "$low" 2>/dev/null) || m=$low
+    avail=$(free_bytes "$low")
+    if [ -n "$avail" ] && [ "$avail" -lt 1048576 ]; then said=": свободно $(size "$avail")"; fi
+    bad "на $m не хватило места${what:+ $what}$said"
+    case $m in /*[[:space:]]*|'') ;; /*) note_extra="${note_extra:+$note_extra }full:$m" ;; esac
 }
 
 # image_trouble i:<kernel version>:<1 if it has modules>:<image>: what is wrong with that image, in a line (status
