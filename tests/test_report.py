@@ -80,6 +80,7 @@ class Reports(unittest.TestCase):
         shutil.rmtree(os.path.join(HOME, ".local"), ignore_errors=True)
         self.saved_who, self.saved_sender = report._who, report.start_sender
         report.start_sender = lambda: None            # the tests send by hand, in this process
+        os.environ["ARCH_UPDATE_REPORT_URL"] = ""     # never the real relay: a test that sends sets its own
         self.server = None
 
     def tearDown(self):
@@ -589,11 +590,15 @@ class Reports(unittest.TestCase):
         self.assertEqual(report.state_of(path), "rejected")
 
     def test_without_a_relay_reports_wait(self):
-        report.set_consent(True)
+        report.set_consent(True)                     # setUp left no server known
         report.after_update(self.result())
-        self.assertFalse(report.status()["endpoint"]) if not report.ENDPOINT else None
-        if not report.ENDPOINT:
-            self.assertEqual(report.send_pending(), (0, 1))
+        self.assertFalse(report.status()["endpoint"])
+        self.assertEqual(report.send_pending(), (0, 1))
+
+    def test_the_relay_is_the_developers_worker(self):
+        self.assertRegex(report.ENDPOINT, r"^https://[a-z0-9-]+\.[a-z0-9-]+\.workers\.dev/report$")
+        os.environ.pop("ARCH_UPDATE_REPORT_URL")
+        self.assertEqual(report.endpoint(), report.ENDPOINT)
 
     def test_nothing_is_sent_once_consent_is_withdrawn(self):
         self.relay()

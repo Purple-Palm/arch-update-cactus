@@ -40,9 +40,9 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import engine  # noqa: E402
 
-# Where reports go: a small relay that files them in the developer's private repository on GitHub
-# (relay/). Empty until the relay is deployed: reports wait in the outbox meanwhile.
-ENDPOINT = ""
+# Where reports go: the relay (relay/worker.js, on Cloudflare) that files them in the developer's private
+# repository on GitHub. ARCH_UPDATE_REPORT_URL overrides it ("" means no server: reports only wait).
+ENDPOINT = "https://arch-update-reports.cirill11100.workers.dev/report"
 SCHEMA = 1
 SETTINGS = os.path.join(engine.STATE_DIR, "settings.json")
 REPORTS = os.path.join(engine.STATE_DIR, "reports")
