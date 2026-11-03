@@ -54,6 +54,16 @@ def write(path, text, mode=0o755):
     os.chmod(path, mode)
 
 
+def without_snapshots(test, tmp):
+    """Nothing of the machine's own snapshots: its pacman hooks, snapper's configs and folder, Timeshift's settings
+    (a CI container or a developer's machine may have them, and the space check would then look at its disk)."""
+    for name in ("SNAPPER_CONF", "SNAPSHOTS_DIR", "TIMESHIFT_CONF", "SNAPPER_ROOT", "SNAP_PAC_INI"):
+        test.addCleanup(setattr, engine, name, getattr(engine, name))
+        setattr(engine, name, os.path.join(tmp, "no-" + name.lower()))
+    test.addCleanup(setattr, engine, "HOOK_DIRS", engine.HOOK_DIRS)
+    engine.HOOK_DIRS = (os.path.join(tmp, "no-hooks"),)
+
+
 class Patching(unittest.TestCase):
     def patch(self, obj, name, value):
         self.addCleanup(setattr, obj, name, getattr(obj, name))
@@ -282,6 +292,8 @@ class Machine(Patching):
         self.patch(engine, "running_kernel", lambda: KVER)
         self.patch(engine, "is_chromebook", lambda: False)
         self.patch(engine, "PACMAN_CACHE", os.path.join(self.tmp, "pkg"))
+        self.patch(engine, "free_mib", lambda path="/": 50 * 1024)     # room on /, whatever this machine has
+        self.patch(fixes.space, "free", lambda path="/": 50 * 2 ** 30)
         # lsinitcpio for the images the user may read: the kernel version written next to the image; as mkinitcpio
         # builds them, its folder always, its module list only when there are modules in it (not with .nomods)
         stub = os.path.join(self.tmp, "bin")
@@ -602,6 +614,111 @@ class Machine(Patching):
         self.patch(fixes.space, "free", lambda path="/": 50 * 2 ** 30)
         self.assertEqual(self.fix_keys(self.checks(failures={"No space left on device"})), [])   # full elsewhere
 
+    # What pacman 7.1 printed when the disk ran full while it put a package's files in place (btrfs, the snapshots
+    # holding the old files; the end of the real output, in that order): one line per file, the errno nowhere.
+    NOSPACE_FILES = ("101 015 084 029 012 003 078 096 065 002 045 028 148 137 021 132 116 008 034 047 064 140 013 "
+                     "001 136 048 017 014 126 062 026 055 007 023 099 043 145 110 133 079 037 019 031 081 049 059 "
+                     "113 060 150 039 104").split()
+    NOSPACE = ("(1/1) upgrading bigpkg                             [###################---]  89%\r(1/1) upgrading "
+               "bigpkg                             [######################] 100%\r\r\nwarning: directory permissions "
+               "differ on /usr/\r\nfilesystem: 755  package: 777\r\n"
+               + "".join(f"error: could not extract /usr/share/bigpkg/data-{n}.bin (Write failed)\r\n"
+                         for n in NOSPACE_FILES)
+               + "error: problem occurred while upgrading bigpkg\r\nerror: could not commit transaction\r\nerror: "
+               "failed to commit transaction (transaction aborted)\r\nErrors occurred, no packages were upgraded.\r\n"
+               "\x1b[?25h\x1b]3008;end=570edd3d878646d68eea34e552e23ee8\x1b\\")
+    # and when a write failed otherwise (a file size limit here): a warning, pacman ends with 0, the file is cut short
+    CUT_SHORT = ("installing bigpkg...\nwarning: warning given when extracting /usr/share/bigpkg/data-080.bin (Write "
+                 "failed)\nwarning: warning given when extracting /usr/share/bigpkg/data-098.bin (Write failed)\n")
+
+    @staticmethod
+    def fed(text, chunk=4096):
+        """A responder fed the output the way pump() reads the pty."""
+        r = engine.Responder(child=None, stop_on_news=True, manual=False)
+        data = text.encode()
+        for i in range(0, len(data), chunk):
+            r.feed(data[i:i + chunk])
+        return r
+
+    def test_a_disk_that_ran_full_while_pacman_wrote_the_files(self):
+        could_not = engine.UNWRITTEN["could not extract"]
+        for chunk in (4096, 61, 7):                     # lines cut across reads too
+            r = self.fed(self.NOSPACE, chunk)
+            self.assertEqual(r.failures, {could_not}, chunk)            # one marker, however many lines
+            self.assertEqual(r.unfinished, ["bigpkg"], chunk)           # never a name cut off by a read
+        files = r.unwritten[could_not]
+        self.assertEqual((files[0], len(files)), ("/usr/share/bigpkg/data-101.bin", 20))
+        # / left with next to no room: the disk ran full, F frees room first; the package it was putting in place
+        # stays registered, half written: updating again leaves it so, the reinstall mends it (pacman 7.1)
+        self.patch(engine, "free_mib", lambda path="/": 3)
+        self.patch(fixes.space, "free", lambda path="/": 3 * 2 ** 20)
+        res = engine.system_checks({}, 1, r, 0, carry=False)
+        mend = ("пакет bigpkg записан не целиком — когда освободишь место, поставь заново: sudo pacman -S --dbonly "
+                "bigpkg && sudo pacman -S bigpkg")
+        self.assertEqual(res["problems"], ["arch-update завершился с кодом 1", engine.DISK_FULL, mend])
+        self.assertEqual(self.fix_keys(res), ["space"])
+        self.assertNotIn("No space left on device", engine.DISK_FULL)   # it may come from either now
+        # the output said "No space left on device" too (a hook): the same, once
+        r.failures.add("No space left on device")
+        again = engine.system_checks({}, 1, r, 0, carry=False)["problems"]
+        self.assertEqual((again.count(engine.DISK_FULL), again.count(mend)), (1, 1))
+        # room on /: another file system ran full (pacman puts the microcode into /boot), not this one
+        self.patch(engine, "free_mib", lambda path="/": 50 * 1024)
+        self.patch(fixes.space, "free", lambda path="/": 50 * 2 ** 30)
+        res = engine.system_checks({}, 1, self.fed(self.NOSPACE), 0, carry=False)
+        self.assertNotIn(engine.DISK_FULL, res["problems"])
+        self.assertEqual(res["problems"][1], "pacman не смог записать часть файлов (например, "
+                                             "/usr/share/bigpkg/data-101.bin): там кончилось место — освободи его "
+                                             "(df -h покажет, где его мало), потом поставь заново: sudo pacman -S "
+                                             "--dbonly bigpkg && sudo pacman -S bigpkg")
+        self.assertEqual(res["fixes"], [])
+        self.assertFalse(any("Write failed" in p for p in res["problems"][2:]), res["problems"])
+        # no word of which package: what to do all the same
+        r = self.fed(self.NOSPACE.replace("error: problem occurred while upgrading bigpkg\r\n", ""))
+        self.assertTrue(engine.system_checks({}, 1, r, 0, carry=False)["problems"][1].endswith(
+            "освободи его (df -h покажет, где его мало), потом обнови ещё раз"))
+
+    def test_a_write_that_failed_otherwise_is_no_full_disk(self):
+        r = self.fed(self.CUT_SHORT)
+        cut = engine.UNWRITTEN["warning given when extracting"]
+        self.assertEqual(r.failures, {cut})
+        self.patch(engine, "free_mib", lambda path="/": 3)              # even with / nearly full: pacman went on
+        res = engine.system_checks({}, 0, r, 0, carry=False)
+        self.assertEqual(res["problems"], ["pacman записал часть файлов не целиком (например, "
+                                           "/usr/share/bigpkg/data-080.bin): ошибка записи на диск — проверь диск, "
+                                           "потом поставь эти пакеты заново"])
+        self.owners["/usr/share/bigpkg/data-080.bin"] = self.owners["/usr/share/bigpkg/data-098.bin"] = "bigpkg"
+        res = engine.system_checks({}, 0, r, 0, carry=False)           # its files are its own: a plain reinstall
+        self.assertTrue(res["problems"][0].endswith("проверь диск, потом поставь заново: sudo pacman -S bigpkg"),
+                        res["problems"])
+
+    def test_a_failed_update_on_a_full_disk_says_so(self):
+        self.patch(fixes.space, "free", lambda path="/": 3 * 2 ** 20)
+        self.patch(engine, "free_mib", lambda path="/": 3)
+        r = self.checks(exitstatus=5)                   # it failed, and / has next to no room: whatever it said
+        self.assertEqual((r["problems"], self.fix_keys(r)), (["arch-update завершился с кодом 5", engine.DISK_FULL],
+                                                             ["space"]))
+        self.assertEqual(self.checks()["problems"], [])                 # it went through: not this check's business
+        self.assertEqual(self.checks(exitstatus=11)["problems"], [])    # a service did not restart, the rest was done
+        self.patch(engine, "free_mib", lambda path="/": None)           # no telling
+        self.assertEqual(self.checks(exitstatus=5)["problems"], ["arch-update завершился с кодом 5"])
+
+    def test_a_full_disk_as_the_previous_version_said_it(self):
+        """A summary of 6201a1e's still gets F's space fix: it says the full disk in other words."""
+        self.patch(fixes.space, "free", lambda path="/": 300 * 2 ** 20)
+        self.new_run()
+        r = self.checks(failures={"No space left on device"})
+        path = engine.summary_path(r["log"])
+        saved = engine.read_json(path)
+        engine.write_json(path, dict(saved, problems=[engine.DISK_FULL_OLD]))          # as 6201a1e wrote it
+        bad = engine.unresolved()
+        self.assertEqual(bad["problems"], [engine.DISK_FULL])
+        self.assertEqual(self.fix_keys(bad), ["space"])
+        engine._update_summary(r["log"], lambda d: None)                # written again: in this version's words
+        self.assertEqual(engine.read_json(path)["problems"], [engine.DISK_FULL])
+        old = engine.normal_summary({"problems": [engine.DISK_FULL_OLD, "в выводе: «No space left on device»"]})
+        self.assertEqual(old["problems"], [engine.DISK_FULL, "в выводе: «No space left on device»"])
+
     def test_a_summary_a_full_disk_did_not_let_be_written_still_warns(self):
         self.linux(self.boot_file("vmlinuz-linux"), self.boot_file("initramfs-linux.img", data=b""))
         self.new_run()
@@ -632,6 +749,86 @@ class Machine(Patching):
         # it went through the second time
         self.assertEqual(engine.recheck_boot(r["log"], probe=out), [])
         self.assertTrue(engine.mark_resolved(r["log"]))
+
+    def test_after_a_fix_that_failed_what_the_look_sees_exactly_counts(self):
+        """flow-F8: depmod went through, the initramfs fix after it was put back. The module list is there now: not
+        said to be missing any more, and depmod is not offered again. The image stays (cautious after a failed
+        mkinitcpio, though the look finds it whole now)."""
+        image = self.boot_file("initramfs-linux.img", modules=False)
+        self.linux(self.boot_file("vmlinuz-linux"), image, index=False)
+        r = self.checks()
+        self.assertEqual(sorted(i["kind"] for i in r["boot"]), ["depmod", "image"])
+        self.assertEqual(self.fix_keys(r), ["depmod", "initramfs"])
+        write(engine.module_index(KVER), "index", 0o644)               # depmod: done and checked
+        os.remove(image + ".nomods")                                    # whole, as far as the look can tell
+        left = engine.recheck_boot(r["log"], failed=True)
+        self.assertFalse(any("нет списка модулей" in t for t in left), left)
+        self.assertTrue(any(f"в {image} нет модулей ядра" in t for t in left), left)
+        self.assertEqual([f["key"] for f in self.summary(r)["fixes"]], ["initramfs"])
+        self.assertEqual(engine.recheck_boot(r["log"]), [])             # a fix that went through: the look counts
+
+    def test_after_a_fix_that_failed_a_mounted_boot_and_a_built_module_count(self):
+        self.patch(engine, "unmounted_boot", lambda: ["/boot"])
+        self.kernel("linux", KVER)
+        self.dkms = "nvidia/615.78: added\n"
+        r = self.checks()
+        self.assertEqual(sorted(i["kind"] for i in r["boot"]), ["dkms", "unmounted"])
+        self.patch(engine, "unmounted_boot", lambda: [])
+        self.dkms = f"nvidia/615.78, {KVER}, x86_64: installed\n"
+        self.assertEqual(engine.recheck_boot(r["log"], failed=True), [])
+
+    def test_after_a_fix_that_failed_a_signature_is_still_not_trusted(self):
+        kernel = self.secure_boot_machine()
+        self.sbctl = f"✗ {kernel} is not signed\n"
+        r = self.checks()
+        self.assertEqual([i["kind"] for i in r["boot"]], ["unsigned"])
+        self.sbctl = f"✓ {kernel} is signed\n"
+        self.assertEqual(len(engine.recheck_boot(r["log"], failed=True)), 1)
+        self.assertEqual(engine.recheck_boot(r["log"]), [])
+
+    def test_a_kernel_reinstalled_whose_mkinitcpio_said_errors(self):
+        """mkinitcpio-F4: F put the kernel file back (pacman -U, from the cache); its mkinitcpio hook said "errors
+        were encountered" and pacman "command failed", and the fix rightly stayed. The file is there: not called
+        missing any more; mkinitcpio's error is the problem now, as after an update."""
+        kernel = os.path.join(self.tmp, "vmlinuz-linux")
+        self.linux(kernel, self.boot_file("initramfs-linux.img"))      # the kernel file is gone
+        r = self.checks()
+        self.assertEqual([(i["kind"], i["how"]) for i in r["boot"]], [("kernel", "missing")])
+        self.boot_file("vmlinuz-linux")                                 # back, 64 bytes
+        seen = {"error: command failed to execute correctly", "errors were encountered during the build"}
+        left = engine.recheck_boot(r["log"], failed=True, markers=seen)
+        said = engine.initcpio_issue("errors were encountered during the build")["text"]
+        self.assertEqual(left, [said])
+        self.assertEqual(said, "mkinitcpio собрал initramfs с ошибками — он может быть неполным: «errors were "
+                               "encountered during the build» — НЕ перезагружайся (сначала: sudo mkinitcpio -P)")
+        s = self.summary(r)
+        self.assertEqual((s["problems"], [f["key"] for f in s["fixes"]]), ([said], ["initramfs"]))
+        with open(r["log"], encoding="utf-8") as f:
+            self.assertIn("ПЕРЕПРОВЕРКА] после неудачного исправления: " + said, f.read())
+        # the same error said by the update already, or twice in other case: once
+        r = self.checks(failures={"errors were encountered during the build"})
+        left = engine.recheck_boot(r["log"], failed=True, markers={"errors were encountered during the build",
+                                                                   "ERRORS were encountered during the build"})
+        self.assertEqual(sum("were encountered during the build" in t for t in left), 1, left)
+        # without markers, nothing new: what the update found stays, the look finds the rest
+        r = self.checks(failures={"Initcpio image generation FAILED"})
+        left = engine.recheck_boot(r["log"], failed=True)
+        self.assertEqual(left, [engine.initcpio_issue("Initcpio image generation FAILED")["text"]])
+        self.assertIsNone(engine.initcpio_issue("depmod: FATAL"))
+
+    def test_after_a_failed_fix_a_kernel_file_root_sees_again_counts(self):
+        kernel, image = self.closed_boot("vmlinuz-linux", "initramfs-linux.img")
+        self.linux(kernel, image)
+        self.probe = self.probe_says(sizes=[(kernel, None), (image, 64)], images=[(image, 0, [KVER])])
+        r = self.checks()
+        self.assertEqual([(i["kind"], i["how"]) for i in r["boot"]], [("kernel", "missing")])
+        out = os.path.join(self.tmp, "probe.out")                       # the fix's own probe: the file is back
+        write(out, self.probe_says(sizes=[(kernel, 64), (image, 64)], images=[(image, 0, [KVER])]), 0o600)
+        self.assertEqual(engine.recheck_boot(r["log"], probe=out, failed=True), [])
+        self.probe = self.probe_says(sizes=[(kernel, 0), (image, 64)], images=[(image, 0, [KVER])])
+        r = self.checks()                                               # empty now, and still empty after the fix
+        write(out, self.probe_says(sizes=[(kernel, 0), (image, 64)], images=[(image, 0, [KVER])]), 0o600)
+        self.assertEqual(len(engine.recheck_boot(r["log"], probe=out, failed=True)), 1)
 
     def test_a_kernel_partition_to_flash_has_no_fix_here(self):
         r = self.checks(failures={"You can do this later by running: # dd if=/boot/vmlinux.kpart of=/dev/mmcblk0p1"})
@@ -1259,9 +1456,9 @@ class Stubs(Patching):
                             ("own_service", lambda: ""), ("battery", lambda: None)):
             self.patch(engine, name, value)
         # nothing of the machine's own pacman: its log (CI's container has one, from installing the test's
-        # dependencies) and its hooks (a snapshot hook would make the space check look at this machine's disk)
+        # dependencies), its hooks and snapshots (they would make the space check look at this machine's disk)
         self.patch(engine, "PACMAN_LOG", os.path.join(self.tmp, "no-pacman.log"))
-        self.patch(engine, "HOOK_DIRS", (os.path.join(self.tmp, "no-hooks"),))
+        without_snapshots(self, self.tmp)
 
     def stub(self, name, text):
         write(os.path.join(self.bin, name), text)
@@ -1304,7 +1501,7 @@ echo "installing"
         super().setUp()
         self.free = 1200 * 2 ** 20
         self.patch(engine, "mount_of", lambda path: ("btrfs", "/dev/mmcblk0p3"))
-        self.patch(engine, "snapshot_hooks", lambda: ["05-snap-pac-pre.hook"])
+        self.patch(engine, "root_snapshots", lambda: "snapper")
         self.patch(engine.shutil, "disk_usage", lambda path: types.SimpleNamespace(free=self.free, total=0, used=0))
         self.stub("fake-update", self.UPDATE)
 
@@ -1313,15 +1510,17 @@ echo "installing"
         self.assertIn("answer=n", log)
         self.assertNotIn("installing", log)
         self.assertEqual((res["started"], res["verdict"]), (False, 1))
-        self.assertTrue(res["warnings"][0].startswith("мало места на диске: свободно 1,2 ГБ, а обновлению нужно "
-                                                      "около 2,"), res["warnings"])
-        self.assertIn("снимок snapper", res["warnings"][0])
+        # what matters first, then the facts: 1200 MiB free, 1293 + 673 + 256 MiB needed
+        self.assertEqual(res["warnings"][0], "мало места на диске — обновление не начинал, система не менялась: "
+                                             "свободно 1,2 ГБ, а обновлению нужно около 2,2 ГБ (не хватает 1023 МБ; "
+                                             "снимки snapper хранят старые версии файлов, пока ставятся новые)")
         self.assertEqual([f["key"] for f in res["fixes"]], ["space"])
         need = int(res["fixes"][0]["args"][0])
         self.assertGreater(need, (1293 + 673) * 2 ** 20)            # every new file and the downloads
         self.assertIn("МЕСТО]", log)
         saved = engine.read_json(engine.summary_path(res["log"]))
-        self.assertEqual(saved["space"]["need"], need)
+        self.assertEqual((saved["space"]["need"], saved["space"]["tool"]), (need, "snapper"))
+        self.assertEqual(engine.last_update()["space"]["tool"], "snapper")      # kept when it is read back
         # F freed the room: the summary says so, F is gone, the update can run again
         self.free = 5 * 2 ** 30
         data = engine.space_freed(res["log"])
@@ -1335,17 +1534,131 @@ echo "installing"
         self.assertIn("answer=y", log)
         self.assertTrue(res["started"])
         self.free = 1200 * 2 ** 20
-        self.patch(engine, "snapshot_hooks", lambda: [])             # pacman's own count holds without one
-        _, res, log = self.run_update()
-        self.assertIn("answer=y", log)
-        self.patch(engine, "snapshot_hooks", lambda: ["05-snap-pac-pre.hook"])
-        self.patch(engine, "mount_of", lambda path: ("ext4", "/dev/sda2"))
+        # no snapshot of / at all, none there and none taken: pacman's own count holds
+        self.patch(engine, "root_snapshots", lambda: None)
         _, res, log = self.run_update()
         self.assertIn("answer=y", log)
 
     def test_the_demo_never_checks(self):
         _, res, log = self.run_update(demo=True)
         self.assertIn("answer=y", log)
+
+    def signs(self):
+        """The real root_snapshots, with snapper's list of configs, its folder and Timeshift's settings in the temp
+        folder (nothing there yet)."""
+        self.patch(engine, "root_snapshots", self.REAL_ROOT_SNAPSHOTS)
+        conf, snaps = os.path.join(self.tmp, "conf.d-snapper"), os.path.join(self.tmp, "dot-snapshots")
+        timeshift = os.path.join(self.tmp, "timeshift.json")
+        self.patch(engine, "SNAPPER_CONF", conf)
+        self.patch(engine, "SNAPSHOTS_DIR", snaps)
+        self.patch(engine, "TIMESHIFT_CONF", timeshift)
+        return conf, snaps, timeshift
+
+    def stopped(self):
+        """Through a whole run (the stub's pacman question): (stopped, what it said first), (False, "") if it went
+        on."""
+        _, res, log = self.run_update()
+        if "answer=n" not in log:
+            return False, ""
+        return not res["started"], res["warnings"][0]
+
+    def test_snapshots_there_already_count_without_a_hook(self):
+        """archinstall's "Snapper" (a root config with timeline snapshots, no snap-pac), snapshots in /.snapshots,
+        Timeshift in BTRFS mode: every file the update replaces stays in them, a hook or not."""
+        conf, snaps, timeshift = self.signs()
+        self.assertEqual(self.stopped(), (False, ""))                   # nothing: pacman's own count holds
+        write(conf, 'SNAPPER_CONFIGS="home"\n', 0o644)                 # /home only: no update replaces files there
+        self.assertEqual(self.stopped(), (False, ""))
+        write(conf, '## Path: System/Snapper\n# List of snapper configurations.\nSNAPPER_CONFIGS="root home"\n',
+              0o644)
+        went, said = self.stopped()
+        self.assertTrue(went)
+        self.assertIn("снимки snapper хранят старые версии файлов", said)
+        write(conf, 'SNAPPER_CONFIGS=""\n', 0o644)                     # as the snapper package installs it
+        os.makedirs(snaps)
+        self.assertEqual(self.REAL_ROOT_SNAPSHOTS(), None)              # an empty folder holds nothing
+        os.makedirs(os.path.join(snaps, "1"))
+        went, said = self.stopped()
+        self.assertTrue(went)
+        self.assertIn("снимки системы хранят", said)                    # not snapper's for all we know
+        shutil.rmtree(snaps)
+        write(timeshift, '{\n  "backup_device_uuid" : "1c3f",\n  "btrfs_mode" : "true",\n  "count_daily" : "5"\n}\n',
+              0o644)                                                     # Timeshift writes every value as text
+        went, said = self.stopped()
+        self.assertTrue(went)
+        self.assertIn("снимки Timeshift хранят", said)
+        write(timeshift, '{"btrfs_mode": "false"}', 0o644)               # RSYNC mode: copies, nothing shared
+        self.assertEqual(self.stopped(), (False, ""))
+
+    def test_which_signs_count(self):
+        conf, snaps, timeshift = self.signs()
+        real = self.REAL_ROOT_SNAPSHOTS
+        for text, tool in (('SNAPPER_CONFIGS="home"\n', None), ("SNAPPER_CONFIGS='root'\n", "snapper"),
+                           ('SNAPPER_CONFIGS="root" # one\n', "snapper"), ("SNAPPER_CONFIGS=root\n", "snapper"),
+                           ('SNAPPER_CONFIGS="home root"\nSNAPPER_CONFIGS=""\n', None),     # the last one counts
+                           ('#SNAPPER_CONFIGS="root"\n', None), ('SNAPPER_CONFIGS="root\n', "snapper")):
+            write(conf, text, 0o644)
+            self.assertEqual(real(), tool, text)
+        write(conf, 'SNAPPER_CONFIGS="home"\n', 0o644)
+        os.makedirs(os.path.join(snaps, "1"))
+        self.assertEqual(real(), "snapper")                             # snapper's own folder of / (another name)
+        os.chmod(snaps, 0o700)
+        self.addCleanup(os.chmod, snaps, 0o755)
+        os.rmdir(os.path.join(snaps, "1"))
+        os.chmod(snaps, 0o000)                                          # root's only, as snapper makes it (0750)
+        if not os.access(snaps, os.R_OK):
+            self.assertEqual(real(), "snapper")                         # cannot look: there may be some
+        os.chmod(snaps, 0o755)
+        self.assertEqual(real(), None)
+        for text in ('{"btrfs_mode": true}', '{"btrfs_mode": "True"}'):
+            write(timeshift, text, 0o644)
+            self.assertEqual(real(), "timeshift", text)
+        for text in ('{"btrfs_mode": 1}', '["btrfs_mode"]', "{broken", '{"btrfs_mode": "false"}'):
+            write(timeshift, text, 0o644)
+            self.assertEqual(real(), None, text)
+        # snap-pac installed, no snapper config for / and nothing else (space-space-4): no snapshot is taken
+        hooks = os.path.join(self.tmp, "hooks")
+        os.makedirs(hooks)
+        self.patch(engine, "HOOK_DIRS", (hooks,))
+        write(os.path.join(hooks, "05-snap-pac-pre.hook"),
+              "[Action]\nWhen = PreTransaction\nExec = /usr/share/libalpm/scripts/snap-pac pre\n", 0o644)
+        write(conf, 'SNAPPER_CONFIGS=""\n', 0o644)
+        self.assertEqual(real(), None)
+        self.assertEqual(self.stopped(), (False, ""))
+        # timeshift-autosnap's own hook (0.10.0, as the AUR package ships it)
+        write(os.path.join(hooks, "00-timeshift-autosnap.hook"),
+              "[Trigger]\nOperation = Upgrade\nType = Package\nTarget = *\n\n[Action]\nDescription = Creating "
+              "Timeshift snapshot before upgrade...\nDepends = timeshift\nWhen = PreTransaction\nExec = "
+              "/usr/bin/timeshift-autosnap\nAbortOnFail\n", 0o644)
+        self.assertEqual(real(), "timeshift")
+        write(os.path.join(hooks, "00-timeshift-autosnap.hook"),
+              "[Action]\nWhen = PreTransaction\nExec = /usr/bin/btrfs subvolume snapshot -r / /snaps/pre\n", 0o644)
+        self.assertEqual(real(), "btrfs")
+        # every sign at once, on a root that is not btrfs: never
+        write(conf, 'SNAPPER_CONFIGS="root"\n', 0o644)
+        write(timeshift, '{"btrfs_mode": "true"}', 0o644)
+        self.patch(engine, "mount_of", lambda path: ("ext4", "/dev/sda2"))
+        self.assertEqual(real(), None)
+        self.assertEqual(self.stopped(), (False, ""))
+
+    def test_the_texts_say_what_is_missing_and_who_keeps_the_files(self):
+        gib, mib = 2 ** 30, 2 ** 20
+        space = {"free": int(1.21 * gib), "need": int(1.24 * gib), "snapshots": True, "tool": "snapper"}
+        # free and need round to the same: the shortfall says it all the same
+        self.assertEqual(engine.space_text(space),
+                         "мало места на диске — обновление не начинал, система не менялась: свободно 1,2 ГБ, а "
+                         "обновлению нужно около 1,2 ГБ (не хватает 31 МБ; снимки snapper хранят старые версии "
+                         "файлов, пока ставятся новые)")
+        self.assertTrue(engine.space_text(space).startswith(engine.SPACE_HEAD))
+        self.assertIn("снимки Timeshift хранят", engine.space_text(dict(space, tool="timeshift")))
+        for tool in ("btrfs", None, 5, ["snapper"]):
+            self.assertIn("снимки системы хранят", engine.space_text(dict(space, tool=tool)))
+        self.assertIn("(не хватает 1 МБ)", engine.space_facts({"free": 10 * mib, "need": 10 * mib + 1}))
+        self.assertIn("не хватает 1 МБ", engine.space_facts({"free": True, "need": "x"}))     # read back broken
+        # a summary of another shape: the tool only as text
+        d = engine.normal_summary({"space": {"need": 5, "tool": "timeshift", "free": "x", "stopped": True}})
+        self.assertEqual(d["space"], {"need": 5, "tool": "timeshift", "stopped": True})
+        self.assertNotIn("tool", engine.normal_summary({"space": {"need": 5, "tool": ["snapper"]}})["space"])
 
     def test_sizes_and_hooks(self):
         text = ("Packages (1) a-1\n\nTotal Installed Size:  1.50 GiB\n\n:: Proceed with installation? [Y/n] "
@@ -1405,12 +1718,18 @@ echo "installing"
                 if "ВНИМАНИЕ" in msg:
                     engine.RESPONDER.user_input(b"n\r")       # the user reads it and says no
         status, res, log = self.run_update(View(), manual=True)
-        self.assertTrue(any("ВНИМАНИЕ: мало места на диске" in m for m in View.said), View.said)
+        warned = [m for m in View.said if "ВНИМАНИЕ: мало места на диске" in m]
+        self.assertEqual(len(warned), 1, View.said)
+        # the same facts as the stop says them: the shortfall, who keeps the old files
+        self.assertIn("ВНИМАНИЕ: мало места на диске: свободно 1,2 ГБ, а обновлению нужно около 2,2 ГБ (не хватает "
+                      "1023 МБ; снимки snapper хранят старые версии файлов, пока ставятся новые). Ответь n", warned[0])
         self.assertIn("ручной режим: предупредил", log)
         self.assertEqual((res["started"], [f["key"] for f in res["fixes"]]), (False, ["space"]))
+        self.assertTrue(res["warnings"][0].startswith("мало места на диске — обновление не начинал"), res["warnings"])
 
 
 SpaceBeforeTheUpdate.REAL_HOOKS = staticmethod(engine.snapshot_hooks)
+SpaceBeforeTheUpdate.REAL_ROOT_SNAPSHOTS = staticmethod(engine.root_snapshots)
 
 
 class ServicesRun(Stubs):
@@ -1632,6 +1951,7 @@ class SudoOnce(unittest.TestCase):
     def test_password_once_then_the_update_runs(self):
         tmp = self.tmp = tempfile.mkdtemp()
         os.makedirs(os.path.join(tmp, "bin"))
+        without_snapshots(self, tmp)
         scripts = {
             # fake sudo: "-n …" succeeds only with a ticket, "-v" asks for the password
             "sudo": '#!/bin/bash\ncase "$1" in\n-n) [ -f "$T/ticket" ] ;;\n'
@@ -1719,6 +2039,7 @@ class NothingDone(unittest.TestCase):
         for name, value in (("unmounted_boot", lambda: []), ("sudo_asks_password", lambda: False)):
             self.addCleanup(setattr, engine, name, getattr(engine, name))
             setattr(engine, name, value)
+        without_snapshots(self, os.path.dirname(path))
 
         class View(engine.TerminalView):
             def out(self, data):

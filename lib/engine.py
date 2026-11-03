@@ -87,6 +87,19 @@ UNKNOWN_PROMPT = re.compile(
     r"|(?i:(?:enter|select|choose|password|passphrase|user ?name|login|answer|input)[^\n]*:)$"
 )
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>78]")
+# A file pacman could not write while it put a package's files in place. libarchive says only "Write failed", and
+# pacman (7.1) tells two cases apart by the error behind it: a full disk (ENOSPC) is an error, "could not extract
+# <path> (Write failed)", and the transaction is aborted halfway; any other (an I/O error, a quota, a size limit) is
+# only a warning, "warning given when extracting <path> (Write failed)": the file stays cut short and pacman ends as
+# if all went well. Either comes once per file, so each counts as one marker (UNWRITTEN), whatever the path.
+UNWRITTEN = {"could not extract": "could not extract … (Write failed)",
+             "warning given when extracting": "warning given when extracting … (Write failed)"}
+UNWRITTEN_LINE = re.compile(r"(?P<what>could not extract|warning given when extracting) (?P<path>[^\n]+?) "
+                            r"\(Write failed\)", re.I)
+# The package pacman was putting in place when that happened (a whole line, never one cut off by a read). It stays
+# registered as installed, with its files half written: "update again" leaves it so (pacman 7.1: "there is nothing
+# to do"), and a reinstall stops at its own files ("exists in filesystem") when the database lost their list too.
+UNFINISHED = re.compile(r"problem occurred while (?:upgrading|installing) ([A-Za-z0-9@._+-]+)\n")
 # What went wrong, in the output. mkinitcpio goes on after a hook or a module failed and writes the image all the
 # same ("errors were encountered during the build"), and one without a single module when the kernel's module list
 # is missing (depmod failed: a full disk) — the Chromebook that did not boot any more.
@@ -95,7 +108,8 @@ FAILURE_MARKERS = re.compile(r"Initcpio image generation FAILED|error: command f
                              r"|depmod: FATAL|No space left on device|not enough free disk space"
                              r"|An error has occurred during the update process"
                              r"|invalid or corrupted package \(PGP signature\)|is unknown trust|is marginal trust"
-                             r"|You can do this later by running: #? ?dd if=\S+ of=\S+", re.I)
+                             r"|You can do this later by running: #? ?dd if=\S+ of=\S+"
+                             r"|" + UNWRITTEN_LINE.pattern, re.I)
 KERNEL_FLASH = re.compile(r"dd if=\S+ of=\S+")   # depthcharge kernels (ARM Chromebooks): flash by hand
 KEYRING_TROUBLE = re.compile(r"PGP signature|unknown trust|marginal trust", re.I)
 # The markers that say mkinitcpio built a broken or incomplete image (or none), and what the summary says of each.
@@ -104,12 +118,18 @@ INITCPIO_SAYS = {"initcpio image generation failed": "mkinitcpio не собра
                                                              "неполным",
                  "no modules were added to the image": "в initramfs не попал ни один модуль ядра — система с ним "
                                                        "не загрузится"}
-DISK_FULL = ("на диске кончилось место («No space left on device») — часть файлов не записалась: освободи место "
-             "(например: sudo pacman -Sc) и обнови ещё раз")
-# The update's room on the disk, looked at when pacman asks before it changes anything. With a snapshot taken at the
-# start of the transaction (snap-pac, timeshift-autosnap on btrfs) the files it replaces stay in that snapshot, so
-# the transaction needs room for every new file, not only for the difference pacman counts ("Net Upgrade Size"):
-# the Chromebook ran out of space in the middle of one that way (7 MiB counted, about 2 GiB needed).
+# The disk ran full during the update ("No space left on device" in the output, or pacman could not write a file
+# with / left with next to no room: FULL_LEFT). lib/fixes/space.py and the UI know it by this very text.
+DISK_FULL = ("на диске кончилось место — часть файлов не записалась: освободи место (например: sudo pacman -Sc) и "
+             "обнови ещё раз")
+DISK_FULL_OLD = ("на диске кончилось место («No space left on device») — часть файлов не записалась: освободи место "
+                 "(например: sudo pacman -Sc) и обнови ещё раз")     # the same, as the summaries of 6201a1e say it
+FULL_LEFT = 64                   # MiB free on / below which a failed update counts as one that ran out of room
+# The update's room on the disk, looked at when pacman asks before it changes anything. On btrfs the snapshots of /
+# keep every file the update replaces, the one a hook takes at the start of the transaction (snap-pac,
+# timeshift-autosnap) as well as those that are there already (snapper's timeline, Timeshift's schedule, earlier
+# pairs): the transaction needs room for every new file, not only for the difference pacman counts ("Net Upgrade
+# Size"). The Chromebook ran out of space in the middle of one that way (7 MiB counted, about 2 GiB needed).
 SIZE_LINE = re.compile(r"^Total (Installed|Download) Size:\s+([\d.]+)\s+(B|KiB|MiB|GiB|TiB)\s*$", re.M)
 SIZE_UNITS = {"B": 1, "KiB": 2 ** 10, "MiB": 2 ** 20, "GiB": 2 ** 30, "TiB": 2 ** 40}
 HOOK_DIRS = ("/usr/share/libalpm/hooks", "/etc/pacman.d/hooks")    # the second overrides the first by name
@@ -120,6 +140,13 @@ SNAPSHOT_CMD = re.compile(r"\bsnap-pac\s+pre\b|\btimeshift-autosnap\b|\bsnapper\
                           r"|\bbtrfs\s+subvolume\s+snapshot\b")
 SNAPPER_ROOT = "/etc/snapper/configs/root"   # snap-pac snapshots the snapper config "root" (/) unless told not to
 SNAP_PAC_INI = "/etc/snap-pac.ini"
+# Snapshots of / that are there already, as a user can see them: snapper's list of configs (world-readable, shell
+# syntax: SNAPPER_CONFIGS="root home"; archinstall's "Snapper" makes "root" with timeline snapshots and no snap-pac),
+# the folder snapper (and others) keep the snapshots of / in, Timeshift's settings in BTRFS mode.
+SNAPPER_CONF = "/etc/conf.d/snapper"
+SNAPSHOTS_DIR = "/.snapshots"
+TIMESHIFT_CONF = "/etc/timeshift/timeshift.json"     # "btrfs_mode" : "true" (Timeshift writes every value as text)
+SNAPSHOT_TOOLS = {"snapper": "snapper", "timeshift": "Timeshift"}     # by name in the texts; another: "снимки системы"
 SPACE_MARGIN = 256 * 2 ** 20     # on top: the hooks' own files (initramfs, caches), btrfs's metadata
 MOUNTINFO = "/proc/self/mountinfo"
 SPACE_HEAD = "мало места на диске"
@@ -303,9 +330,16 @@ def pacman_busy():
 
 
 def snapshot_hooks():
-    """The pacman hooks that take a file system snapshot before a transaction (snap-pac, timeshift-autosnap…), by
-    name. One in /etc/pacman.d/hooks overrides the same name in /usr/share/libalpm/hooks (a link to /dev/null
-    switches it off)."""
+    """The pacman hooks that take a snapshot of / at the start of a transaction (snap-pac's pre hook while snapper
+    has its "root" config, timeshift-autosnap, a hand-made snapper create or btrfs subvolume snapshot), by name. One
+    in /etc/pacman.d/hooks overrides the same name in /usr/share/libalpm/hooks (a link to /dev/null switches it
+    off). Not all there is to it: snapshots taken before (snapper's timeline, Timeshift's schedule) hold the old
+    files too, with no hook at all (root_snapshots)."""
+    return [name for name, _ in _snapshot_hooks()]
+
+
+def _snapshot_hooks():
+    """snapshot_hooks, each with the tool that takes the snapshot: [(name, "snapper" | "timeshift" | "btrfs")]."""
     hooks = {}
     for d in HOOK_DIRS:
         for path in glob.glob(os.path.join(d, "*.hook")):
@@ -322,12 +356,66 @@ def snapshot_hooks():
         if not re.search(r"(?mi)^\s*When\s*=\s*PreTransaction\b", text):
             continue
         cmds = [m.group("cmd") for m in SNAPSHOT_EXEC.finditer(text)]
-        if not any(SNAPSHOT_CMD.search(c) for c in cmds):
+        took = [m.group(0) for c in cmds for m in [SNAPSHOT_CMD.search(c)] if m]
+        if not took:
             continue
         if any(re.search(r"\bsnap-pac\s+pre\b", c) for c in cmds) and not snap_pac_takes_root():
             continue
-        found.append(name)
+        tool = "timeshift" if "timeshift" in took[0] else "btrfs" if took[0].startswith("btrfs") else "snapper"
+        found.append((name, tool))
     return found
+
+
+def snapper_configs():
+    """The snapper configs /etc/conf.d/snapper lists (SNAPPER_CONFIGS, shell syntax; the last one counts, as when
+    the shell reads it). [] without any, or without snapper."""
+    try:
+        with open(SNAPPER_CONF, encoding="utf-8", errors="replace") as f:
+            lines = f.read(65536).splitlines()
+    except OSError:
+        return []
+    names = []
+    for line in lines:
+        m = re.match(r"\s*(?:export\s+)?SNAPPER_CONFIGS=(.*)$", line)
+        if m:
+            try:
+                names = " ".join(shlex.split(m.group(1), comments=True)).split()
+            except ValueError:                  # an unclosed quote: the words as they are
+                names = m.group(1).replace('"', " ").replace("'", " ").split()
+    return names
+
+
+def timeshift_btrfs():
+    """Timeshift is set up in BTRFS mode: its snapshots are subvolume snapshots of / (and keep what they hold)."""
+    mode = read_json(TIMESHIFT_CONF).get("btrfs_mode")
+    return mode is True or (isinstance(mode, str) and mode.strip().lower() == "true")
+
+
+def root_snapshots():
+    """Which tool keeps snapshots of / on this machine, as a user can tell: "snapper", "timeshift", "btrfs" (another,
+    or one by hand); None when there is none to see, or / is not btrfs. Every file an update replaces stays in the
+    newest snapshot (on btrfs it shares the old file's blocks), so such an update needs room for all its new files:
+    a hook that takes one at the start of the transaction (snapshot_hooks), snapper's "root" config (its timeline
+    snapshots, with or without snap-pac), Timeshift in BTRFS mode, or snapshots in /.snapshots (one that is empty,
+    as far as a user may look into it, holds nothing)."""
+    if mount_of("/")[0] != "btrfs":
+        return None
+    hooks = _snapshot_hooks()
+    if hooks:
+        return hooks[0][1]
+    configs = snapper_configs()
+    if "root" in configs:
+        return "snapper"
+    if timeshift_btrfs():
+        return "timeshift"
+    if os.path.isdir(SNAPSHOTS_DIR):
+        try:
+            held = bool(os.listdir(SNAPSHOTS_DIR))
+        except OSError:                         # snapper's own is root's only (0750): there is something to keep
+            held = True
+        if held:
+            return "snapper" if configs else "btrfs"
+    return None
 
 
 def snap_pac_takes_root():
@@ -381,11 +469,28 @@ def size_text(n):
     return f"{n / 2 ** 30:.1f} ГБ".replace(".", ",") if n >= 2 ** 30 else f"{max(0, n) // 2 ** 20} МБ"
 
 
+def snapshots_text(tool):
+    """Who keeps the old files: "снимки snapper", "снимки Timeshift", else "снимки системы"."""
+    return f"снимки {SNAPSHOT_TOOLS[tool]}" if isinstance(tool, str) and tool in SNAPSHOT_TOOLS else "снимки системы"
+
+
+def space_facts(space):
+    """"свободно 1,2 ГБ, а обновлению нужно около 2,2 ГБ (не хватает 1,0 ГБ; снимки snapper хранят …)" for what
+    Responder.space_short found. The shortfall always: free and need can round to the same "1,2 ГБ"."""
+    def number(key):
+        v = space.get(key)
+        return v if type(v) is int else 0
+    free, need = number("free"), number("need")
+    short = -(-max(need - free, 1) // 2 ** 20) * 2 ** 20          # up to whole MiB: never "не хватает 0 МБ"
+    why = (f"; {snapshots_text(space.get('tool'))} хранят старые версии файлов, пока ставятся новые"
+           if space.get("snapshots") else "")
+    return (f"свободно {size_text(free)}, а обновлению нужно около {size_text(need)} (не хватает "
+            f"{size_text(short)}{why})")
+
+
 def space_text(space):
-    return (f"{SPACE_HEAD}: свободно {size_text(space.get('free', 0))}, а обновлению нужно около "
-            f"{size_text(space.get('need', 0))}"
-            + (" (снимок snapper хранит старые версии файлов, пока ставятся новые)" if space.get("snapshots") else "")
-            + " — обновление не начинал, система не менялась")
+    """Why an update was not begun for want of room, what matters first (the summary may show only its start)."""
+    return f"{SPACE_HEAD} — обновление не начинал, система не менялась: {space_facts(space)}"
 
 
 def kernel_packages():
@@ -596,6 +701,24 @@ def dkms_skips(module, kver):
 
 def installed_versions():
     return dict(line.split(" ", 1) for line in run(["pacman", "-Q"]).splitlines() if " " in line)
+
+
+def owners(paths):
+    """The packages that own these files (pacman -Qo), each once, in their order; [] when none is known."""
+    found = []
+    for line in run(["pacman", "-Qo", "--", *paths], env=child_env()).splitlines() if paths else ():
+        m = re.match(r"^\S.* is owned by ([A-Za-z0-9@._+-]+) \S+$", line)
+        if m and m.group(1) not in found:
+            found.append(m.group(1))
+    return found
+
+
+def reinstall_text(names, dbonly):
+    """The command that puts half-written packages whole again. dbonly: pacman's database may have lost their file
+    lists as well (it ran out of room too): written again first (--dbonly touches no file), so that their own files
+    are theirs again; then the ordinary reinstall. Never --overwrite '*': it takes other packages' files as well."""
+    pkgs = " ".join(names)
+    return f"sudo pacman -S --dbonly {pkgs} && sudo pacman -S {pkgs}" if dbonly else f"sudo pacman -S {pkgs}"
 
 
 def last_lines(text, n):
@@ -1316,6 +1439,8 @@ class Responder:
         self.saw_new_news = False
         self.notes = set()
         self.failures = set()
+        self.unwritten = {}       # UNWRITTEN marker -> the first files it was said of (system_checks names one)
+        self.unfinished = []      # the packages pacman could not finish putting in place (UNFINISHED)
         self.hinted = False
         self.forced = False       # Ctrl+] pressed: Ctrl+C reaches the program even mid-transaction
         self.safe_only = False    # window closed during a manual run: never confirm anything for the user
@@ -1339,7 +1464,18 @@ class Responder:
         if "[NEW]" in recent:
             self.saw_new_news = True
         for m in FAILURE_MARKERS.finditer(recent):
-            self.failures.add(m.group(0))
+            marker = m.group(0)
+            said = UNWRITTEN_LINE.fullmatch(marker)
+            if said:                            # one marker for all the files it is said of
+                marker = UNWRITTEN[said.group("what").lower()]
+                files = self.unwritten.setdefault(marker, [])
+                if len(files) < 20 and said.group("path") not in files:
+                    files.append(said.group("path"))
+            self.failures.add(marker)
+        if "problem occurred while" in recent:
+            for m in UNFINISHED.finditer(recent):
+                if m.group(1) not in self.unfinished and len(self.unfinished) < 20:
+                    self.unfinished.append(m.group(1))
         if "restart" in recent:
             self.watch_services(recent)
         if self.mode == "manual" and self.space is None and "Proceed with" in recent and self.waiting() \
@@ -1347,10 +1483,9 @@ class Responder:
             short = self.space_short()
             if short:                           # the user answers in a manual run: tell them before they do
                 self.space = dict(short, stopped=False)
-                LOG.event("МЕСТО", space_text(short) + " (ручной режим: предупредил)")
-                say(f"\n[автоответчик] ВНИМАНИЕ: {SPACE_HEAD} — свободно {size_text(short['free'])}, а этому "
-                    f"обновлению нужно около {size_text(short['need'])} (снимок snapper хранит старые версии "
-                    "файлов). Ответь n, освободи место (F в итоге) и обнови снова.\n", C_RED)
+                LOG.event("МЕСТО", f"{SPACE_HEAD}: {space_facts(short)} — ручной режим: предупредил")
+                say(f"\n[автоответчик] ВНИМАНИЕ: {SPACE_HEAD}: {space_facts(short)}. Ответь n, освободи место "
+                    "(F в итоге) и обнови снова.\n", C_RED)
         if self.mode == "handover":
             if not self.user_typed and self.current_line() != self.handover_line:
                 self.mode = "auto"    # false alarm: the program moved on by itself
@@ -1365,14 +1500,15 @@ class Responder:
                 LOG.event("АВТО", "программа ушла дальше, недопечатанный ввод сброшен")
 
     def space_short(self):
-        """At pacman's question before it changes anything: when a snapshot is taken at the start of the
-        transaction (snapshot_hooks, on btrfs), is there room for every new file, and for the downloads when they go
-        to the same file system? None when there is, or no telling; else {"need", "free", "installed", "download",
-        "snapshots"} (bytes)."""
+        """At pacman's question before it changes anything: when snapshots keep the files the update replaces (a
+        snapshot of / there already or taken at the start of the transaction: root_snapshots, on btrfs), is there
+        room for every new file, and for the downloads when they go to the same file system? None when there is, or
+        no telling (no snapshots: pacman's own count holds); else {"need", "free", "installed", "download" (bytes),
+        "snapshots": True, "tool": the one that keeps them (root_snapshots)}."""
         if not self.check_space:
             return None
         if self._snapshots is None:
-            self._snapshots = mount_of("/")[0] == "btrfs" and bool(snapshot_hooks())
+            self._snapshots = root_snapshots() or ""
         if not self._snapshots:
             return None
         sizes = pacman_sizes(self.tail)
@@ -1387,7 +1523,8 @@ class Responder:
             return None
         if free >= need:
             return None
-        return {"need": need, "free": free, "installed": sizes["installed"], "download": download, "snapshots": True}
+        return {"need": need, "free": free, "installed": sizes["installed"], "download": download, "snapshots": True,
+                "tool": self._snapshots}
 
     def watch_services(self, recent):
         """arch-update's list of services to restart (once its question shows, whoever answers it) and what it
@@ -1470,8 +1607,7 @@ class Responder:
                     if short:
                         self.space = dict(short, stopped=True)
                         LOG.event("МЕСТО", space_text(short))
-                        return (f"{SPACE_HEAD}: свободно {size_text(short['free'])}, нужно около "
-                                f"{size_text(short['need'])} — не начинаю", NO, "space")
+                        return f"{SPACE_HEAD}: {space_facts(short)} — не начинаю", NO, "space"
                 return (label, action, note)
         return None
 
@@ -1640,6 +1776,8 @@ def normal_summary(d):
                 if plain(v) is not None and isinstance(v, list) == (k in ("kvers", "files", "argv", "args"))}
     for k in ("changed", "added", "removed", "problems", "warnings", "notes", "ok"):
         d[k] = plain(d.get(k)) if isinstance(d.get(k), list) else []
+    # a full disk as the previous version said it: as this one says it (F knows it by DISK_FULL)
+    d["problems"] = [DISK_FULL if p == DISK_FULL_OLD else p for p in d["problems"]]
     for k in ("boot", "fixes"):
         items = d.get(k) if isinstance(d.get(k), list) else []
         d[k] = [item(i) for i in items if isinstance(i, dict)]
@@ -1648,8 +1786,9 @@ def normal_summary(d):
     d["services"] = {k: plain(v) for k, v in svc.items() if isinstance(v, list)}
     if not (type(d.get("verdict")) is int and d["verdict"] in (0, 1, 2)):
         d["verdict"] = None
-    space = d.get("space")
-    d["space"] = {k: v for k, v in space.items() if type(v) in (int, bool)} if isinstance(space, dict) else None
+    space = d.get("space")                      # numbers and switches, and the tool that keeps the snapshots
+    d["space"] = {k: v for k, v in space.items() if type(v) in (int, bool) or (k == "tool" and type(v) is str)} \
+        if isinstance(space, dict) else None
     if not d["space"]:
         d.pop("space")
     return d
@@ -1816,6 +1955,14 @@ def _file_issue(kind, path, pkg, how, text):
     return {"kind": "kernel" if kind == "kernel" else "image", "pkg": pkg, "path": path, "how": how, "text": text}
 
 
+def initcpio_issue(marker):
+    """The problem with booting a failure marker of mkinitcpio's says (INITCPIO_SAYS), None for another marker."""
+    says = INITCPIO_SAYS.get(marker.lower()) if isinstance(marker, str) else None
+    if not says:
+        return None
+    return {"kind": "initcpio", "text": f"{says}: «{marker}» — НЕ перезагружайся (сначала: sudo mkinitcpio -P)"}
+
+
 def _when(iso):
     """12:34 today, 03.11 12:34 another day."""
     try:
@@ -1852,7 +1999,8 @@ def boot_state(probe=None, pacman_log=None, changed=(), earlier=(), since=None, 
     stay, as found then (since: when that was, None for this update's own). found: issues this update has
     found already (in its output), so that an earlier one of the same kind is not said twice. keep: a fix of
     them has just failed: what this look does not find again stays all the same (a look that finds nothing
-    wrong after a failed mkinitcpio may have missed what it left out)."""
+    wrong after a failed mkinitcpio may have missed what it left out), but for what this look has just seen
+    exactly: a boot partition mounted, a DKMS module built, a kernel's module list or its file there again."""
     issues, warnings, ok, unverified, looked_into = [], [], [], set(), set()
     for t in unmounted_boot():
         issues.append({"kind": "unmounted", "target": t,
@@ -1987,9 +2135,18 @@ def boot_state(probe=None, pacman_log=None, changed=(), earlier=(), since=None, 
         if kind == "unsigned":
             return "sb" not in unverified
         return False                            # a kernel partition to flash by hand: nothing here can tell
+
+    def settled(i):
+        """What this look sees exactly, and has just looked at: it counts even after a fix that failed. Not an
+        image, mkinitcpio's errors or a signature: a look that finds nothing wrong there may miss what is."""
+        kind = i.get("kind")
+        if kind in ("unmounted", "dkms") or (kind == "depmod" and i.get("path")):
+            return True
+        return kind == "kernel" and i.get("how") in ("missing", "empty") and bool(known.get(i.get("path")))
     now = {(i["kind"], i.get("path")) for i in list(issues) + list(found)}
     for i in earlier:
-        if not isinstance(i, dict) or not isinstance(i.get("text"), str) or (not keep and seen_again(i)):
+        if not isinstance(i, dict) or not isinstance(i.get("text"), str) \
+                or (seen_again(i) and (not keep or settled(i))):
             continue
         key = (i.get("kind"), i.get("path"))
         if key in now:
@@ -2107,7 +2264,7 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
     depmod_failed = False
     for f in sorted(responder.failures):
         flash = KERNEL_FLASH.search(f)
-        initcpio = INITCPIO_SAYS.get(f.lower())
+        initcpio = initcpio_issue(f)
         if flash:
             boot.append({"kind": "flash", "cmd": flash.group(0),
                          "text": "новое ядро не записано в раздел ядра — перед перезагрузкой выполни: "
@@ -2115,8 +2272,7 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
         elif "update process" in f:
             warnings.append(f"в выводе: «{f}»")
         elif initcpio:
-            boot.append({"kind": "initcpio", "text": f"{initcpio}: «{f}» — НЕ перезагружайся (сначала: "
-                                                     "sudo mkinitcpio -P)"})
+            boot.append(initcpio)
         elif f.lower() == "depmod: fatal":
             depmod_failed = True                # for which kernels: the look below knows them
         elif f.lower() == "no space left on device":
@@ -2124,8 +2280,38 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
         elif f.lower() == "not enough free disk space":
             problems.append("pacman не стал ставить часть пакетов: мало места на диске («not enough free disk "
                             "space») — освободи место и обнови ещё раз")
-        else:
+        elif f not in UNWRITTEN.values():       # files pacman could not write: below
             problems.append(f"в выводе: «{f}»")
+    # Files pacman could not write. "could not extract" is a full file system: / when it has (next to) no room left
+    # now, or the output said so; else another one (a full /boot: pacman puts the microcode there). "warning given"
+    # is a write that failed otherwise (an I/O error, a quota): the file was cut short, pacman went on. Either way
+    # the packages stay registered as installed: updating again does not mend them, a reinstall does.
+    unwritten = getattr(responder, "unwritten", None) or {}
+    unfinished = [n for n in getattr(responder, "unfinished", None) or [] if isinstance(n, str)]
+    left = free_mib("/")
+    full = left is not None and left < FULL_LEFT
+    for marker in (m for m in UNWRITTEN.values() if m in responder.failures):
+        files = [p for p in unwritten.get(marker) or [] if isinstance(p, str)]
+        example = f" (например, {files[0]})" if files else ""
+        if marker == UNWRITTEN["could not extract"] and (full or DISK_FULL in problems):
+            if DISK_FULL not in problems:       # (in it already: "No space left on device" in the output)
+                problems.append(DISK_FULL)
+            if unfinished:
+                problems.append(("пакет " if len(unfinished) == 1 else "пакеты ") + ", ".join(unfinished)
+                                + (" записан" if len(unfinished) == 1 else " записаны") + " не целиком — когда "
+                                "освободишь место, поставь заново: " + reinstall_text(unfinished, True))
+        elif marker == UNWRITTEN["could not extract"]:
+            problems.append(f"pacman не смог записать часть файлов{example}: там кончилось место — освободи его "
+                            "(df -h покажет, где его мало), "
+                            + (f"потом поставь заново: {reinstall_text(unfinished, True)}" if unfinished else
+                               "потом обнови ещё раз"))
+        else:
+            cut = owners(files)
+            problems.append(f"pacman записал часть файлов не целиком{example}: ошибка записи на диск — проверь диск, "
+                            + (f"потом поставь заново: {reinstall_text(cut, False)}" if cut else
+                               "потом поставь эти пакеты заново"))
+    if exitstatus not in (0, None, 11) and full and DISK_FULL not in problems:
+        problems.append(DISK_FULL)              # it failed, and / is full: whatever it said, room is the first thing
     if any(KEYRING_TROUBLE.search(f) for f in responder.failures):
         keyring = "archlinuxarm-keyring" if before.get("archlinuxarm-keyring") else "archlinux-keyring"
         problems.append(f"похоже, устарел keyring: sudo pacman -Sy {keyring} && sudo pacman -Su, потом обнови снова")
@@ -2220,10 +2406,10 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
 
     space = getattr(responder, "space", None)
     if space:
-        room = f"свободно {size_text(space.get('free', 0))}, нужно около {size_text(space.get('need', 0))}"
-        warnings.append(f"{SPACE_HEAD} для части обновления ({room}) — её не ставил: освободи место (F) и обнови "
-                        "ещё раз" if space.get("stopped") else
-                        f"{SPACE_HEAD} перед установкой ({room}) — освободи место (F), пока его не стало ещё меньше")
+        warnings.append(f"{SPACE_HEAD} — часть обновления не ставил: {space_facts(space)}; освободи место (F) и "
+                        "обнови ещё раз" if space.get("stopped") else
+                        f"{SPACE_HEAD} перед установкой — освободи место (F), пока его не стало ещё меньше: "
+                        f"{space_facts(space)}")
     if LOG.broken:
         warnings.append("журнал обновления неполный: не удалось писать на диск (место в /home?)")
     for p in problems:
@@ -2349,19 +2535,29 @@ def probe_targets():
     return list(dict.fromkeys(files)), list(dict.fromkeys(images))
 
 
-def recheck_boot(log, probe=None, failed=False):
+def recheck_boot(log, probe=None, failed=False, markers=()):
     """The problems with booting of that update as they are now (after a fix): the same look as after the update
     (boot partitions, the kernels' module lists and boot files, DKMS, Secure Boot). What cannot be looked at now
     (a /boot closed to the user while sudo asks for a password) stays as it was found; after a fix that failed
     (failed: its exit status was not 0, or its output said an error) so does everything found before that this
-    look does not find again. The update's summary follows: its problems, verdict and fixes. probe: the file
-    boot_probe_command wrote (or parse_probe's dict). Returns the problems with booting, [] when there are none."""
+    look does not find again, but what it has just seen exactly (boot_state's keep). The update's summary
+    follows: its problems, verdict and fixes. probe: the file boot_probe_command wrote (or parse_probe's dict).
+    markers: what FAILURE_MARKERS found in the output of the fixes whose changes stayed (a kernel reinstalled, and
+    its mkinitcpio hook said an error): mkinitcpio's (INITCPIO_SAYS) are problems with booting, as after the
+    update, each once. Returns the problems with booting, [] when there are none."""
     data = normal_summary(read_json(summary_path(log)))
     old = [i for i in data["boot"] if isinstance(i.get("text"), str)]
     if isinstance(probe, str):
         probe = read_probe(probe)
+    said = {}
+    for m in sorted(x for x in markers or () if isinstance(x, str)):
+        issue = initcpio_issue(m)
+        if issue:
+            said.setdefault(m.lower(), issue)
+    said = list(said.values())
     issues, _, _, _ = boot_state(probe if isinstance(probe, dict) else None, earlier=old, keep=failed,
-                                 event=lambda kind, msg: journal_event(log, kind, msg))
+                                 found=said, event=lambda kind, msg: journal_event(log, kind, msg))
+    issues = said + issues
     texts = [i["text"] for i in issues]
     gone = {i["text"] for i in old}
 
