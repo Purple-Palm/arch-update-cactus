@@ -6,6 +6,7 @@ folder, so the real settings and outbox are never touched.
 
   python3 tests/test_report.py
 """
+import datetime
 import errno
 import http.server
 import json
@@ -58,18 +59,148 @@ WHO = ({"cactus"}, {"cactus-chromebook"}, {"Ivan", "Petrov"}, {"/home/cactus"}, 
 GONE = (r"(?i)(?<![\w-])(?:cactus|cactus-chromebook|ivan|petrov)(?![\w-])|HomeWiFi|Sup3rS3cret|ghp_|zzz9|hunter2"
         r"|192\.168|10\.0\.0")
 
+# Journals as engine.RunLog has written them from its first version on: what arch-update, pacman and yay print, the
+# updater's own lines among it ("[17:45:45 ПАКЕТЫ] …"), and at the end the update's part of pacman.log. Together
+# the week of the owner's Chromebook that stopped booting: the update that broke it is the newest.
+BROKEN_BOOT = """[17:42:38 СТАРТ] arch-update, режим: автоответы, новости: останавливаться, вид: UIView
+[17:42:38 SUDO] sudo спрашивает пароль: спрошу один раз в начале
+[sudo] password for cactus:
+==> Looking for updates...
+
+==> Packages:
+gnupg  2.4.9-3  ->  2.4.9-4
+linux  7.2.11.arch1-1  ->  7.2.12.arch1-1
+
+==> AUR Packages:
+brave-bin  1:1.97.57-1  ->  1:1.98.63-1
+yay  12.5.2-1  ->  12.5.3-1
+
+==> Proceed with update? [Y/n]
+[17:42:41 АВТО] «==> Proceed with update? [Y/n]» → y   (proceed with update)
+y
+:: Proceed with installation? [Y/n]
+[17:42:52 АВТО] «:: Proceed with installation? [Y/n]» → y   (pacman proceed)
+y
+(1/2) upgrading gnupg                            [######################] 100%
+(2/2) upgrading linux                            [######################] 100%
+:: Running post-transaction hooks...
+(3/9) Updating linux initcpios...
+==> Building image from preset: /etc/mkinitcpio.d/linux.preset: 'default'
+==> ERROR: Initcpio image generation FAILED: '/boot/initramfs-linux.img'
+error: command failed to execute correctly
+  -> Downloading brave-bin-1.98.63-x86_64.zip...
+Error while writing index for `/home/cactus/.cache/yay/yay-bin/pkg/yay-bin/usr/bin/yay': No debugging symbols
+==> The update has been applied
+[17:45:44 КОНЕЦ] arch-update завершился, код 0
+[17:45:45 ПАКЕТЫ] обновлены: brave-bin 1:1.97.57-1→1:1.98.63-1, gnupg 2.4.9-3→2.4.9-4, \
+linux 7.2.11.arch1-1→7.2.12.arch1-1, yay 12.5.2-1→12.5.3-1
+[17:45:45 ПРОБЛЕМА] в выводе: «Initcpio image generation FAILED»
+[17:45:45 ПРОБЛЕМА] в выводе: «error: command failed to execute correctly»
+[17:45:45 ПРОБЛЕМА] /boot/initramfs-linux.img пустой — НЕ перезагружайся (сначала: sudo mkinitcpio -P)
+[17:45:46 ВНИМАНИЕ] перезагрузись, когда будет удобно (обновились: linux)
+
+══════ /var/log/pacman.log за это обновление ══════
+[2026-10-31T17:42:47-0700] [PACMAN] Running 'pacman -Syu'
+[2026-10-31T17:43:02-0700] [ALPM] upgraded gnupg (2.4.9-3 -> 2.4.9-4)
+[2026-10-31T17:43:10-0700] [ALPM] upgraded linux (7.2.11.arch1-1 -> 7.2.12.arch1-1)
+[2026-10-31T17:43:30-0700] [ALPM-SCRIPTLET] ==> ERROR: Initcpio image generation FAILED: '/boot/initramfs-linux.img'
+[17:43:31 ПРОБЛЕМА] what a hook printed: not one of the updater's lines
+[2026-10-31T17:43:31-0700] [ALPM] transaction completed
+"""
+# Past midnight, by hand: the end is on the next day.
+MIDNIGHT = """[23:58:10 СТАРТ] arch-update, режим: ручной, новости: останавливаться, вид: UIView
+==> Proceed with update? [Y/n] y
+:: Proceed with installation? [Y/n] y
+(1/1) upgrading firefox                          [######################] 100%
+[00:03:11 КОНЕЦ] arch-update завершился, код 0
+[00:03:12 ПАКЕТЫ] обновлены: firefox 140.0-1→141.0-1
+[00:03:12 ПАКЕТЫ] новые: libfoo; удалены: oldlib, oldlib2
+
+══════ /var/log/pacman.log за это обновление ══════
+[2026-10-31T00:01:02+0300] [ALPM] upgraded firefox (140.0-1 -> 141.0-1)
+"""
+# The main PC's usual end: nothing wrong, something to read.
+WARNED = """[21:00:00 СТАРТ] arch-update, режим: автоответы, новости: не останавливаться, вид: UIView
+:: Proceed with installation? [Y/n]
+[21:00:20 АВТО] «:: Proceed with installation? [Y/n]» → y   (pacman proceed)
+y
+==> Select the service(s) to restart (e.g. 1 3 5), select 0 to restart them all or press "enter" to continue \
+without restarting the service(s):
+[21:04:10 АВТО] «==> Select the service(s) to restart (e.g. 1 3 5), select 0 to restart them all or press "enter" \
+to continue without restarting the service(s):» → Enter   (restart services)
+[21:04:30 КОНЕЦ] arch-update завершился, код 0
+[21:04:31 ПАКЕТЫ] обновлены: plasma-workspace 6.5.1-1→6.5.2-1
+[21:04:31 ПАКЕТЫ] новые: python-foo; удалены: kwayland5, plasma-wayland-protocols
+[21:04:32 СЕРВИСЫ] не работали ещё до обновления: bluetooth.service
+[21:04:32 ВНИМАНИЕ] есть пакеты-сироты — не удалял, посмотреть: pacman -Qdtq
+[21:04:32 ВНИМАНИЕ] arch-update предлагал перезапустить сервисы — пропущено, перезагрузка это решит
+"""
+DECLINED = """[08:00:00 СТАРТ] arch-update, режим: ручной, новости: останавливаться, вид: UIView
+==> Proceed with update? [Y/n] n
+[08:00:09 КОНЕЦ] arch-update завершился, код 4
+[08:00:10 НЕ НАЧАТО] обновление отменено — система не менялась
+"""
+UNMOUNTED = """[07:00:00 СТАРТ] arch-update, режим: автоответы, новости: останавливаться, вид: UIView
+[07:00:01 НЕ НАЧАТО] /boot не смонтирован — обновление не начинаю (ядро записалось бы не туда)
+"""
+CUT_OFF = """[06:00:00 СТАРТ] arch-update, режим: автоответы, новости: останавливаться, вид: TerminalView
+:: Retrieving packages...
+ linux-7.2.12.arch1-1-x86_64 downloading...
+"""
+CLEAN = """[09:10:02 СТАРТ] arch-update, режим: автоответы, новости: останавливаться, вид: UIView
+(1/2) upgrading mesa                             [######################] 100%
+(2/2) upgrading vulkan-radeon                    [######################] 100%
+[09:12:40 КОНЕЦ] arch-update завершился, код 0
+[09:12:41 ПАКЕТЫ] обновлены: mesa 1:26.2.5-1→1:26.2.6-1, vulkan-radeon 1:26.2.5-1→1:26.2.6-1
+"""
+JOURNALS = [("2026-10-28_09-10-02", CLEAN), ("2026-10-29_06-00-00", CUT_OFF), ("2026-10-29_07-00-00", UNMOUNTED),
+            ("2026-10-30_08-00-00", DECLINED), ("2026-10-30_21-00-00", WARNED), ("2026-10-30_23-58-10", MIDNIGHT),
+            ("2026-10-31_17-42-38", BROKEN_BOOT)]
+
+
+def relay_takes(r):
+    """What relay/worker.js (validate) asks of a report: a report the tests send is one the real relay would file."""
+    u = r.get("update")
+    try:
+        when = datetime.datetime.strptime(r.get("time"), "%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError):
+        return False
+    lists = ("changed", "added", "removed", "problems", "warnings", "ok")
+    return (r.get("schema") == 1 and re.fullmatch(r"[0-9a-f]{8}", str(r.get("id"))) is not None
+            and 2020 <= when.year <= 2099 and r["time"].endswith("Z") and isinstance(r.get("device"), dict)
+            and isinstance(r.get("updater", {}), dict) and isinstance(u, dict)
+            and u.get("verdict") in (0, 1, 2, None) and not isinstance(u.get("verdict"), bool)
+            and isinstance(u.get("started", True), bool) and (u.get("exit") is None or type(u["exit"]) is int)
+            and (u.get("seconds") is None or 0 <= u["seconds"] <= 30 * 86400)
+            and all(isinstance(u.get(k, []), list) and all(isinstance(s, str) for s in u.get(k, [])) for k in lists)
+            and isinstance(r.get("log"), str))
+
 
 class Relay(http.server.BaseHTTPRequestHandler):
     """The relay's stand-in: answers every POST with Relay.code (a number, or a function of the
-    report that came) and keeps what it got."""
-    code, got = 201, []
+    report that came) and keeps what it got. Like the relay, it answers a report it files with the
+    issue's number, and the same report again (the same machine and time: the same log file, see
+    putLog in relay/worker.js) with that number, as a duplicate."""
+    code, got, filed, headers = 201, [], {}, {}
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         Relay.got.append(body)
-        self.send_response(Relay.code(body) if callable(Relay.code) else Relay.code)
+        code = Relay.code(body) if callable(Relay.code) else Relay.code
+        answer = {"ok": 200 <= code < 300}
+        key = (body.get("id"), body.get("time")) if isinstance(body, dict) and body.get("log") else None
+        if code == 201 and key in Relay.filed:
+            code, answer = 200, {"ok": True, "issue": Relay.filed[key], "duplicate": True}
+        elif code == 201:
+            answer["issue"] = len(Relay.filed) + 1
+            Relay.filed[key or len(Relay.got)] = answer["issue"]
+        elif code >= 400:
+            answer["error"] = "не принят"
+        self.send_response(code)
+        for name, value in Relay.headers.items():
+            self.send_header(name, value)
         self.end_headers()
-        self.wfile.write(b'{"ok": true}')
+        self.wfile.write(json.dumps(answer).encode())
 
     def log_message(self, *args):
         pass
@@ -88,9 +219,9 @@ class Reports(unittest.TestCase):
         os.environ.pop("ARCH_UPDATE_REPORT_URL", None)
         self.stop_relay()
 
-    def relay(self, code=201):
+    def relay(self, code=201, headers=None):
         self.stop_relay()
-        Relay.code, Relay.got = code, []
+        Relay.code, Relay.got, Relay.filed, Relay.headers = code, [], {}, headers or {}
         self.server = http.server.HTTPServer(("127.0.0.1", 0), Relay)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         os.environ["ARCH_UPDATE_REPORT_URL"] = f"http://127.0.0.1:{self.server.server_port}/report"
@@ -126,6 +257,39 @@ class Reports(unittest.TestCase):
             os.replace(report.queue(r), path)
             paths.append(path)
         return paths
+
+    def journal(self, stamp, text, summary=None, folder=None):
+        """An update's journal as engine.RunLog leaves it in logs/ (or in folder), with its .raw and, if given, the
+        engine's summary next to it (a dict, or the text of a damaged one)."""
+        folder = folder or report.LOGS
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, stamp + ".log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        with open(path[:-4] + ".raw", "wb") as f:
+            f.write(text.encode())
+        if summary is not None:
+            with open(path[:-4] + ".json", "w", encoding="utf-8") as f:
+                f.write(summary if isinstance(summary, str) else json.dumps(summary, ensure_ascii=False))
+        return path
+
+    def journals(self):
+        """The journals of JOURNALS, oldest first, without summaries: from before there were any."""
+        return [self.journal(stamp, text) for stamp, text in JOURNALS]
+
+    def zone(self, tz):
+        """The machine's time zone for this test (POSIX: "MSK-3" is three hours ahead of UTC)."""
+        saved = os.environ.get("TZ")
+        os.environ["TZ"] = tz
+        time.tzset()
+
+        def restore():
+            if saved is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = saved
+            time.tzset()
+        self.addCleanup(restore)
 
     # ── consent
 
@@ -686,6 +850,329 @@ class Reports(unittest.TestCase):
         report.set_consent(True)
         report.queue({"schema": 1})
         self.assertEqual(report.send_pending(), (1, 0))
+
+    # ── the updates kept on this machine, and a report sent by hand
+
+    def test_updates_from_before_the_summaries_are_listed_from_their_journals(self):
+        paths = self.journals()
+        os.symlink(os.path.basename(paths[-1]), os.path.join(report.LOGS, "latest.log"))
+        open(os.path.join(report.LOGS, "notes.txt"), "w").close()
+        got = report.local_updates()
+        self.assertEqual([u["log"] for u in got], paths[:-6:-1])             # the newest five, newest first
+        broken, midnight, warned, declined, unmounted = got
+        self.assertEqual((broken["verdict"], broken["started"], broken["mode"], broken["exitstatus"]),
+                         (2, True, "auto", 0))
+        self.assertEqual((broken["changed"], broken["added"], broken["packages"]),
+                         (["brave-bin", "gnupg", "linux", "yay"], [], 4))
+        self.assertEqual(broken["problems"], ["в выводе: «Initcpio image generation FAILED»",
+                                              "в выводе: «error: command failed to execute correctly»",
+                                              "/boot/initramfs-linux.img пустой — НЕ перезагружайся "
+                                              "(сначала: sudo mkinitcpio -P)"])     # not what a hook printed
+        self.assertEqual(broken["warnings"], ["перезагрузись, когда будет удобно (обновились: linux)"])
+        self.assertEqual((broken["time"], broken["ended"], broken["seconds"]),
+                         ("2026-10-31T17:42:38", "2026-10-31T17:45:46", 188))
+        self.assertEqual((broken["sent"], broken["issue"], broken["notes"], broken["waiting"]), ("", None, [], False))
+        self.assertEqual((midnight["verdict"], midnight["mode"], midnight["ended"], midnight["seconds"]),
+                         (0, "manual", "2026-10-31T00:03:12", 302))
+        self.assertEqual((midnight["changed"], midnight["added"], midnight["removed"], midnight["packages"]),
+                         (["firefox"], ["libfoo"], ["oldlib", "oldlib2"], 4))
+        self.assertEqual((warned["verdict"], warned["problems"], len(warned["warnings"]), warned["packages"]),
+                         (1, [], 2, 4))
+        self.assertEqual((declined["verdict"], declined["started"], declined["exitstatus"], declined["warnings"]),
+                         (1, False, 4, ["обновление отменено — система не менялась"]))
+        self.assertEqual((unmounted["verdict"], unmounted["started"], unmounted["packages"]), (2, False, 0))
+        self.assertIn("не смонтирован", unmounted["problems"][0])
+        everything = report.local_updates(10)
+        self.assertEqual([u["log"] for u in everything], paths[::-1])
+        cut_off, clean = everything[-2:]
+        self.assertEqual((cut_off["verdict"], cut_off["started"], cut_off["exitstatus"]), (None, True, None))
+        self.assertEqual((clean["verdict"], clean["changed"]), (0, ["mesa", "vulkan-radeon"]))
+        self.assertEqual(report.local_updates(0), [])
+
+    def test_the_engines_summary_counts_where_there_is_one(self):
+        summary = {"verdict": 1, "changed": ["mesa"], "added": [], "removed": [], "problems": [],
+                   "warnings": ["есть .pacnew файлы — разберём вместе (pacdiff -o покажет список)"],
+                   "notes": ["сервисы не перезапускались"], "ok": ["pacman завершился штатно"], "exitstatus": 0,
+                   "started": True, "mode": "manual", "began": "2026-11-02T10:00:00", "ended": "2026-11-02T10:01:30",
+                   "boot_id": "6f0a…", "services": {"listed": [], "restarted": [], "skipped": []}, "fixes": []}
+        path = self.journal("2026-11-02_10-00-00", BROKEN_BOOT, summary)     # its journal says otherwise
+        u, = report.local_updates()
+        self.assertEqual((u["verdict"], u["mode"], u["changed"], u["problems"], u["notes"], u["ok"], u["seconds"]),
+                         (1, "manual", ["mesa"], [], summary["notes"], summary["ok"], 90))
+        self.assertFalse(u["resolved"])
+        report._write_json(path[:-4] + ".json", dict(summary, verdict=2, problems=["нет /boot/vmlinuz-linux"],
+                                                     resolved=True))
+        self.assertTrue(report.local_updates()[0]["resolved"])
+        self.assertIn("✓ исправлено", report.listing())
+        # One half written, or of another shape, is no summary: the journal is read instead.
+        for junk in ('{"verdict": 1, "chan', "[1, 2]", '{"verdict": "yes"}', '{"verdict": true}', "{}"):
+            with open(path[:-4] + ".json", "w", encoding="utf-8") as f:
+                f.write(junk)
+            u, = report.local_updates()
+            self.assertEqual((u["verdict"], len(u["problems"]), u["mode"]), (2, 3, "auto"), junk)
+
+    def test_odd_files_in_the_journals_folder_break_nothing(self):
+        self.journal("2026-10-01_10-00-00", "")
+        with open(os.path.join(report.LOGS, "2026-10-02_10-00-00.log"), "wb") as f:
+            f.write(bytes(range(256)) * 64 + b"\n[1\xff:00:00 \xd0\x9f] x\n")
+        self.journal("2026-10-03_10-00-00", "[99:99:99 ПРОБЛЕМА] нет\n[25:00:00 КОНЕЦ] код x\n[10:00:01 КОНЕЦ]\n"
+                                            "[10:00:02 ПАКЕТЫ] новые: ; удалены\n")
+        os.mkdir(os.path.join(report.LOGS, "2026-10-04_10-00-00.log"))      # a folder named like a journal
+        self.journal("2026-13-45_10-00-00", BROKEN_BOOT)                     # no such day
+        outside = self.journal("2026-10-05_10-00-00", BROKEN_BOOT, folder=os.path.join(HOME, "elsewhere"))
+        os.symlink(outside, os.path.join(report.LOGS, "2026-10-06_10-00-00.log"))
+        got = report.local_updates(10)
+        self.assertEqual([os.path.basename(u["log"]) for u in got],
+                         ["2026-10-03_10-00-00.log", "2026-10-02_10-00-00.log", "2026-10-01_10-00-00.log"])
+        self.assertEqual([u["verdict"] for u in got], [None, None, None])
+        self.assertEqual(got[0]["ended"], "2026-10-03T10:00:02")
+        report.listing()
+
+    def test_a_long_journal_is_listed_quickly(self):
+        build = "".join(f"  CC [M]  drivers/gpu/drm/i915/display/intel_{i:06d}.o\n" for i in range(300_000))
+        self.journal("2026-10-31_17-42-38", BROKEN_BOOT.replace("==> The update has been applied\n",
+                                                                build + "==> The update has been applied\n"))
+        t0 = time.perf_counter()
+        u, = report.local_updates()
+        self.assertLess(time.perf_counter() - t0, 2)                     # its head and its end are read, not all
+        self.assertEqual((u["verdict"], len(u["problems"]), u["mode"], u["packages"]), (2, 3, "auto", 4))
+        self.assertGreater(os.path.getsize(u["log"]), report.WHOLE)
+
+    def test_a_report_of_a_journal_is_one_the_relay_files(self):
+        self.zone("MSK-3")
+        report._who = lambda: WHO
+        path = self.journal("2026-10-30_23-58-10", MIDNIGHT)
+        r = report.build_from_log(path, ui={"screen": "80x24", "monitors": None})
+        self.assertEqual(r["id"], "")                                   # building it makes no ID
+        self.assertFalse(os.path.exists(report.SETTINGS))
+        r["id"] = report.ensure_id()
+        self.assertTrue(relay_takes(r), r["update"])
+        self.assertEqual(r["time"], "2026-10-30T21:03:12Z")             # when it ended, in UTC
+        u = r["update"]
+        self.assertEqual((u["mode"], u["verdict"], u["started"], u["exit"], u["seconds"]), ("manual", 0, True, 0, 302))
+        self.assertEqual((u["changed"], u["added"], u["removed"]), (["firefox"], ["libfoo"], ["oldlib", "oldlib2"]))
+        self.assertEqual(r["device"]["screen"], "80x24")
+        self.assertRegex(r["log"], r"^\[отчёт отправлен вручную \d\d\.\d\d\.20\d\d \d\d:\d\d; устройство и версия "
+                                   r"апдейтера в нём — на это время\]\n\[23:58:10 СТАРТ\]")
+        self.assertIn("[00:03:12 ПАКЕТЫ] новые: libfoo; удалены: oldlib, oldlib2", r["log"])
+
+    def test_an_update_is_sent_by_hand_with_the_reports_off(self):
+        self.zone("UTC0")
+        for decided in (False, True):
+            with self.subTest(decided=decided):
+                shutil.rmtree(os.path.join(HOME, ".local"), ignore_errors=True)
+                self.relay()
+                report._who = lambda: WHO
+                if decided:
+                    report.set_consent(False)                           # the installer's question: no
+                path = self.journal("2026-10-31_17-42-38", BROKEN_BOOT)
+                self.assertEqual(report.send_now(path), (True, "отчёт отправлен разработчику (№ 1)", 1))
+                got, = Relay.got
+                self.assertTrue(relay_takes(got), got["update"])
+                self.assertEqual((got["update"]["verdict"], got["time"]), (2, "2026-10-31T17:45:46Z"))
+                self.assertIn("/boot/initramfs-linux.img пустой — НЕ перезагружайся (сначала: sudo mkinitcpio -P)",
+                              got["update"]["problems"])
+                self.assertIn("==> ERROR: Initcpio image generation FAILED", got["log"])
+                # The machine has an ID now, and that is all: no automatic reports, nor a choice made about them.
+                self.assertRegex(report.report_id(), r"^[0-9a-f]{8}$")
+                self.assertEqual(got["id"], report.report_id())
+                self.assertEqual((report.enabled(), report.decided()), (False, decided))
+                self.assertIsNone(report.after_update(self.result()))
+                self.assertEqual(self.waiting(), [])
+                u, = report.local_updates()
+                self.assertEqual(u["issue"], 1)
+                self.assertTrue(report._local(u["sent"]))
+                self.assertEqual(report._read_json(report.RECORDS)["2026-10-31_17-42-38.log"]["issue"], 1)
+                self.assertIn("отправлен", report.listing())
+
+    def test_an_update_sent_again_goes_and_says_it_went_before(self):
+        self.relay()
+        path = self.journal("2026-10-31_17-42-38", BROKEN_BOOT)
+        self.assertTrue(report.send_now(path)[0])
+        rid = report.report_id()
+        self.assertEqual(report.send_now(path), (True, "этот отчёт уже у разработчика (№ 1)", 1))
+        self.assertEqual(len(Relay.got), 2)
+        self.assertEqual({(r["id"], r["time"]) for r in Relay.got}, {(rid, Relay.got[0]["time"])})   # the same report
+        u, = report.local_updates()
+        self.assertEqual((u["issue"], bool(u["sent"])), (1, True))
+
+    def test_what_the_user_is_told_when_a_report_cannot_go(self):
+        path = self.journal("2026-10-31_17-42-38", BROKEN_BOOT)
+        self.assertEqual(report.send_now(path), (False, "сервер для отчётов не подключён", None))
+        os.environ["ARCH_UPDATE_REPORT_URL"] = "http://127.0.0.1:9/report"     # nobody listens on port 9
+        self.assertEqual(report.send_now(path, timeout=3), (False, "нет связи с сервером — попробуй позже", None))
+        self.relay(429, headers={"Retry-After": "1200"})
+        ok, message, issue = report.send_now(path)
+        self.assertEqual((ok, issue), (False, None))
+        self.assertTrue(message.startswith("сервер просит подождать — попробуй позже"), message)
+        self.assertIn(f"до {report.PER_HOUR} отчётов в час", message)
+        for code, said in ((400, "сервер не принял отчёт (HTTP 400)"), (413, "сервер не принял отчёт (HTTP 413)"),
+                           (502, "сервер не принял отчёт (HTTP 502) — попробуй позже"),
+                           (408, "нет связи с сервером — попробуй позже")):
+            self.relay(code)
+            self.assertEqual(report.send_now(path), (False, said, None), code)
+        self.assertEqual(report.send_now(os.path.join(report.LOGS, "2026-10-30_10-00-00.log")),
+                         (False, "журнал этого обновления не найден", None))
+        u, = report.local_updates()
+        self.assertEqual((u["sent"], u["issue"]), ("", None))               # none of it counts as sent
+        self.assertEqual(report._read_json(report.RECORDS), {})
+        self.assertFalse(report.enabled())
+
+    def test_a_report_sent_by_hand_names_nobody(self):
+        self.relay()
+        report._who = lambda: WHO
+        path = self.journal("2026-10-31_17-42-38", BROKEN_BOOT + PERSONAL_LOG + MORE_LOG)
+        self.assertTrue(report.send_now(path)[0])
+        got = json.dumps(Relay.got[0], ensure_ascii=False)
+        self.assertNotRegex(got, GONE)
+        for gone in ("/home/cactus", "3c:22:fb", "ivan.petrov@example.com", "0123456789abcdef0123456789abcdef"):
+            self.assertNotIn(gone, got)
+        for kept in ("[sudo] password for <user>:", "~/.cache/yay/yay-bin", "gnupg 2.4.9-3→2.4.9-4"):
+            self.assertIn(kept, Relay.got[0]["log"])
+
+    def test_a_journal_that_says_not_how_it_ran_is_taken_for_one_typed_by_hand(self):
+        # No СТАРТ line (a journal its disk ran out on): what was typed ahead of a password prompt goes all the same.
+        self.relay()
+        report._who = lambda: WHO
+        path = self.journal("2026-10-31_17-42-38", "correct horse battery staple\nhunter2\n"
+                                                   "[sudo] password for cactus: \n==> Looking for updates...\n")
+        self.assertTrue(report.send_now(path)[0])
+        log = Relay.got[0]["log"]
+        self.assertNotIn("correct horse", log)
+        self.assertNotIn("hunter2", log)
+        self.assertIn("[sudo] password for <user>:", log)
+        self.assertIsNone(Relay.got[0]["update"]["mode"])
+
+    def test_the_demos_journals_are_never_listed_sent_or_deleted(self):
+        self.relay()
+        demo = self.journal("2026-11-01_10-00-00", BROKEN_BOOT,
+                            folder=os.path.join(report.engine.STATE_DIR, "demo-logs"))
+        self.assertEqual(report.local_updates(), [])
+        self.assertEqual(report.send_now(demo), (False, "это не журнал обновления этого компьютера", None))
+        self.assertFalse(report.delete_local(demo))
+        self.assertEqual(Relay.got, [])
+        self.assertTrue(os.path.exists(demo))
+        self.assertFalse(os.path.exists(report.SETTINGS))                   # no ID either
+
+    def test_an_update_is_deleted_whole_and_nothing_else_is(self):
+        self.relay()
+        paths = self.journals()
+        newest = paths[-1]
+        latest = os.path.join(report.LOGS, "latest.log")
+        os.symlink(os.path.basename(newest), latest)
+        report._write_json(newest[:-4] + ".json", {"verdict": 2})
+        self.assertTrue(report.send_now(newest)[0])
+        self.assertTrue(report.delete_local(newest))
+        for ext in (".log", ".raw", ".json"):
+            self.assertFalse(os.path.exists(newest[:-4] + ext), ext)
+        self.assertNotIn(os.path.basename(newest), report._read_json(report.RECORDS))
+        self.assertEqual(os.readlink(latest), os.path.basename(paths[-2]))  # the newest one left
+        self.assertEqual([u["log"] for u in report.local_updates(10)], paths[-2::-1])
+        # Anything that is not an update in logs/ is refused, and stays.
+        stray = self.result()["log"]
+        demo = self.journal("2026-11-01_10-00-00", CLEAN, folder=os.path.join(report.engine.STATE_DIR, "demo-logs"))
+        named_like_one = self.journal("2026-11-02_10-00-00", CLEAN, folder=HOME)
+        link = os.path.join(report.LOGS, "2026-11-03_10-00-00.log")
+        os.symlink(named_like_one, link)
+        for log in (stray, demo, named_like_one, link, report.LOGS, os.path.join(report.LOGS, ".."), report.SETTINGS,
+                    os.path.join(report.LOGS, "..", "logs", "..", "settings.json"), "", None, 42, "../../etc/passwd"):
+            self.assertFalse(report.delete_local(log), log)
+        for f in (stray, demo, named_like_one):
+            self.assertTrue(os.path.exists(f), f)
+        self.assertTrue(os.path.islink(link))
+        # An update by its name alone, or as latest.log.
+        self.assertTrue(report.delete_local(os.path.basename(paths[0])))
+        self.assertTrue(report.delete_local(latest))
+        self.assertEqual([u["log"] for u in report.local_updates(10)], paths[-3:0:-1])
+        self.assertEqual(os.readlink(latest), os.path.basename(paths[-3]))
+        for path in paths[1:-2]:
+            self.assertTrue(report.delete_local(path))
+        self.assertFalse(os.path.lexists(latest))                           # no journal left to name
+        self.assertEqual(sorted(os.listdir(report.LOGS)), ["2026-11-03_10-00-00.log"])
+
+    def test_an_automatic_report_marks_its_update_sent(self):
+        self.relay()
+        report.set_consent(True)
+        path = self.journal("2026-10-31_17-42-38", BROKEN_BOOT)
+        res = {"verdict": 2, "changed": ["linux"], "added": [], "removed": [], "exitstatus": 0, "problems": ["x"],
+               "warnings": [], "ok": [], "log": path}
+        queued = report.after_update(res, mode="auto", seconds=188)
+        u, = report.local_updates()
+        self.assertEqual((u["sent"], u["waiting"]), ("", True))
+        self.assertEqual(report.send_pending(), (1, 0))
+        u, = report.local_updates()
+        self.assertEqual((u["issue"], bool(u["sent"]), u["waiting"]), (1, True, False))
+        self.assertEqual(report.state_of(queued), "sent")
+        # Sent by hand after that: the same report to the relay (its time too), which has it already.
+        self.assertEqual(report.send_now(path), (True, "этот отчёт уже у разработчика (№ 1)", 1))
+        self.assertEqual(Relay.got[1]["time"], Relay.got[0]["time"])
+
+    def test_a_report_sent_by_hand_takes_the_waiting_one_along(self):
+        report.set_consent(True)
+        path = self.journal("2026-10-31_17-42-38", BROKEN_BOOT)
+        queued = report.after_update({"verdict": 2, "log": path, "problems": ["x"]}, mode="auto")
+        self.assertEqual(report.state_of(queued), "waiting")                # no relay yet
+        self.relay()
+        self.assertEqual(report.send_now(path), (True, "отчёт отправлен разработчику (№ 1)", 1))
+        self.assertEqual(report.state_of(queued), "")                       # it went out by hand
+        self.assertEqual(report.send_pending(), (0, 0))
+        self.assertEqual(len(Relay.got), 1)
+        self.assertEqual(report._read_json(report.RECORDS)["2026-10-31_17-42-38.log"]["time"], Relay.got[0]["time"])
+
+    def test_settings_keep_each_other(self):
+        self.assertEqual(report.option("restart_services", False), False)   # nothing written yet
+        report.set_option("restart_services", True)                         # makes the state folder
+        self.assertIs(report.option("restart_services", False), True)
+        report.set_consent(True)
+        rid = report.report_id()
+        report.set_option("restart_services", False)
+        self.assertEqual((report.option("restart_services", True), report.enabled(), report.report_id()),
+                         (False, True, rid))
+        report._write_json(report.SETTINGS, dict(report.settings(), restart_services="yes"))   # by hand
+        self.assertIs(report.option("restart_services", False), False)
+        self.assertEqual((report.option("missing"), report.option("missing", 3)), (None, 3))
+        # The reports' own switch, through set_consent: off drops what waits to be sent.
+        report.after_update(self.result())
+        self.assertEqual(len(self.waiting()), 1)
+        report.set_option("reports", False)
+        self.assertEqual((self.waiting(), report.enabled(), report.report_id(), report.settings()["restart_services"]),
+                         ([], False, rid, "yes"))
+        self.assertEqual(report.ensure_id(), rid)                           # an ID it has is kept
+
+    def test_the_command_line_lists_and_sends_the_last_updates(self):
+        paths = self.journals()
+        env = dict(os.environ, HOME=HOME)
+        cli = [sys.executable, os.path.join(ROOT, "lib", "report.py")]
+        out = subprocess.run(cli + ["--list"], env=env, capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertRegex(out.stdout, r"(?m)^ 1  31\.10\.2026 17:42  ✗ нужна проверка +4 пакета +не отправлен\n"
+                                     r"    /boot/initramfs-linux\.img пустой — НЕ перезагружайся")
+        for line in (" 2  30.10.2026 23:58  ✓ всё чисто", " 3  30.10.2026 21:00  ⚠ есть что прочитать",
+                     " 4  30.10.2026 08:00  · не начиналось", " 5  29.10.2026 07:00  ✗ не начиналось"):
+            self.assertIn(line, out.stdout)
+        self.assertNotIn("28.10.2026", out.stdout)                          # the newest five only
+        self.relay()
+        env["ARCH_UPDATE_REPORT_URL"] = os.environ["ARCH_UPDATE_REPORT_URL"]
+        sent = subprocess.run(cli + ["--send", "1"], env=env, capture_output=True, text=True)
+        self.assertEqual((sent.returncode, sent.stdout.splitlines()),
+                         (0, ["Отправляю отчёт об обновлении 31.10.2026 17:42…", "отчёт отправлен разработчику (№ 1)"]))
+        out = subprocess.run(cli + ["--list"], env=env, capture_output=True, text=True).stdout
+        self.assertRegex(out, r"(?m)^ 1  .* отправлен \d\d\.\d\d \d\d:\d\d \(№ 1\)$")
+        sent = subprocess.run(cli + ["--send-log", paths[0]], env=env, capture_output=True, text=True)
+        self.assertEqual((sent.returncode, sent.stdout.splitlines()[-1]), (0, "отчёт отправлен разработчику (№ 2)"))
+        for bad in (["--send", "0"], ["--send", "8"], ["--send", "x"], ["--send", "²"],
+                    ["--send-log", os.path.join(HOME, "nothing.log")], ["--send-log", self.result()["log"]]):
+            run = subprocess.run(cli + bad, env=env, capture_output=True, text=True)
+            self.assertNotEqual(run.returncode, 0, bad)
+            self.assertTrue(run.stderr.strip(), bad)
+        env["ARCH_UPDATE_REPORT_URL"] = ""
+        run = subprocess.run(cli + ["--send", "2"], env=env, capture_output=True, text=True)
+        self.assertEqual((run.returncode, run.stderr.strip()), (1, "сервер для отчётов не подключён"))
+        self.assertEqual(len(Relay.got), 2)
+        self.assertFalse(report.enabled())
+        shutil.rmtree(report.LOGS)
+        out = subprocess.run(cli + ["--list"], env=env, capture_output=True, text=True).stdout
+        self.assertEqual(out.strip(), "На этом компьютере пока нет журналов обновлений.")
 
     # ── the installer's side
 

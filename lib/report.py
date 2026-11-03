@@ -8,17 +8,26 @@ cable, the adapter, the signal) and the update's log. Taken out of all of it: th
 host's names, home paths, IP and MAC addresses, e-mail addresses, the machine ID, passwords and
 tokens in web addresses, the instance names of systemd units (a user or a Wi-Fi network can be
 named there) and a password typed before its prompt showed. The name of the Wi-Fi network is never
-read. Nothing is collected while reports are off (the default), and the demo never reports.
+read. While reports are off (the default) nothing is collected and nothing goes out but the one
+report the user sends by hand: a key on the summary or in the list of the last updates, or
+report.py --send N. That key is the consent for that one report and switches nothing on. The demo
+never reports.
 
-Everything stays in ~/.local/state/arch-update-auto: settings.json (the choice, a random report
-ID), reports/outbox (waiting to be sent) and reports/sent (the last ones that went out).
+Everything stays in ~/.local/state/arch-update-auto: settings.json (the choices, a random report
+ID), reports/outbox (waiting to be sent), reports/sent (the last ones that went out) and
+reports/manual.json (which updates' reports went out, with their issues). The updates themselves
+are the journals in logs/ (with a summary, <stamp>.json, from the engine of this version on).
 
   report.py --consent yes|no   record the user's choice (the installer's question)
   report.py --decided          exit 0 if the user has chosen either way
   report.py --status           one line for the installer: on or off
   report.py --send             send what waits in the outbox (started detached after an update)
   report.py --preview          what a report from this machine looks like now
+  report.py --list             the last updates kept on this machine, numbered: 1 is the newest
+  report.py --send N           send the report of update N of that list now, with reports off too
+  report.py --send-log PATH    the same for the update of that journal (one in logs/)
 """
+import contextlib
 import datetime
 import fcntl
 import glob
@@ -54,6 +63,12 @@ KEEP = {OUTBOX: 20, SENT: 20, REJECTED: 5}
 TRIES = 3                           # times the relay may fail on one report (500, 502) before it is set aside
 LOG_LIMIT = 200_000                 # characters of log in one report: the head and the tail of a longer one
 ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+# The updates kept on this machine: the journals of engine.RunLog (<stamp>.log, .raw and the summary <stamp>.json),
+# never the demo's (demo-logs/). Which of them went out, and as which issue, manual.json says.
+LOGS = os.path.join(engine.STATE_DIR, "logs")
+RECORDS = os.path.join(REPORTS, "manual.json")
+SHOWN = 5                           # updates the list of the last ones offers
+PER_HOUR = 6                        # reports the relay takes from one machine in an hour (relay/worker.js PER_ID)
 
 
 def endpoint():
@@ -110,20 +125,21 @@ def set_consent(on):
     """The user's choice. Switching off drops what was waiting to be sent, before anything else: if
     the choice cannot be written then, settings.json goes (without it reports are off) and the error
     is raised all the same."""
-    s = settings()
-    s["reports"] = bool(on)
-    s["reports_decided"] = datetime.date.today().isoformat()
-    if on and not _id_ok(s.get("report_id")):
-        s["report_id"] = secrets.token_hex(4)          # random: not derived from anything on the machine
-    if not on:
-        for f in glob.glob(os.path.join(OUTBOX, "*.json")):
-            _remove(f)
-    try:
-        _write_json(SETTINGS, s)
-    except OSError:
+    with _locked():                     # an ID a report sent by hand makes meanwhile is kept (ensure_id)
+        s = settings()
+        s["reports"] = bool(on)
+        s["reports_decided"] = datetime.date.today().isoformat()
+        if on and not _id_ok(s.get("report_id")):
+            s["report_id"] = secrets.token_hex(4)      # random: not derived from anything on the machine
         if not on:
-            _remove(SETTINGS)
-        raise
+            for f in glob.glob(os.path.join(OUTBOX, "*.json")):
+                _remove(f)
+        try:
+            _write_json(SETTINGS, s)
+        except OSError:
+            if not on:
+                _remove(SETTINGS)
+            raise
     return s
 
 
@@ -134,6 +150,70 @@ def _id_ok(rid):
 def report_id():
     rid = settings().get("report_id")
     return rid if _id_ok(rid) else ""
+
+
+def ensure_id():
+    """This machine's report ID, made now if it has none: for a report sent by hand, without switching the automatic
+    reports on or counting as the choice about them. One that cannot be saved still serves this report."""
+    rid = report_id()
+    if rid:
+        return rid
+    rid = secrets.token_hex(4)                        # random: not derived from anything on the machine
+    try:
+        with _locked():
+            s = settings()
+            if _id_ok(s.get("report_id")):            # made meanwhile
+                return s["report_id"]
+            s["report_id"] = rid
+            _write_json(SETTINGS, s)
+    except OSError:
+        pass
+    return rid
+
+
+def option(key, default=None):
+    """One setting of settings.json (restart_services …): default when it is not there, or is of another type than
+    default (a switch written by hand as "yes")."""
+    value = settings().get(key)
+    if value is None or (default is not None and type(value) is not type(default)):
+        return default
+    return value
+
+
+def set_option(key, value):
+    """One setting changed and the others kept, written whole or not at all; raises OSError when it cannot be
+    written. The reports' own switch goes through set_consent: off drops what waits to be sent."""
+    if key == "reports":
+        return set_consent(value)
+    with _locked():
+        s = settings()
+        s[key] = value
+        _write_json(SETTINGS, s)
+    return s
+
+
+@contextlib.contextmanager
+def _locked():
+    """Held while settings.json or manual.json is read, changed and written back: the program, the sender in its
+    own process and the command line may be at it at once. Waits three seconds at most, and goes on without
+    when no lock can be had."""
+    lock = None
+    try:
+        os.makedirs(REPORTS, exist_ok=True)
+        lock = open(os.path.join(REPORTS, "records.lock"), "a")
+        for _ in range(60):
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                time.sleep(0.05)
+    except OSError:
+        pass
+    try:
+        yield
+    finally:
+        if lock:
+            lock.close()
 
 
 # ───────────────────────────── taking out what is personal ─────────────────────────────
@@ -167,6 +247,7 @@ TYPED_AHEAD_SAYS = "<ввод до запроса пароля>\n"
 # are not the updater's own notes ("[12:34:56 СТАРТ] …").
 PASSWORD_PROMPT = re.compile(r"(?i)(?:\[sudo\] )?(?:password|passphrase|пароль)[^\n]{0,120}?:[^\S\n]*$")
 OWN_NOTE = re.compile(r"\[\d\d:\d\d:\d\d \S")
+SWITCHED_TO_MANUAL = re.compile(r"(?m)^\[\d\d:\d\d:\d\d РУЧНОЙ\]")       # Ctrl+] in an automatic update
 # A templated unit's instance can be a user (syncthing@cactus.service) or a Wi-Fi network (netctl names
 # its profiles "interface-network": netctl@wlp2s0\x2dHome.service); a number (user@1000.service) or a
 # tty (getty@tty1.service) says nothing, if that is all of it (ping@192.168.1.5.service is no number).
@@ -281,7 +362,7 @@ def clean(report, scrub):
     report = scrub_all(report, scrub)
     if isinstance(report, dict) and isinstance(report.get("log"), str):
         update = report.get("update") if isinstance(report.get("update"), dict) else {}
-        if update.get("mode") == "manual" or re.search(r"(?m)^\[\d\d:\d\d:\d\d РУЧНОЙ\]", report["log"]):
+        if update.get("mode") == "manual" or SWITCHED_TO_MANUAL.search(report["log"]):
             report["log"] = hide_typed_ahead(report["log"])
     return report
 
@@ -521,7 +602,7 @@ def build(res, mode="auto", seconds=None, ui=None):
                    "exit": res.get("exitstatus"), "seconds": round(seconds) if seconds else None,
                    "changed": res.get("changed", []), "added": res.get("added", []),
                    "removed": res.get("removed", []), "problems": res.get("problems", []),
-                   "warnings": res.get("warnings", []), "ok": res.get("ok", [])},
+                   "warnings": res.get("warnings", []), "notes": res.get("notes", []), "ok": res.get("ok", [])},
         "log": _log_text(res.get("log")),
     }
     return clean(report, scrubber())
@@ -570,9 +651,15 @@ def after_update(res, demo=False, **info):
     try:
         if not report_id():
             set_consent(True)                       # an ID for a choice made by hand in settings.json
-        path = queue(build(res, **info))
+        report = build(res, **info)
+        path = queue(report)
     except Exception:
         return None
+    # The update's record: its report waits as this file and goes out with this time. One sent by hand later
+    # takes the same time, so that the relay knows it for the same report and files no second issue.
+    name = os.path.basename(_journal(res.get("log")) or "")
+    if name:
+        _record(name, queued=os.path.basename(path), time=report["time"])
     start_sender()
     return path
 
@@ -584,6 +671,10 @@ def _note(**kw):
         _write_json(STATUS, s)
     except OSError:
         pass
+
+
+def _now():
+    return datetime.datetime.now().isoformat(timespec="seconds")
 
 
 def send_pending(timeout=15):
@@ -610,9 +701,40 @@ def _tries(names):
     return {k: n for k, n in got.items() if k in names and type(n) is int and n > 0}
 
 
+def _agent():
+    return "arch-update-cactus/" + updater_version().get("commit", "?")
+
+
+def _post(url, report, timeout, agent):
+    """One report to the relay: (HTTP status, its answer as a dict: {"ok": true, "issue": 12}, or {}). Raises
+    OSError, ValueError or http.client.HTTPException when no answer came (offline, DNS, TLS, a garbled one)."""
+    data = json.dumps(report, ensure_ascii=False).encode("utf-8", "replace")
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers={"Content-Type": "application/json", "User-Agent": agent})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, _answer(r)
+    except urllib.error.HTTPError as e:
+        return e.code, _answer(e)
+
+
+def _answer(r):
+    """The JSON the relay answers with; {} for a body that is none (cut off, or no JSON at all)."""
+    try:
+        got = json.loads(r.read(65536).decode("utf-8", "replace"))
+    except Exception:
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
+def _issue_of(d):
+    n = d.get("issue") if isinstance(d, dict) else None
+    return n if type(n) is int and n > 0 else None
+
+
 def _send(waiting, url, timeout):
     sent = 0
-    agent = "arch-update-cactus/" + updater_version().get("commit", "?")
+    agent = _agent()
     scrub = scrubber()
     tries = _tries({os.path.basename(p) for p in waiting})
     unsure = {}                                         # name → path: 502/504 on it, on it alone or on every report?
@@ -632,21 +754,16 @@ def _send(waiting, url, timeout):
             continue
         # Through the scrubber once more: one queued by an older version goes out as clean as a new one.
         report = clean(report, scrub)
-        data = json.dumps(report, ensure_ascii=False).encode("utf-8", "replace")
         try:
-            req = urllib.request.Request(url, data=data, method="POST",
-                                         headers={"Content-Type": "application/json", "User-Agent": agent})
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                code = r.status
-        except urllib.error.HTTPError as e:
-            code = e.code
+            code, answer = _post(url, report, timeout, agent)
         except (OSError, ValueError, http.client.HTTPException) as e:   # offline, DNS, TLS: try again later
             _note(last_error=f"{type(e).__name__}: {e}"[:200], tries=tries)
             break
         if 200 <= code < 300:
             sent += 1
             tries.pop(name, None)
-            _note(last_sent=datetime.datetime.now().isoformat(timespec="seconds"), last_error="", tries=tries)
+            _note(last_sent=_now(), last_error="", tries=tries)
+            _went_out(name, _issue_of(answer))          # before it leaves the outbox: never "not sent" between
             _file_away(path, SENT, report)
         elif code in (404, 405, 408, 429, 503):         # not set up, busy or limited: the others would fare alike
             _note(last_error=f"HTTP {code}", tries=tries)
@@ -733,6 +850,414 @@ def preview():
     return json.dumps(report, ensure_ascii=False, indent=1)
 
 
+# ───────────────────────────── the updates kept on this machine ─────────────────────────────
+
+JOURNAL = re.compile(r"20\d\d-\d\d-\d\d_\d\d-\d\d-\d\d\.log")             # engine.RunLog's names
+QUEUED = re.compile(r"\d{8}-\d{6}-[0-9a-f]{4}\.json")                     # queue()'s names
+RELAY_TIME = re.compile(r"20[2-9]\d-\d\d-\d\dT\d\d:\d\d:\d\dZ")            # what the relay takes: 2020…2099, UTC
+# The updater's own lines in a journal (RunLog.event): "[17:45:45 ПАКЕТЫ] обновлены: …". Looked for from the newline
+# before them: a pattern with a fixed start is found quickly, and a journal can be megabytes long.
+EVENT = re.compile(r"\n\[(\d\d):(\d\d):(\d\d) ([^\]\n]{1,40})\] ?([^\n]*)")
+PACMAN_PART = "\n══════ /var/log/pacman.log за это обновление ══════"    # after the updater's last lines
+WHOLE, HEAD = 4 * 2 ** 20, 2 ** 19  # bytes of a journal read whole; of a longer one (a long AUR build) its head
+                                    # and the rest of WHOLE from its end: the result follows КОНЕЦ, at the end
+
+
+def _journals():
+    """The names of the journals in logs/, newest first."""
+    try:
+        names = os.listdir(LOGS)
+    except OSError:
+        return []
+    paths = (os.path.join(LOGS, n) for n in names if JOURNAL.fullmatch(n) and _stamp(n))
+    return sorted((os.path.basename(p) for p in paths if os.path.isfile(p) and not os.path.islink(p)), reverse=True)
+
+
+def _stamp(name):
+    """When the update of a journal began, from its name: local time. None for another name."""
+    try:
+        return datetime.datetime.strptime(name[:19], "%Y-%m-%d_%H-%M-%S")
+    except (TypeError, ValueError):
+        return None
+
+
+def _journal(log):
+    """The journal of an update of this machine that log names (its path, its name, or latest.log) as a path in
+    logs/; None for anything else: a file outside logs/ (the demo's, in demo-logs/, too) or of another kind."""
+    try:
+        log = os.fspath(log)
+    except TypeError:
+        return None
+    if not isinstance(log, str) or not log or "\0" in log:
+        return None
+    path = os.path.abspath(log) if os.sep in log else os.path.join(LOGS, log)
+    try:
+        if os.path.islink(path):                   # latest.log: the newest journal
+            path = os.path.realpath(path)
+        if os.path.realpath(os.path.dirname(path)) != os.path.realpath(LOGS):
+            return None
+    except (OSError, ValueError):
+        return None
+    name = os.path.basename(path)
+    return os.path.join(LOGS, name) if JOURNAL.fullmatch(name) and _stamp(name) else None
+
+
+def _local(value):
+    """An ISO time as the engine writes it, as a local time without a zone; None for anything else."""
+    if not isinstance(value, str):
+        return None
+    try:
+        t = datetime.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        return t.astimezone().replace(tzinfo=None) if t.tzinfo else t
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _relay_time(t):
+    """A local time as the relay takes it: UTC, "2026-10-30T17:45:45Z", 2020…2099. Now for one it would not take."""
+    try:
+        utc = t.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if RELAY_TIME.fullmatch(utc):
+            return utc
+    except (AttributeError, ValueError, OverflowError, OSError):
+        pass
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _strs(value):
+    return [s for s in value if isinstance(s, str)] if isinstance(value, list) else []
+
+
+def _blank(began):
+    return {"verdict": None, "started": True, "mode": None, "exitstatus": None, "changed": [], "added": [],
+            "removed": [], "problems": [], "warnings": [], "notes": [], "ok": [], "began": began, "ended": None,
+            "resolved": False}
+
+
+def _from_summary(path, began):
+    """What the engine's summary next to a journal (<stamp>.json) says of its update; None without a usable one."""
+    d = _read_json(path[:-4] + ".json") if path.endswith(".log") else {}
+    verdict = d.get("verdict", "")
+    if not (verdict is None or (type(verdict) is int and verdict in (0, 1, 2))):
+        return None
+    u = _blank(_local(d.get("began")) or began)
+    for key in ("changed", "added", "removed", "problems", "warnings", "notes", "ok"):
+        u[key] = _strs(d.get(key))
+    code = d.get("exitstatus")
+    u.update(verdict=verdict, started=d.get("started") is not False, ended=_local(d.get("ended")),
+             mode=d.get("mode") if d.get("mode") in ("auto", "manual") else None,
+             exitstatus=code if type(code) is int else None, resolved=bool(d.get("resolved")))
+    return u
+
+
+def _journal_events(path):
+    """The updater's own lines in a journal, up to its pacman.log part: [(hours, minutes, seconds, kind, text)]."""
+    with open(path, "rb") as f:
+        size = os.fstat(f.fileno()).st_size
+        if size <= WHOLE:
+            data = f.read()
+        else:
+            data = f.read(HEAD)
+            f.seek(size - (WHOLE - HEAD))
+            data += b"\n" + f.read()
+    text = data.decode("utf-8", "replace")
+    end = text.find(PACMAN_PART)
+    return EVENT.findall("\n" + (text if end == -1 else text[:end]))
+
+
+def _from_journal(path, began):
+    """What a journal says of its update in the updater's own lines, the same in the journals of every version: the
+    mode (СТАРТ), the exit code (КОНЕЦ), a run that never started (НЕ НАЧАТО), then the checks (ПАКЕТЫ, ПРОБЛЕМА,
+    ВНИМАНИЕ, as system_checks writes them). No checks, no verdict: the update was cut off."""
+    u = _blank(began)
+    try:
+        events = _journal_events(path)
+    except OSError:
+        return u
+    checked = False
+    day, last = began.date(), began.hour * 3600 + began.minute * 60 + began.second
+    for hh, mm, ss, kind, text in events:
+        h, m, s = int(hh), int(mm), int(ss)
+        if h > 23 or m > 59 or s > 59:
+            continue
+        if h * 3600 + m * 60 + s < last - 3 * 3600:          # past midnight (a clock put back an hour is not)
+            day += datetime.timedelta(days=1)
+        last = h * 3600 + m * 60 + s
+        u["ended"] = datetime.datetime.combine(day, datetime.time(h, m, s))
+        text = text.rstrip()
+        if kind == "СТАРТ":
+            u["mode"] = "manual" if "режим: ручной" in text else "auto" if "режим: автоответы" in text else u["mode"]
+        elif kind == "КОНЕЦ":
+            code = re.search(r"код (-?\d+)", text)
+            u["exitstatus"] = int(code.group(1)) if code else None
+        elif kind == "НЕ НАЧАТО":                   # engine.not_started: only a boot partition not mounted is a problem
+            u["started"] = False
+            u["verdict"] = 2 if "не смонтирован" in text else 1
+            (u["problems"] if u["verdict"] == 2 else u["warnings"]).append(text)
+        elif kind == "ПАКЕТЫ" and text.startswith("обновлены:"):     # the checks' first line: "name old→new, …"
+            checked = True
+            u["changed"] = [p.split(" ", 1)[0] for p in _items(text[len("обновлены:"):])]
+        elif kind == "ПАКЕТЫ":
+            lists = re.fullmatch(r"новые: (.*); удалены: (.*)", text)
+            if lists:
+                u["added"], u["removed"] = _items(lists.group(1)), _items(lists.group(2))
+        elif kind == "ПРОБЛЕМА":
+            u["problems"].append(text)
+        elif kind == "ВНИМАНИЕ":
+            u["warnings"].append(text)
+    if checked and u["started"]:
+        u["verdict"] = 2 if u["problems"] else 1 if u["warnings"] else 0
+    return u
+
+
+def _items(text):
+    """A list as the engine writes it in its lines: "a, b" or "—" for none."""
+    return [p for p in text.strip().split(", ") if p not in ("", "—")]
+
+
+def _update_of(path):
+    """What is known of one update: its summary if the engine left one, else what its journal says."""
+    began = _stamp(os.path.basename(path)) or datetime.datetime.now().replace(microsecond=0)
+    u = _from_summary(path, began) or _from_journal(path, began)
+    took = (u["ended"] - u["began"]).total_seconds() if u["ended"] else -1
+    u["seconds"] = took if 0 <= took <= 30 * 86400 else None
+    return u
+
+
+def local_updates(n=SHOWN):
+    """The newest n updates kept on this machine (logs/, never the demo's), newest first. Each: {"log": its journal,
+    "time": when it began (ISO, local), "verdict": 0, 1, 2 or None (no result: the update was cut off), "packages":
+    how many changed, "problems", "warnings", "notes": lists of text, "sent": when its report went out (ISO, local;
+    "" if it never did), "issue": the issue it became, or None}; besides: "ended" (ISO or ""), "started", "mode",
+    "exitstatus", "changed", "added", "removed", "ok", "resolved", "seconds" and "waiting" (its automatic report
+    waits in the outbox). From the summary next to the journal, or, for an update from before there were summaries,
+    from the journal's own lines."""
+    names = _journals()
+    names = names[:n] if n is None or n > 0 else []
+    records = _records()
+    out = []
+    for name in names:
+        path = os.path.join(LOGS, name)
+        try:
+            u = _update_of(path)
+        except Exception:                           # one journal the list cannot read is listed all the same
+            u = dict(_blank(_stamp(name)), seconds=None)
+        rec = records.get(name, {})
+        sent, queued = _str(rec.get("sent")), _str(rec.get("queued"))
+        out.append({
+            "log": path, "time": u["began"].isoformat(timespec="seconds"),
+            "ended": u["ended"].isoformat(timespec="seconds") if u["ended"] else "",
+            "verdict": u["verdict"], "started": u["started"], "mode": u["mode"], "exitstatus": u["exitstatus"],
+            "packages": len(u["changed"]) + len(u["added"]) + len(u["removed"]),
+            "changed": u["changed"], "added": u["added"], "removed": u["removed"], "problems": u["problems"],
+            "warnings": u["warnings"], "notes": u["notes"], "ok": u["ok"], "resolved": u["resolved"],
+            "seconds": u["seconds"], "sent": sent, "issue": _issue_of(rec),
+            "waiting": not sent and bool(QUEUED.fullmatch(queued)) and os.path.exists(os.path.join(OUTBOX, queued)),
+        })
+    return out
+
+
+def build_from_log(log, ui=None):
+    """The report of one update kept on this machine, put together now from its summary or its journal, everything
+    personal taken out as build() does. Its time is the update's own, when it ended, or the one its report had
+    already: the same update sent again is the same report to the relay, which files no second issue for it. The
+    machine and the updater are described as they are now, and the log says so at its top."""
+    u = _update_of(log)
+    res = {k: u[k] for k in ("verdict", "started", "exitstatus", "changed", "added", "removed", "problems",
+                             "warnings", "notes", "ok")}
+    res["log"] = log
+    report = build(res, mode=u["mode"], seconds=u["seconds"], ui=ui)
+    if u["mode"] is None and not SWITCHED_TO_MANUAL.search(report["log"]):
+        report["log"] = hide_typed_ahead(report["log"])      # no telling how it ran: as if by hand (see clean)
+    known = _records().get(os.path.basename(_journal(log) or ""), {}).get("time")
+    report["time"] = known if isinstance(known, str) and RELAY_TIME.fullmatch(known) else \
+        _relay_time(u["ended"] or u["began"])
+    report["log"] = (f"[отчёт отправлен вручную {datetime.datetime.now():%d.%m.%Y %H:%M}; устройство и версия "
+                     "апдейтера в нём — на это время]\n" + report["log"])
+    return report
+
+
+def send_now(log, timeout=20, ui=None):
+    """The report of one update kept on this machine, sent now because the user asked for it (a key on the summary
+    or in the list of the last updates): that key is the consent for this one report, with the automatic reports
+    off too, and switches nothing on. A machine without a report ID gets one. Allowed again for a report that went
+    out already. Returns (sent, what to tell the user, the issue's number or None); never raises."""
+    try:
+        return _send_now(log, timeout, ui)
+    except Exception:
+        return False, "не удалось собрать отчёт", None
+
+
+def _send_now(log, timeout, ui):
+    path = _journal(log)
+    if not path:
+        return False, "это не журнал обновления этого компьютера", None
+    if not os.path.isfile(path):
+        return False, "журнал этого обновления не найден", None
+    url = endpoint()
+    if not url:
+        return False, "сервер для отчётов не подключён", None
+    rid = ensure_id()
+    report = build_from_log(path, ui=ui)
+    report["id"] = report["id"] or rid               # one that could not be saved serves this report
+    try:
+        code, answer = _post(url, report, timeout, _agent())
+    except (OSError, ValueError, http.client.HTTPException):         # offline, DNS, TLS, a garbled answer
+        return False, "нет связи с сервером — попробуй позже", None
+    if 200 <= code < 300:
+        name = os.path.basename(path)
+        rec = _records().get(name, {})
+        again = answer.get("duplicate") is True                       # the relay has this report already
+        issue = _issue_of(answer) or _issue_of(rec)                   # the same time: the same log, the same issue
+        _record(name, sent=_now(), issue=issue, time=report["time"])
+        queued = _str(rec.get("queued"))
+        if QUEUED.fullmatch(queued):
+            _remove(os.path.join(OUTBOX, queued))    # this update's automatic report, still waiting: it went out now
+        number = f" (№ {issue})" if issue else ""
+        return True, (f"этот отчёт уже у разработчика{number}" if again else
+                      f"отчёт отправлен разработчику{number}"), issue
+    if code == 429:
+        return False, f"сервер просит подождать — попробуй позже: до {PER_HOUR} отчётов в час с компьютера", None
+    if code == 408:
+        return False, "нет связи с сервером — попробуй позже", None
+    if code >= 500:
+        return False, f"сервер не принял отчёт (HTTP {code}) — попробуй позже", None
+    return False, f"сервер не принял отчёт (HTTP {code})", None
+
+
+def delete_local(log):
+    """One update deleted from this machine: its journal (.log, .raw), its summary (.json), its record and its
+    automatic report if that still waits to be sent. Only an update in logs/, and not the one running now: anything
+    else is refused (False). True once all of it is gone; never raises."""
+    try:
+        path = _journal(log)
+        if not path or (engine.RUNNING and engine.LOG and os.path.realpath(engine.LOG.path) == os.path.realpath(path)):
+            return False
+        gone = True
+        for f in (path, path[:-4] + ".raw", path[:-4] + ".json"):
+            try:
+                os.remove(f)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                gone = False
+        name = os.path.basename(path)
+        queued = _str(_records().get(name, {}).get("queued"))
+        if QUEUED.fullmatch(queued):
+            _remove(os.path.join(OUTBOX, queued))
+        _record(name, forget=True)
+        _point_latest()
+        return gone
+    except Exception:
+        return False
+
+
+def _point_latest():
+    """latest.log, when the journal it named is gone: to the newest one left, or away."""
+    latest = os.path.join(LOGS, "latest.log")
+    if not os.path.islink(latest) or os.path.exists(latest):
+        return
+    left = _journals()
+    tmp = f"{latest}.{os.getpid()}.tmp"
+    try:
+        if left:
+            os.symlink(left[0], tmp)
+            os.replace(tmp, latest)
+        else:
+            os.remove(latest)
+    except OSError:
+        _remove(tmp)
+
+
+def _records():
+    """manual.json: {journal's name: {"sent": when its report went out (ISO, local), "issue": its number, "time": the
+    report's time, "queued": its automatic report in the outbox}}."""
+    return {k: v for k, v in _read_json(RECORDS).items() if JOURNAL.fullmatch(k) and isinstance(v, dict)}
+
+
+def _record(name, forget=False, **fields):
+    """One journal's record changed, or forgotten; those of journals no longer kept go. Never raises."""
+    try:
+        with _locked():
+            records = _records()
+            if forget:
+                records.pop(name, None)
+            else:
+                records.setdefault(name, {}).update(fields)
+            kept = set(_journals())
+            _write_json(RECORDS, {k: v for k, v in records.items() if k in kept})
+    except OSError:
+        pass
+
+
+def _went_out(queued, issue):
+    """An automatic report went out: the record of its update says so (after_update linked the two)."""
+    try:
+        with _locked():
+            records = _records()
+            for rec in records.values():
+                if rec.get("queued") == queued:
+                    rec.update(sent=_now(), issue=issue or _issue_of(rec))
+                    _write_json(RECORDS, records)
+                    return
+    except OSError:
+        pass
+
+
+# ───────────────────────────── the command line ─────────────────────────────
+
+def _plural(n, one, few, many):
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    return few if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else many
+
+
+def _when(iso, year=True):
+    t = _local(iso)
+    return t.strftime("%d.%m.%Y %H:%M" if year else "%d.%m %H:%M") if t else "—"
+
+
+def _verdict_words(u):
+    if not u["started"]:
+        return ("✗ " if u["verdict"] == 2 else "· ") + "не начиналось"
+    if u["verdict"] == 2 and u["resolved"]:
+        return "✓ исправлено"
+    return {0: "✓ всё чисто", 1: "⚠ есть что прочитать", 2: "✗ нужна проверка"}.get(u["verdict"], "· без итога")
+
+
+def listing(n=SHOWN):
+    """The last updates as report.py --list prints them."""
+    updates = local_updates(n)
+    if not updates:
+        return "На этом компьютере пока нет журналов обновлений."
+    lines = ["Последние обновления (1 — самое новое):"]
+    for i, u in enumerate(updates, 1):
+        count = u["packages"]
+        known = u["started"] and u["verdict"] is not None
+        packages = f"{count} {_plural(count, 'пакет', 'пакета', 'пакетов')}" if known else "—"
+        if u["sent"]:
+            sent = f"отправлен {_when(u['sent'], year=False)}" + (f" (№ {u['issue']})" if u["issue"] else "")
+        else:
+            sent = "ждёт отправки" if u["waiting"] else "не отправлен"
+        lines.append(f"{i:>2}  {_when(u['time'])}  {_verdict_words(u):<21} {packages:<12} {sent}")
+        worst = [p for p in u["problems"] if "НЕ перезагружайся" in p] + u["problems"] + u["warnings"]
+        first = worst[0] if worst else ""
+        if first:
+            lines.append("    " + (first if len(first) <= 110 else first[:109] + "…"))
+    me = os.path.realpath(__file__).replace(os.path.expanduser("~"), "~", 1)
+    lines += ["", f"Отправить отчёт разработчику: python3 {me} --send N"]
+    return "\n".join(lines)
+
+
+def _send_cli(log):
+    path = _journal(log)
+    if path and os.path.isfile(path):
+        print(f"Отправляю отчёт об обновлении {_stamp(os.path.basename(path)):%d.%m.%Y %H:%M}…", flush=True)
+    ok, message, _ = send_now(log)
+    print(message, file=sys.stdout if ok else sys.stderr)
+    return 0 if ok else 1
+
+
 def main(argv):
     if argv[:1] == ["--consent"] and argv[1:2] in (["yes"], ["no"]):
         set_consent(argv[1] == "yes")
@@ -744,6 +1269,16 @@ def main(argv):
         send_pending()
     elif argv == ["--preview"]:
         print(preview())
+    elif argv == ["--list"]:
+        print(listing())
+    elif argv[:1] == ["--send"] and len(argv) == 2:
+        names = _journals()
+        if not (re.fullmatch(r"[0-9]{1,6}", argv[1]) and 1 <= int(argv[1]) <= len(names)):
+            print(f"нет обновления под номером {argv[1]} — номера показывает report.py --list", file=sys.stderr)
+            return 2
+        return _send_cli(os.path.join(LOGS, names[int(argv[1]) - 1]))
+    elif argv[:1] == ["--send-log"] and len(argv) == 2:
+        return _send_cli(argv[1])
     else:
         print(__doc__.strip().split("\n\n")[-1], file=sys.stderr)
         return 2
