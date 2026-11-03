@@ -12,7 +12,7 @@ Worker в Cloudflare (в программе и в её README он называ�
   Issue чистого обновления сразу закрывается, поэтому **открытые issues — это те, что стоит посмотреть**.
   Метки: `ок`, `предупреждения`, `проблемы`, `не начато`, `chromebook`.
 
-Всё делается в браузере, на Windows. Командная строка нужна один раз — для проверки в PowerShell (шаг 5).
+Всё делается в браузере. Командная строка нужна один раз — для проверки (шаг 5): в PowerShell на Windows или в терминале Linux.
 Бесплатно: хватает бесплатных тарифов GitHub и Cloudflare, банковская карта не нужна.
 
 ## 1. Закрытый репозиторий для отчётов
@@ -95,7 +95,7 @@ Worker в Cloudflare (в программе и в её README он называ�
    и выключи там) → сохрани (**Save** или **Deploy** — какая кнопка будет). **Traces** и **Issues**
    там же оставь выключенными, как они стоят сразу. Проверишь, что журнал не пишется, в шаге 5.
 
-## 5. Проверка из PowerShell
+## 5. Проверка (PowerShell или терминал Linux)
 
 Скопируй пример ниже в Блокнот и замени в первой строке весь адрес
 `https://arch-update-reports.ПОДДОМЕН.workers.dev` на тот, что скопировал в шаге 4.7 (`/report`
@@ -124,7 +124,22 @@ try {
 }
 ```
 
-Должна напечататься табличка: `True` под `ok` и номер issue под `issue`. В репозитории отчётов
+То же из терминала Linux (адрес замени так же):
+
+```bash
+curl -sS -X POST https://arch-update-reports.ПОДДОМЕН.workers.dev/report -H 'Content-Type: application/json' --data @- <<EOF
+{"schema": 1, "id": "00000000", "time": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+ "updater": {"commit": "test", "date": ""},
+ "device": {"vendor": "Test", "model": "PowerShell", "chromebook": false, "cpu": "Test CPU", "cores": 4, "ram_gib": 8},
+ "update": {"mode": "auto", "verdict": 1, "started": true, "seconds": 42, "changed": ["gnupg"], "added": [],
+            "removed": [], "problems": [], "warnings": ["test warning"], "ok": ["test ok"]},
+ "log": "test line 1\ntest line 2\n"}
+EOF
+```
+
+Ответ должен быть `{"ok":true,"issue":…}`.
+
+В PowerShell должна напечататься табличка: `True` под `ok` и номер issue под `issue`. В репозитории отчётов
 появятся issue «⚠ … · Test PowerShell · 1 пакет · 00000000» с меткой `предупреждения` и ветка
 `logs-00000000` с файлом лога (переключатель веток над списком файлов). Тестовое можно удалить:
 issue — на его странице справа внизу **Delete issue**, ветку — как в разделе «Удалить отчёты одной машины».
