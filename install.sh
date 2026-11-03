@@ -371,7 +371,10 @@ self_check() {
 		bash -n "$ROOT/$f" || return 1
 	done
 	python3 -m py_compile "$ROOT/bin/arch-update-ui" "$ROOT/bin/arch-update-auto" "$ROOT/lib/engine.py" \
-		"$ROOT/lib/games.py" "$ROOT/lib/report.py" || return 1
+		"$ROOT/lib/games.py" "$ROOT/lib/report.py" "$ROOT"/lib/fixes/*.py || return 1
+	# the fixes' root shell (lib/fixes) is bash inside Python: it has to parse too
+	python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import fixes; print(fixes.runner())' "$ROOT/lib" \
+		| bash -n || return 1
 	python3 "$ROOT/bin/arch-update-ui" --self-test || return 1
 }
 

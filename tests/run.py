@@ -88,14 +88,23 @@ UPDATES = [("2026-11-01_09-15-00", OLD_JOURNAL, None),
              "services": {}, "fixes": [], "boot": []})]
 # The last update, in this very boot: it said not to reboot, nothing has fixed it (the demo's, and the
 # real program's in the run with stand-ins). It began an hour before the run: an update the run makes is newer.
-BAD_BOOT = [{"kind": "image", "pkg": "linux", "path": "/boot/initramfs-linux.img", "how": "missing",
-             "text": "нет /boot/initramfs-linux.img — НЕ перезагружайся, система не загрузится"}]
+BAD_BOOT = [{"kind": "unmounted", "target": "/boot",
+             "text": "/boot не смонтирован — ядро могло записаться не туда, НЕ перезагружайся"}]
+BAD_SAYS = "/boot не смонтирован"
 # Stand-ins for the runs without --demo. sudo says what it would run and runs nothing (sudo -n true, as
 # the engine asks whether it wants a password, says no). arch-update has no update to offer, or one whose
 # run leaves a service waiting to be restarted (as arch-update 4.4's restart_services.sh asks, unanswered).
 SUDO = """while [ "${1#-}" != "$1" ]; do shift; done
+if [ "$1" = bash ] && [ "$2" = -c ] && [ "$4" = arch-update-fix ]; then
+    # F: the fixes catalogue's own root shell, run for real as this user, with the stand-ins for mount below
+    echo "[sudo в тесте] исправления каталога: $(printf '%s\\n' "${@:6}" | grep -xE '[a-z]+' | paste -sd ' ' -)"
+    exec "$@"
+fi
 [ $# -eq 0 ] || echo "[sudo в тесте] $*"
 exit 0"""
+# The boot partition F mounts, as far as the stand-ins tell: mount marks it mounted, mountpoint asks the mark.
+MOUNT = 'echo "[mount в тесте] $*"; : >"$HOME/mounted"'
+MOUNTPOINT = 'test -e "$HOME/mounted"'
 NO_UPDATE = "exit 7"
 ONE_UPDATE = """if [ "$1" = -l ]; then
     printf '==> Packages:\\ncups 2.4.14-1 -> 2.4.15-1\\n'
@@ -174,7 +183,7 @@ class Run:
             # Without --demo the program is the real one: arch-update and sudo are stand-ins (nothing is
             # updated or elevated), and nothing is reached on the network: archlinux.org's news through a proxy
             # where nobody listens, the reports a closed local port, never the real server for them.
-            stubs.update({"arch-update": update, "sudo": SUDO})
+            stubs.update({"arch-update": update, "sudo": SUDO, "mount": MOUNT, "mountpoint": MOUNTPOINT})
             proxy = f"http://127.0.0.1:{closed_port()}"
             for k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
                 env[k] = proxy
@@ -240,8 +249,7 @@ class Run:
                     "boot_id": boot_id(), "boot": BAD_BOOT, "reboot": True,
                     "services": {"listed": ["cups.service"], "restarted": [], "skipped": ["cups.service"],
                                  "waiting": ["cups.service"], "later": [], "failed": []},
-                    "fixes": [{"key": "initramfs", "label": "собрать initramfs заново (mkinitcpio -P)",
-                               "argv": ["sudo", "mkinitcpio", "-P"]}]}
+                    "fixes": [{"key": "mount", "label": "смонтировать /boot", "argv": ["sudo", "mount", "/boot"]}]}
         with open(os.path.join(logs, self.bad_stamp + ".json"), "w", encoding="utf-8") as f:
             json.dump(self.bad, f, ensure_ascii=False)
 
@@ -609,12 +617,12 @@ class Run:
     def banner(self):
         """The demo's last update said not to reboot, in this boot: the menu warns about it; F, S and the
         summary opened from the menu (F, R there too) only say that the demo does not do that."""
-        if not self.wait("menu", "/boot/initramfs-linux.img", timeout=40):
+        if not self.wait("menu", BAD_SAYS, timeout=40):
             return
         if not self.gone("menu-news", "загружаю новости"):
             return
         screen = self.text()
-        if "НЕ перезагружайся" not in screen or "F — собрать initramfs заново" not in screen or \
+        if "НЕ перезагружайся" not in screen or "F — смонтировать /boot" not in screen or \
                 "S — отправить отчёт" not in screen:
             self.snapshot("menu-banner-FAILED")
             self.failures.append("меню: нет предупреждения о последнем обновлении с клавишами F и S")
@@ -647,7 +655,7 @@ class Run:
     def sends(self):
         """Without --demo, with the stand-in for the server for the reports: S under the menu's warning and the summary
         opened before the answer came; then an update's summary, S and Enter at once."""
-        if not self.wait("menu", "/boot/initramfs-linux.img", timeout=40):
+        if not self.wait("menu", BAD_SAYS, timeout=40):
             return
         if not self.gone("menu-news", "загружаю новости"):
             return
@@ -706,18 +714,21 @@ class Run:
         """Without --demo, with the stand-ins: F under the menu's warning and R on the summary of an update go to
         the plain terminal (where sudo only says what it would run) and back with Enter; what came of them is
         said, and kept in the updates' summaries and journals."""
-        if not self.wait("menu", "/boot/initramfs-linux.img", timeout=40):
+        if not self.wait("menu", BAD_SAYS, timeout=40):
             return
         if not self.gone("menu-news", "загружаю новости"):
             return
         self.send("f")
         if not self.wait("fix-terminal", "Enter — вернуться в Arch-Update", timeout=60):
             return
-        if "[sudo в тесте] mkinitcpio -P" not in self.text():
-            self.failures.append("F: в терминале не видно, что запускается mkinitcpio -P")
+        screen = self.text()
+        if "[sudo в тесте] исправления каталога: mount" not in screen or "[mount в тесте] -- /boot" not in screen:
+            self.failures.append("F: в терминале не видно, что каталог монтирует /boot")
+        if "готово, проверено" not in screen:
+            self.failures.append("F: исправление не проверено")
         self.send(ENTER)
         # Whatever the look at this machine's boot files finds now, the menu says it
-        if not self.wait("fix-back", "всё ещё нет /boot", "больше не нашёл", timeout=10):
+        if not self.wait("fix-back", "всё ещё", "больше не нашёл", timeout=10):
             return
         self.send(ENTER)                            # the first item: «Обновить автоматически»
         if not self.wait("dashboard", "мини-игры", timeout=20):

@@ -74,6 +74,7 @@ RULES = [
 # paru and flatpak end their questions with ':' ("[Y/n]: "), pacman and yay don't
 RULES = [(label, re.compile(rx[:-1] + ":?$" if rx.endswith(r"\]$") else rx), action, note)
          for label, rx, action, note in RULES]
+PACMAN_PROCEED = next(rx for label, rx, _, _ in RULES if label == "pacman proceed")
 
 QUIT_PROMPT = re.compile(r'Press "enter" to quit$')
 # yay menus print the question above and wait on a bare "==>" line.
@@ -90,7 +91,7 @@ ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x
 # is missing (depmod failed: a full disk) — the Chromebook that did not boot any more.
 FAILURE_MARKERS = re.compile(r"Initcpio image generation FAILED|error: command failed to execute correctly"
                              r"|errors were encountered during the build|No modules were added to the image"
-                             r"|depmod: FATAL|No space left on device"
+                             r"|depmod: FATAL|No space left on device|not enough free disk space"
                              r"|An error has occurred during the update process"
                              r"|invalid or corrupted package \(PGP signature\)|is unknown trust|is marginal trust"
                              r"|You can do this later by running: #? ?dd if=\S+ of=\S+", re.I)
@@ -104,6 +105,19 @@ INITCPIO_SAYS = {"initcpio image generation failed": "mkinitcpio не собра
                                                        "не загрузится"}
 DISK_FULL = ("на диске кончилось место («No space left on device») — часть файлов не записалась: освободи место "
              "(например: sudo pacman -Sc) и обнови ещё раз")
+# The update's room on the disk, looked at when pacman asks before it changes anything. With a snapshot taken at the
+# start of the transaction (snap-pac, timeshift-autosnap on btrfs) the files it replaces stay in that snapshot, so
+# the transaction needs room for every new file, not only for the difference pacman counts ("Net Upgrade Size"):
+# the Chromebook ran out of space in the middle of one that way (7 MiB counted, about 2 GiB needed).
+SIZE_LINE = re.compile(r"^Total (Installed|Download) Size:\s+([\d.]+)\s+(B|KiB|MiB|GiB|TiB)\s*$", re.M)
+SIZE_UNITS = {"B": 1, "KiB": 2 ** 10, "MiB": 2 ** 20, "GiB": 2 ** 30, "TiB": 2 ** 40}
+HOOK_DIRS = ("/usr/share/libalpm/hooks", "/etc/pacman.d/hooks")    # the second overrides the first by name
+SNAPSHOT_EXEC = re.compile(r"(?mi)^\s*Exec\s*=.*\b(?:snap-pac|snapper|timeshift|btrfs\s+subvolume\s+snapshot)\b")
+SPACE_MARGIN = 256 * 2 ** 20     # on top: the hooks' own files (initramfs, caches), btrfs's metadata
+MOUNTINFO = "/proc/self/mountinfo"
+SPACE_HEAD = "мало места на диске"
+FULL_BEFORE = ("pacman не начал: мало места на диске («not enough free disk space») — обновление не начиналось, "
+               "система не менялась")
 # mkinitcpio's "the image was built" (v38 on: "Initcpio image generation successful"; v37: "Image generation
 # successful"), and what says it was not, or not whole.
 IMAGE_BUILT = re.compile(r"(?i)image generation successful")
@@ -279,6 +293,73 @@ def free_mib(path="/"):
 
 def pacman_busy():
     return os.path.exists(PACMAN_LOCK) and bool(run(["pgrep", "-x", "pacman"]).strip())
+
+
+def snapshot_hooks():
+    """The pacman hooks that take a file system snapshot before a transaction (snap-pac, timeshift-autosnap…), by
+    name. One in /etc/pacman.d/hooks overrides the same name in /usr/share/libalpm/hooks (a link to /dev/null
+    switches it off)."""
+    hooks = {}
+    for d in HOOK_DIRS:
+        for path in glob.glob(os.path.join(d, "*.hook")):
+            hooks[os.path.basename(path)] = path
+    found = []
+    for name, path in sorted(hooks.items()):
+        try:
+            if os.path.realpath(path) == os.devnull:
+                continue
+            with open(path, encoding="utf-8", errors="replace") as f:
+                text = f.read(65536)
+        except OSError:
+            continue
+        if re.search(r"(?mi)^\s*When\s*=\s*PreTransaction\b", text) and SNAPSHOT_EXEC.search(text):
+            found.append(name)
+    return found
+
+
+def mount_of(path):
+    """(file system type, source) of the mount that holds path (/proc/self/mountinfo); (None, None) if unknown.
+    Two subvolumes of one btrfs have one source: they share its free space."""
+    best, info = "", (None, None)
+    try:
+        real = os.path.realpath(path)
+        with open(MOUNTINFO, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                left, _, right = line.partition(" - ")
+                parts, rest = left.split(), right.split()
+                if len(parts) < 5 or len(rest) < 2:
+                    continue
+                point = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), parts[4])
+                if (real == point or real.startswith(point.rstrip("/") + "/")) and len(point) >= len(best):
+                    best, info = point, (rest[0], rest[1])
+    except OSError:
+        pass
+    return info
+
+
+def pacman_sizes(text):
+    """{"installed": bytes, "download": bytes} from the totals pacman printed before its question (the last list
+    in text), None without them."""
+    start = max(text.rfind("\nPackages ("), text.rfind("\nPackage ("))
+    sizes = {}
+    for kind, number, unit in SIZE_LINE.findall(text[start:] if start >= 0 else text):
+        try:
+            sizes[kind.lower()] = int(float(number) * SIZE_UNITS[unit])
+        except ValueError:
+            pass
+    return sizes if "installed" in sizes else None
+
+
+def size_text(n):
+    """Bytes for the user: "1,4 ГБ", "830 МБ"."""
+    return f"{n / 2 ** 30:.1f} ГБ".replace(".", ",") if n >= 2 ** 30 else f"{max(0, n) // 2 ** 20} МБ"
+
+
+def space_text(space):
+    return (f"{SPACE_HEAD}: свободно {size_text(space.get('free', 0))}, а обновлению нужно около "
+            f"{size_text(space.get('need', 0))}"
+            + (" (снимок snapper хранит старые версии файлов, пока ставятся новые)" if space.get("snapshots") else "")
+            + " — обновление не начинал, система не менялась")
 
 
 def kernel_packages():
@@ -1187,9 +1268,13 @@ WAITING_TEXTS = ("сервис ждёт перезапуска:", "сервис�
 
 
 class Responder:
-    def __init__(self, child, stop_on_news, manual, restart_services=False):
+    def __init__(self, child, stop_on_news, manual, restart_services=False, check_space=False):
         self.child = child
         self.stop_on_news = stop_on_news
+        # check_space: before pacman changes anything, is there room for it (space_short); never in the demo
+        self.check_space = check_space
+        self.space = None         # what space_short found: the update stopped (or, in a manual run, was warned)
+        self._snapshots = None
         # the user's setting: restart the services that are safe to restart when arch-update asks
         self.restart_services = restart_services
         # what arch-update listed and how the restarts went (system_checks makes res["services"] from it)
@@ -1231,6 +1316,15 @@ class Responder:
             self.failures.add(m.group(0))
         if "restart" in recent:
             self.watch_services(recent)
+        if self.mode == "manual" and self.space is None and "Proceed with" in recent and self.waiting() \
+                and PACMAN_PROCEED.search(self.current_line()):
+            short = self.space_short()
+            if short:                           # the user answers in a manual run: tell them before they do
+                self.space = dict(short, stopped=False)
+                LOG.event("МЕСТО", space_text(short) + " (ручной режим: предупредил)")
+                say(f"\n[автоответчик] ВНИМАНИЕ: {SPACE_HEAD} — свободно {size_text(short['free'])}, а этому "
+                    f"обновлению нужно около {size_text(short['need'])} (снимок snapper хранит старые версии "
+                    "файлов). Ответь n, освободи место (F в итоге) и обнови снова.\n", C_RED)
         if self.mode == "handover":
             if not self.user_typed and self.current_line() != self.handover_line:
                 self.mode = "auto"    # false alarm: the program moved on by itself
@@ -1243,6 +1337,31 @@ class Responder:
                 VIEW.handover_done()
                 say("\n[автоответчик] программа ушла дальше — твой ввод отменён.\n", C_YEL)
                 LOG.event("АВТО", "программа ушла дальше, недопечатанный ввод сброшен")
+
+    def space_short(self):
+        """At pacman's question before it changes anything: when a snapshot is taken at the start of the
+        transaction (snapshot_hooks, on btrfs), is there room for every new file, and for the downloads when they go
+        to the same file system? None when there is, or no telling; else {"need", "free", "installed", "download",
+        "snapshots"} (bytes)."""
+        if not self.check_space:
+            return None
+        if self._snapshots is None:
+            self._snapshots = mount_of("/")[0] == "btrfs" and bool(snapshot_hooks())
+        if not self._snapshots:
+            return None
+        sizes = pacman_sizes(self.tail)
+        if not sizes:
+            return None
+        root, cache = mount_of("/"), mount_of(PACMAN_CACHE)
+        download = sizes.get("download", 0) if cache[1] is not None and cache == root else 0
+        need = sizes["installed"] + download + max(SPACE_MARGIN, sizes["installed"] // 10)
+        try:
+            free = shutil.disk_usage("/").free
+        except OSError:
+            return None
+        if free >= need:
+            return None
+        return {"need": need, "free": free, "installed": sizes["installed"], "download": download, "snapshots": True}
 
     def watch_services(self, recent):
         """arch-update's list of services to restart (once its question shows, whoever answers it) and what it
@@ -1320,6 +1439,13 @@ class Responder:
                     return ("дочитай новости", HANDOVER, None)
                 if label == "restart services":
                     return self.services_answer(label, action, note)
+                if label == "pacman proceed" and not self.safe_only:
+                    short = self.space_short()
+                    if short:
+                        self.space = dict(short, stopped=True)
+                        LOG.event("МЕСТО", space_text(short))
+                        return (f"{SPACE_HEAD}: свободно {size_text(short['free'])}, нужно около "
+                                f"{size_text(short['need'])} — не начинаю", NO, "space")
                 return (label, action, note)
         return None
 
@@ -1429,7 +1555,7 @@ def detached_answer(line):
 #   boot [{kind, text, …}] (the problems with booting, see fix_commands), reboot (a reboot would apply the update),
 #   later on: rechecked (recheck_boot), resolved (mark_resolved).
 SUMMARY_KEYS = ("verdict", "changed", "added", "removed", "problems", "warnings", "notes", "ok", "exitstatus",
-                "started", "head", "services", "fixes", "boot", "reboot")
+                "started", "head", "services", "fixes", "boot", "reboot", "space")
 
 
 def now_iso():
@@ -1485,7 +1611,7 @@ def normal_summary(d):
 
     def item(i):                                # lists where lists belong (kvers, files, argv), else a plain value
         return {k: plain(v) for k, v in i.items()
-                if plain(v) is not None and isinstance(v, list) == (k in ("kvers", "files", "argv"))}
+                if plain(v) is not None and isinstance(v, list) == (k in ("kvers", "files", "argv", "args"))}
     for k in ("changed", "added", "removed", "problems", "warnings", "notes", "ok"):
         d[k] = plain(d.get(k)) if isinstance(d.get(k), list) else []
     for k in ("boot", "fixes"):
@@ -1496,6 +1622,10 @@ def normal_summary(d):
     d["services"] = {k: plain(v) for k, v in svc.items() if isinstance(v, list)}
     if not (type(d.get("verdict")) is int and d["verdict"] in (0, 1, 2)):
         d["verdict"] = None
+    space = d.get("space")
+    d["space"] = {k: v for k, v in space.items() if type(v) in (int, bool)} if isinstance(space, dict) else None
+    if not d["space"]:
+        d.pop("space")
     return d
 
 
@@ -1884,18 +2014,37 @@ def services_record(responder=None, failed_now=()):
             "later": [u for u in skipped if keep(u)], "failed": sorted(failed)}
 
 
-def not_started(why, verdict, boot=None):
+def not_started(why, verdict, boot=None, space=None):
     """Result of a run that never touched the system (refused before it began). boot: the problems with
-    booting that stopped it (an unmounted /boot), for fix_commands."""
+    booting that stopped it (an unmounted /boot), for fix_commands; space: the disk was too small for it
+    (Responder.space_short), for the space fix."""
     LOG.event("НЕ НАЧАТО", why)
     notify("Обновление не начато", why, urgent=verdict == 2)
     res = {"changed": [], "added": [], "removed": [], "problems": [why] if verdict == 2 else [],
            "warnings": [why] if verdict < 2 else [], "notes": [], "ok": [], "verdict": verdict, "log": LOG.path,
            "exitstatus": None, "started": False, "head": "Обновление не начиналось", "services": services_record(),
            "boot": list(boot or []), "reboot": False}
+    if space:
+        res["space"] = space
     res["fixes"] = fix_commands(res)
     save_summary(res)
     return res
+
+
+def space_freed(log):
+    """After the space fix went through: that update's summary no longer says the disk was too small (an update
+    that stopped for it can run now). A full disk during an update stays a problem: that update is to run again."""
+    def change(d):
+        d["warnings"] = [w for w in d.get("warnings") or [] if not w.startswith(SPACE_HEAD) and w != FULL_BEFORE]
+        d["problems"] = [p for p in d.get("problems") or [] if not p.startswith(SPACE_HEAD) and p != FULL_BEFORE]
+        d.pop("space", None)
+        d["ok"] = list(d.get("ok") or []) + [f"место освобождено: свободно {size_text(shutil.disk_usage('/').free)}"]
+    try:
+        data = _update_summary(log, change) if log else None
+    except OSError:
+        data = None
+    journal_event(log, "МЕСТО", "освобождено по клавише F")
+    return data
 
 
 def system_checks(before, exitstatus, responder, pacman_log_offset, failed_before=(), orphans_before=None,
@@ -1946,6 +2095,9 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
             depmod_failed = True                # for which kernels: the look below knows them
         elif f.lower() == "no space left on device":
             problems.append(DISK_FULL)
+        elif f.lower() == "not enough free disk space":
+            problems.append("pacman не стал ставить часть пакетов: мало места на диске («not enough free disk "
+                            "space») — освободи место и обнови ещё раз")
         else:
             problems.append(f"в выводе: «{f}»")
     if any(KEYRING_TROUBLE.search(f) for f in responder.failures):
@@ -2040,6 +2192,12 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
     if failed_before:
         LOG.event("СЕРВИСЫ", "не работали ещё до обновления: " + ", ".join(failed_before))
 
+    space = getattr(responder, "space", None)
+    if space:
+        room = f"свободно {size_text(space.get('free', 0))}, нужно около {size_text(space.get('need', 0))}"
+        warnings.append(f"{SPACE_HEAD} для части обновления ({room}) — её не ставил: освободи место (F) и обнови "
+                        "ещё раз" if space.get("stopped") else
+                        f"{SPACE_HEAD} перед установкой ({room}) — освободи место (F), пока его не стало ещё меньше")
     if LOG.broken:
         warnings.append("журнал обновления неполный: не удалось писать на диск (место в /home?)")
     for p in problems:
@@ -2060,6 +2218,8 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
            "warnings": warnings, "notes": notes, "ok": ok, "verdict": 2 if problems else (1 if warnings else 0),
            "log": LOG.path, "exitstatus": exitstatus, "started": True, "services": services, "boot": boot,
            "reboot": reboot}
+    if getattr(responder, "space", None):
+        res["space"] = responder.space          # too little room for a part of it (an AUR package, or a manual run)
     res["fixes"] = fix_commands(res)
     save_summary(res, responder)
     return res
@@ -2068,72 +2228,19 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
 # ───────────────────────────── fixes ─────────────────────────────
 
 def fix_commands(res):
-    """What the engine knows to do about the problems with booting in a result (or a summary read back), in the
-    order to run them: [{"key", "label", "argv"}]. Each one only where it fits a problem found:
+    """What can be done about the problems a result (or a summary read back) holds, in the order to run them: the
+    fixes catalogue (lib/fixes, one module per fix) planned for it, [{"key", "label", "argv", "how", "args"}]:
+      space      the disk too full for the update, or full during it
       mount      an fstab boot partition that is not mounted
-      kernel     a kernel file missing or empty: the installed kernel package again, that very version from
-                 pacman's cache (its hooks copy the kernel, build the initramfs and the DKMS modules, sign), or
-                 from the repository when the cache has not got it; none when the repository has a newer one
-                 (that would update the kernel alone, without its headers and the rest: a partial upgrade);
-                 pacman asks before it does anything
-      depmod     a kernel's module list not written, or depmod failed (a full disk)
+      depmod     a kernel's module list not written, or depmod failed (a full disk); ldconfig with it
+      kernel     a kernel file missing or empty: that very version of the kernel package again
       dkms       a DKMS module not built for a kernel
-      initramfs  an initramfs (or UKI) missing, empty or broken, mkinitcpio failed, or after the module lists or a
-                 DKMS build (an image built without them lacks modules): mkinitcpio -P, as pacman's hook does
-      sbctl      a boot file not signed for Secure Boot: signed and kept in sbctl's list
-    [] when there is nothing to do this way. They ask for the password: run them in a terminal."""
-    issues = [i for i in (res or {}).get("boot") or [] if isinstance(i, dict)]
-    su = elevation_command()
-    fixes = []
-    for t in dict.fromkeys(i.get("target") for i in issues if i.get("kind") == "unmounted"):
-        if isinstance(t, str) and t.startswith("/"):
-            fixes.append({"key": "mount", "label": f"смонтировать {t}", "argv": [su, "mount", t]})
-    pkgs = sorted({i.get("pkg") for i in issues if i.get("kind") == "kernel" and isinstance(i.get("pkg"), str)
-                   and re.fullmatch(r"[\w.+@-]+", i.get("pkg"))})
-    fixes += kernel_fixes(su, pkgs) if pkgs else []
-
-    def versions(kind):
-        return list(dict.fromkeys(k for i in issues if i.get("kind") == kind
-                                  for k in [i.get("kver")] + list(i.get("kvers") or [])
-                                  if isinstance(k, str) and re.fullmatch(r"[\w.+~-]+", k)))
-    lists = versions("depmod")
-    for kver in lists:
-        fixes.append({"key": "depmod", "label": f"собрать список модулей ядра {kver} (depmod)",
-                      "argv": [su, "depmod", kver]})
-    kvers = versions("dkms")
-    nvidia = any(i.get("module") == "nvidia" for i in issues if i.get("kind") == "dkms")
-    for kver in kvers:
-        fixes.append({"key": "dkms", "argv": [su, "dkms", "autoinstall", "-k", kver],
-                      "label": f"собрать {'драйвер NVIDIA' if nvidia else 'модули DKMS'} под ядро {kver}"})
-    kinds = {i.get("kind") for i in issues}
-    if kinds & {"image", "initcpio"} or ((kvers or lists) and glob.glob(os.path.join(PRESET_DIR, "*.preset"))):
-        fixes.append({"key": "initramfs", "label": "собрать initramfs заново (mkinitcpio -P)",
-                      "argv": [su, "mkinitcpio", "-P"]})
-    for f in dict.fromkeys(f for i in issues if i.get("kind") == "unsigned" for f in (i.get("files") or [])):
-        if isinstance(f, str) and f.startswith("/"):
-            fixes.append({"key": "sbctl", "label": f"подписать для Secure Boot: {f}",
-                          "argv": [su, "sbctl", "sign", "-s", f]})
-    return fixes
-
-
-def kernel_fixes(su, pkgs):
-    """The kernel packages installed again, exactly as they are installed: from pacman's cache when the file of the
-    installed version is there, else from the repository, but only while the repository has no newer one."""
-    installed = installed_versions()
-    cached = {p: cached_package(p, installed[p]) for p in pkgs if p in installed}
-    cached = {p: f for p, f in cached.items() if f}
-    rest = [p for p in pkgs if p not in cached]
-    if any(run(["pacman", "-Qu", p], timeout=20).strip() for p in rest):
-        return []                               # a newer kernel waits: only a whole -Syu may bring it
-    fixes = []
-    if cached:
-        fixes.append({"key": "kernel", "argv": [su, "pacman", "-U", *cached.values()],
-                      "label": f"переустановить ядро ({', '.join(cached)}) из кэша pacman: вернёт файл ядра "
-                               "и initramfs"})
-    if rest:
-        fixes.append({"key": "kernel", "argv": [su, "pacman", "-S", *rest],
-                      "label": f"переустановить ядро ({', '.join(rest)}): вернёт файл ядра и initramfs"})
-    return fixes
+      initramfs  an initramfs (or UKI) missing, empty or broken, mkinitcpio failed, or after depmod / DKMS
+      sbctl      a boot file not signed for Secure Boot
+    Each one backs up what it changes, checks what it made and puts everything back when that is not right
+    (see lib/fixes). [] when there is nothing to do this way. They ask for the password: run them in a terminal
+    (fixes_command)."""
+    return catalogue.plan(res)
 
 
 def cached_package(pkg, version):
@@ -2190,12 +2297,13 @@ def boot_probe_command(argv, out):
     return probe_command(argv, out, files, images, secure_boot_on() and bool(shutil.which("sbctl")))
 
 
-def fixes_command(fixes, out):
-    """All the fixes as one command for one key: in order, in one terminal session (sudo asks once), stopping at
-    the first that fails, then the probe into out for recheck_boot(log, probe=out). Run it in a pty: sudo asks
-    for the password there and pacman asks before it installs. Exit status: 0 when every fix went through."""
-    script = " && ".join(shlex.join(f["argv"]) for f in fixes if isinstance(f, dict) and f.get("argv"))
-    return boot_probe_command(["bash", "-c", script or "true"], out)
+def fixes_command(fixes, out, result=None):
+    """All the fixes as one command for one key: the catalogue's root shell (sudo asks once), every fix in order with
+    its backups, check and rollback, stopping at the first that was not done; then, in the same terminal session,
+    the probe into out for recheck_boot(log, probe=out). result: a file of this user's (fixes.result_file()) for
+    what came of each fix (fixes.read_results). Run it in a pty: sudo asks for the password there, pacman and the
+    space fix ask before they change anything. Exit status: the runner's (fixes.OK … fixes.NOT_ENOUGH)."""
+    return boot_probe_command(catalogue.command(fixes, result) or ["true"], out)
 
 
 def probe_targets():
@@ -2441,7 +2549,7 @@ def run_update(view, manual=False, stop_on_news=True, cmd=None, summary=True, di
     RUNNING = True
     if on_spawn:
         on_spawn(child)
-    responder = Responder(child, stop_on_news, manual, restart_services=restart)
+    responder = Responder(child, stop_on_news, manual, restart_services=restart, check_space=not demo)
     global RESPONDER
     RESPONDER = responder
     signal.signal(signal.SIGHUP, signal.SIG_IGN)   # our own session never hangs up the work
@@ -2489,6 +2597,15 @@ def run_update(view, manual=False, stop_on_news=True, cmd=None, summary=True, di
             responder
     if child.exitstatus in NOTHING_DONE and installed_versions() == before:
         return status, not_started(NOTHING_DONE[child.exitstatus], 1), responder
+    full = "not enough free disk space" in {f.lower() for f in responder.failures}
+    if (responder.space or full) and installed_versions() == before:
+        # stopped at pacman's question for want of room (or pacman found too little itself): nothing changed
+        space = responder.space or {"need": catalogue.space.AFTER_FULL, "free": shutil.disk_usage("/").free}
+        return status, not_started(space_text(responder.space) if responder.space else FULL_BEFORE, 1,
+                                   space=space), responder
     result = system_checks(before, status, responder, pacman_log_offset, failed_before, orphans_before=orphans_before,
                            probe=probe, carry=not demo) if summary else None
     return status, result, responder
+
+
+import fixes as catalogue  # noqa: E402  (the fixes catalogue, lib/fixes: it uses the engine above)

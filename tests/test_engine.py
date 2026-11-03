@@ -27,6 +27,7 @@ os.environ.pop("ARCH_UPDATE_AUTO_LOGDIR", None)
 os.environ["ARCH_UPDATE_REPORT_URL"] = ""        # nothing here may ever reach the real relay
 sys.path.insert(0, os.path.join(ROOT, "lib"))
 import engine  # noqa: E402
+import fixes  # noqa: E402
 
 KVER = "7.2.11-arch1-1"
 
@@ -480,8 +481,11 @@ class Machine(Patching):
         self.linux(f"{self.tmp}/gone", image)
         r = self.checks()
         self.assertTrue(any("НЕ перезагружайся" in p and "/gone" in p for p in r["problems"]), r["problems"])
-        self.assertEqual(r["fixes"], [{"key": "kernel", "argv": ["sudo", "pacman", "-S", "linux"],
-                                       "label": "переустановить ядро (linux): вернёт файл ядра и initramfs"}])
+        self.assertEqual([(f["key"], f["argv"], f["label"]) for f in r["fixes"]],
+                         [("kernel", ["sudo", "pacman", "-S", "linux"],
+                           "переустановить ядро (linux): вернёт файл ядра и initramfs")])
+        # the runner keeps the kernel's boot files and checks them after pacman
+        self.assertEqual(r["fixes"][0]["args"], ["r:linux", f"k:{self.tmp}/gone", f"i:{KVER}:1:{image}"])
 
     def test_the_kernel_comes_back_as_it_was_installed(self):
         image = self.boot_file("initramfs-linux.img", mode=0o000)
@@ -541,8 +545,8 @@ class Machine(Patching):
         self.assertIn("initcpio", kinds)
         self.assertTrue(any(i["kind"] == "image" and "нет модулей ядра" in i["text"] for i in first["boot"]))
         self.assertEqual(kinds.count("depmod"), 1)          # the module list missing says what depmod failed on
-        self.assertEqual(self.fix_keys(first), ["depmod", "initramfs"])
-        self.assertEqual(first["fixes"][0]["argv"], ["sudo", "depmod", KVER])
+        self.assertEqual(self.fix_keys(first), ["space", "depmod", "initramfs"])
+        self.assertEqual(first["fixes"][1]["argv"], ["sudo", "depmod", KVER])
         self.assertFalse(any(o.startswith("ядро и initramfs") for o in first["ok"]), first["ok"])
         self.assertFalse(any("перезагрузись" in n for n in first["notes"]), first["notes"])
         self.assertTrue(any("только когда проблемы выше будут исправлены" in n for n in first["notes"]))
@@ -591,7 +595,7 @@ class Machine(Patching):
     def test_a_full_disk_is_a_problem(self):
         r = self.checks(failures={"No space left on device"})
         self.assertEqual((r["verdict"], r["problems"]), (2, [engine.DISK_FULL]))
-        self.assertEqual(r["fixes"], [])
+        self.assertEqual(self.fix_keys(r), ["space"])          # F frees room first; the update is to run again
 
     def test_a_summary_a_full_disk_did_not_let_be_written_still_warns(self):
         self.linux(self.boot_file("vmlinuz-linux"), self.boot_file("initramfs-linux.img", data=b""))
@@ -987,9 +991,18 @@ class Machine(Patching):
             self.said = []
             self.patch(self.ui, "back_to_canvas", lambda app, lines: self.said.extend(text for text, _, _ in lines))
             self.patch(self.ui, "say_plain", lambda *a, **k: None)
-        self.patch(self.ui, "run_in_terminal", lambda app, argv, intro: (status, set(seen)))
+        plan = engine.fix_commands(res)
+
+        def terminal(app, argv, intro):
+            # what the catalogue's runner writes: every fix done and checked, or the first one put back
+            if "arch-update-fix" in argv and status in (0, fixes.ROLLED_BACK):
+                with open(argv[argv.index("arch-update-fix") + 1], "w", encoding="utf-8") as f:
+                    for i, fix in enumerate(plan):
+                        f.write(f"{fix['key']} {'ok' if status == 0 else 'rolledback' if i == 0 else 'skipped'}\n")
+            return status, set(seen)
+        self.patch(self.ui, "run_in_terminal", terminal)
         self.said.clear()
-        return self.ui.fix_problems(types.SimpleNamespace(s=None), res, engine.fix_commands(res))
+        return self.ui.fix_problems(types.SimpleNamespace(s=None), res, plan)
 
     def test_a_fix_that_failed_fixed_nothing(self):
         self.linux(self.boot_file("vmlinuz-linux"), self.boot_file("initramfs-linux.img"))
@@ -998,7 +1011,7 @@ class Machine(Patching):
         # mkinitcpio -P exited 1 and wrote the image all the same: the look finds it whole, it is not fixed
         text, colour = self.fix_key(res, 1, {"errors were encountered during the build"})
         self.assertEqual(colour, self.ui.BAD)
-        self.assertTrue(text.startswith("исправление не прошло (код 1, «errors were encountered during the build»)"))
+        self.assertTrue(text.startswith("НЕ перезагружайся: исправление не прошло"), text)
         self.assertTrue(any("НЕ перезагружайся" in s for s in self.said), self.said)
         self.assertEqual(engine.unresolved()["log"], r["log"])
         self.assertNotIn("resolved", self.summary(r))
@@ -1223,6 +1236,122 @@ class Stubs(Patching):
             return status, res, f.read()
 
 
+class SpaceBeforeTheUpdate(Stubs):
+    """The Chromebook of 2026-11-02: btrfs with snap-pac, pacman counted 7 MiB ("Net Upgrade Size") but the
+    snapshot kept every replaced file, and the transaction ran out of room halfway. Now the room is looked at when
+    pacman asks, counted as the snapshot makes it: too little, and pacman gets "n" — nothing changes, and F frees
+    room."""
+
+    # pacman's last words before its question, as on that Chromebook
+    UPDATE = r"""#!/bin/bash
+echo ":: Starting full system upgrade..."
+echo "resolving dependencies..."
+echo
+echo "Packages (3) linux-7.2.14.arch1-1  linux-firmware-20261101-1  wine-11.2-1"
+echo
+echo "Total Download Size:    673.20 MiB"
+echo "Total Installed Size:  1293.45 MiB"
+echo "Net Upgrade Size:         7.15 MiB"
+echo
+read -rp ":: Proceed with installation? [Y/n] " ans
+echo "answer=$ans"
+[ "$ans" = n ] && exit 1
+echo "installing"
+"""
+
+    def setUp(self):
+        super().setUp()
+        self.free = 1200 * 2 ** 20
+        self.patch(engine, "mount_of", lambda path: ("btrfs", "/dev/mmcblk0p3"))
+        self.patch(engine, "snapshot_hooks", lambda: ["05-snap-pac-pre.hook"])
+        self.patch(engine.shutil, "disk_usage", lambda path: types.SimpleNamespace(free=self.free, total=0, used=0))
+        self.stub("fake-update", self.UPDATE)
+
+    def test_too_little_room_with_a_snapshot_stops_before_anything_changes(self):
+        status, res, log = self.run_update()
+        self.assertIn("answer=n", log)
+        self.assertNotIn("installing", log)
+        self.assertEqual((res["started"], res["verdict"]), (False, 1))
+        self.assertTrue(res["warnings"][0].startswith("мало места на диске: свободно 1,2 ГБ, а обновлению нужно "
+                                                      "около 2,"), res["warnings"])
+        self.assertIn("снимок snapper", res["warnings"][0])
+        self.assertEqual([f["key"] for f in res["fixes"]], ["space"])
+        need = int(res["fixes"][0]["args"][0])
+        self.assertGreater(need, (1293 + 673) * 2 ** 20)            # every new file and the downloads
+        self.assertIn("МЕСТО]", log)
+        saved = engine.read_json(engine.summary_path(res["log"]))
+        self.assertEqual(saved["space"]["need"], need)
+        # F freed the room: the summary says so, F is gone, the update can run again
+        self.free = 5 * 2 ** 30
+        data = engine.space_freed(res["log"])
+        self.assertEqual((data["warnings"], data.get("space")), ([], None))
+        self.assertTrue(any(o.startswith("место освобождено") for o in data["ok"]))
+        self.assertEqual(engine.fix_commands(data), [])
+
+    def test_enough_room_or_no_snapshot_goes_on(self):
+        self.free = 3 * 2 ** 30
+        _, res, log = self.run_update()
+        self.assertIn("answer=y", log)
+        self.assertTrue(res["started"])
+        self.free = 1200 * 2 ** 20
+        self.patch(engine, "snapshot_hooks", lambda: [])             # pacman's own count holds without one
+        _, res, log = self.run_update()
+        self.assertIn("answer=y", log)
+        self.patch(engine, "snapshot_hooks", lambda: ["05-snap-pac-pre.hook"])
+        self.patch(engine, "mount_of", lambda path: ("ext4", "/dev/sda2"))
+        _, res, log = self.run_update()
+        self.assertIn("answer=y", log)
+
+    def test_the_demo_never_checks(self):
+        _, res, log = self.run_update(demo=True)
+        self.assertIn("answer=y", log)
+
+    def test_sizes_and_hooks(self):
+        text = ("Packages (1) a-1\n\nTotal Installed Size:  1.50 GiB\n\n:: Proceed with installation? [Y/n] "
+                "\nPackages (2) b-1 c-1\n\nTotal Download Size:  10.00 MiB\nTotal Installed Size:  20.00 MiB\n")
+        self.assertEqual(engine.pacman_sizes(text), {"download": 10 * 2 ** 20, "installed": 20 * 2 ** 20})
+        self.assertIsNone(engine.pacman_sizes("nothing here"))
+        hooks = os.path.join(self.tmp, "hooks")
+        etc = os.path.join(self.tmp, "etc-hooks")
+        os.makedirs(hooks)
+        write(os.path.join(hooks, "05-snap-pac-pre.hook"),
+              "[Action]\nWhen = PreTransaction\nExec = /usr/share/libalpm/scripts/snap-pac pre\n", 0o644)
+        write(os.path.join(hooks, "60-other.hook"), "[Action]\nWhen = PostTransaction\nExec = /bin/snapper\n",
+              0o644)
+        self.patch(engine, "HOOK_DIRS", (hooks, etc))
+        self.assertEqual(self.REAL_HOOKS(), ["05-snap-pac-pre.hook"])
+        os.makedirs(etc)
+        os.symlink(os.devnull, os.path.join(etc, "05-snap-pac-pre.hook"))     # switched off by the user
+        self.assertEqual(self.REAL_HOOKS(), [])
+
+    def test_a_pacman_that_found_too_little_room_itself(self):
+        self.stub("fake-update", "#!/bin/bash\necho 'error: Partition / too full: 12 blocks needed, 3 blocks free'\n"
+                                 "echo 'error: not enough free disk space'\n"
+                                 "echo 'error: failed to commit transaction (not enough free disk space)'\nexit 5\n")
+        _, res, _ = self.run_update()
+        self.assertEqual((res["started"], res["verdict"], res["warnings"]), (False, 1, [engine.FULL_BEFORE]))
+        self.assertEqual([f["key"] for f in res["fixes"]], ["space"])
+
+    def test_a_manual_run_is_warned_and_answers_itself(self):
+        class View(engine.TerminalView):
+            said = []
+
+            def out(self, data):
+                pass
+
+            def message(self, msg, color=None):
+                View.said.append(msg)
+                if "ВНИМАНИЕ" in msg:
+                    engine.RESPONDER.user_input(b"n\r")       # the user reads it and says no
+        status, res, log = self.run_update(View(), manual=True)
+        self.assertTrue(any("ВНИМАНИЕ: мало места на диске" in m for m in View.said), View.said)
+        self.assertIn("ручной режим: предупредил", log)
+        self.assertEqual((res["started"], [f["key"] for f in res["fixes"]]), (False, ["space"]))
+
+
+SpaceBeforeTheUpdate.REAL_HOOKS = staticmethod(engine.snapshot_hooks)
+
+
 class ServicesRun(Stubs):
     """The whole question through a real pty: the setting decides what arch-update gets typed."""
 
@@ -1314,6 +1443,8 @@ class Probe(Stubs):
                           '    exec "$@" ;;\n'
                           '-v) read -rsp "[sudo] password for tester: " pw; echo\n'
                           '    [ "$pw" = secret ] && touch "$T/ticket" || { echo "Sorry, try again."; exit 1; } ;;\n'
+                          '*) if [ ! -f "$T/ticket" ]; then read -rsp "[sudo] password for tester: " pw; echo\n'
+                          '    [ "$pw" = secret ] && touch "$T/ticket" || exit 1; fi\n    exec "$@" ;;\n'
                           'esac\n')
         # root's view of the closed folder, the image's kernel, and sbctl's verdict
         self.stub("stat", '#!/bin/bash\nf=${!#}\nwhile read -r size path; do\n'
@@ -1368,20 +1499,23 @@ class Probe(Stubs):
         self.assertEqual(status, 15)
 
     def test_fixes_run_in_one_session_and_are_looked_at_right_after(self):
+        """F: the catalogue's root shell asks for the password once, runs the fixes with their copies and checks,
+        and the look as root comes right after it, in the same session."""
         import pexpect
-        out = os.path.join(self.tmp, "fix.probe")
-        made = os.path.join(self.tmp, "fixed")
-        fixes = [{"key": "a", "label": "a", "argv": ["sudo", "-v"]},          # asks once, like `sudo mkinitcpio -P`
-                 {"key": "b", "label": "b", "argv": ["sh", "-c", f'echo "64 {self.image}" >> "$T/root-sees"']},
-                 {"key": "c", "label": "c", "argv": ["touch", made]}]
-        argv = engine.fixes_command(fixes, out)
+        out, result = os.path.join(self.tmp, "fix.probe"), os.path.join(self.tmp, "fix.result")
+        self.stub("mountpoint", '#!/bin/bash\ntest -e "$T/mounted"\n')
+        self.stub("mount", f'#!/bin/bash\n: >"$T/mounted"\necho "64 {self.image}" >>"$T/root-sees"\n')
+        plan = engine.fix_commands({"boot": [{"kind": "unmounted", "target": "/boot", "text": "t"}]})
+        self.assertEqual([f["key"] for f in plan], ["mount"])
+        write(result, "", 0o600)
+        argv = engine.fixes_command(plan, out, result)
         child = pexpect.spawn(argv[0], argv[1:], env=engine.child_env(), timeout=20)
         child.expect("password for tester")
         child.sendline("secret")
         child.expect(pexpect.EOF)
         child.close()
-        self.assertEqual(child.exitstatus, 0)
-        self.assertTrue(os.path.exists(made))
+        self.assertEqual(child.exitstatus, fixes.OK)
+        self.assertEqual(fixes.read_results(result), [("mount", "ok")])
         probe = engine.read_probe(out)
         self.assertEqual(probe["sizes"], {self.kernel_file: 64, self.image: 64})
         self.assertEqual(probe["images"], {self.image: (0, {KVER})})
@@ -1389,16 +1523,17 @@ class Probe(Stubs):
         log = os.path.join(self.tmp, "2026-11-03_10-00-00.log")
         write(log, "", 0o644)
         self.assertEqual(engine.recheck_boot(log, probe=out), [])
-        # a fix that fails stops the ones after it; the look still comes
-        os.remove(made)
-        argv = engine.fixes_command([{"key": "a", "label": "a", "argv": ["false"]},
-                                     {"key": "c", "label": "c", "argv": ["touch", made]}], out)
+        # a fix that fails is put back and said so; the look still comes (the ticket from before still holds)
+        os.remove(os.path.join(self.tmp, "mounted"))
+        self.stub("mount", "#!/bin/bash\necho 'mount: /boot: special device does not exist.'\nexit 32\n")
+        write(result, "", 0o600)
+        argv = engine.fixes_command(plan, out, result)
         child = pexpect.spawn(argv[0], argv[1:], env=engine.child_env(), timeout=20)
         child.expect(pexpect.EOF)
         child.close()
-        self.assertEqual(child.exitstatus, 1)
-        self.assertFalse(os.path.exists(made))
-        self.assertIsNotNone(engine.read_probe(out))          # the ticket from before still holds
+        self.assertEqual(child.exitstatus, fixes.ROLLED_BACK)
+        self.assertEqual(fixes.read_results(result), [("mount", "rolledback")])
+        self.assertIsNotNone(engine.read_probe(out))
 
     def test_without_a_ticket_the_look_fails_silently(self):
         self.stub("fake-update", '#!/bin/bash\nrm -f "$T/ticket"\necho "==> The update has been applied"\n')

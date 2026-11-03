@@ -33,7 +33,7 @@ jobs:
         run: |
           useradd -m tester
           chown -R tester: .
-          su tester -c 'python3 tests/test_engine.py && python3 tests/test_report.py && python3 tests/test_sync.py && python3 tests/run.py'
+          su tester -c 'python3 tests/test_engine.py && python3 tests/test_fixes.py && python3 tests/test_report.py && python3 tests/test_sync.py && python3 tests/run.py'
 
   promote:
     needs: test

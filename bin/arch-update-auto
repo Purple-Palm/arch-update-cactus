@@ -70,7 +70,7 @@ def print_summary(res):
     if fixes:
         say("Исправить до перезагрузки — по порядку, в терминале:\n", C_BOLD)
         for fix in fixes:
-            say(f"  {shlex.join(fix['argv'])}   # {fix['label']}\n", "")
+            say(f"  {fix.get('how') or shlex.join(fix['argv'])}   # {fix['label']}\n", "")
     waiting = engine.services_command((res.get("services") or {}).get("waiting") or [])
     if waiting:
         say(f"Перезапустить сервисы сейчас: {shlex.join(waiting)}\n", "")
