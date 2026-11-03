@@ -12,6 +12,7 @@ Each run that reaches a result also leaves a summary next to its journal
 machine has rebooted or the problem was fixed (unresolved, fix_commands,
 recheck_boot, mark_resolved), and the reports list past updates from it.
 """
+import configparser
 import datetime
 import glob
 import json
@@ -112,7 +113,13 @@ DISK_FULL = ("на диске кончилось место («No space left on 
 SIZE_LINE = re.compile(r"^Total (Installed|Download) Size:\s+([\d.]+)\s+(B|KiB|MiB|GiB|TiB)\s*$", re.M)
 SIZE_UNITS = {"B": 1, "KiB": 2 ** 10, "MiB": 2 ** 20, "GiB": 2 ** 30, "TiB": 2 ** 40}
 HOOK_DIRS = ("/usr/share/libalpm/hooks", "/etc/pacman.d/hooks")    # the second overrides the first by name
-SNAPSHOT_EXEC = re.compile(r"(?mi)^\s*Exec\s*=.*\b(?:snap-pac|snapper|timeshift|btrfs\s+subvolume\s+snapshot)\b")
+# A hook's Exec that takes a snapshot: snap-pac's "snap-pac pre" (not its removal hook, which only deletes its
+# notes in /tmp), timeshift-autosnap, a hand-made snapper create or btrfs subvolume snapshot.
+SNAPSHOT_EXEC = re.compile(r"(?mi)^\s*Exec\s*=(?P<cmd>[^\n]*)$")
+SNAPSHOT_CMD = re.compile(r"\bsnap-pac\s+pre\b|\btimeshift-autosnap\b|\bsnapper\b[^\n]*\bcreate\b"
+                          r"|\bbtrfs\s+subvolume\s+snapshot\b")
+SNAPPER_ROOT = "/etc/snapper/configs/root"   # snap-pac snapshots the snapper config "root" (/) unless told not to
+SNAP_PAC_INI = "/etc/snap-pac.ini"
 SPACE_MARGIN = 256 * 2 ** 20     # on top: the hooks' own files (initramfs, caches), btrfs's metadata
 MOUNTINFO = "/proc/self/mountinfo"
 SPACE_HEAD = "мало места на диске"
@@ -312,9 +319,28 @@ def snapshot_hooks():
                 text = f.read(65536)
         except OSError:
             continue
-        if re.search(r"(?mi)^\s*When\s*=\s*PreTransaction\b", text) and SNAPSHOT_EXEC.search(text):
-            found.append(name)
+        if not re.search(r"(?mi)^\s*When\s*=\s*PreTransaction\b", text):
+            continue
+        cmds = [m.group("cmd") for m in SNAPSHOT_EXEC.finditer(text)]
+        if not any(SNAPSHOT_CMD.search(c) for c in cmds):
+            continue
+        if any(re.search(r"\bsnap-pac\s+pre\b", c) for c in cmds) and not snap_pac_takes_root():
+            continue
+        found.append(name)
     return found
+
+
+def snap_pac_takes_root():
+    """snap-pac snapshots / : snapper has its config "root", and /etc/snap-pac.ini does not switch it off (its
+    "snapshot" in [root] or [DEFAULT], true by default for root)."""
+    if not os.path.exists(SNAPPER_ROOT):
+        return False
+    ini = configparser.ConfigParser()
+    try:
+        ini.read(SNAP_PAC_INI, encoding="utf-8")
+        return ini.getboolean("root", "snapshot", fallback=ini.getboolean("DEFAULT", "snapshot", fallback=True))
+    except (configparser.Error, ValueError, OSError):
+        return True                             # cannot tell: as snap-pac would by default
 
 
 def mount_of(path):
@@ -2289,12 +2315,14 @@ def services_restarted(log, names, ok=True):
     return data
 
 
-def boot_probe_command(argv, out):
+def boot_probe_command(argv, out, ask_first=False):
     """argv (a fix) followed, in the same terminal session, by a probe of the boot files into the file out:
     after `sudo …` asked for the password in that terminal, only that session can look into a closed /boot.
-    Give out to recheck_boot afterwards. The exit status is argv's."""
+    Give out to recheck_boot afterwards. The exit status is argv's. ask_first: the password at the start, and
+    kept fresh while argv runs (ASK_SUDO_FIRST: a fix can take longer than sudo remembers it)."""
     files, images = probe_targets()
-    return probe_command(argv, out, files, images, secure_boot_on() and bool(shutil.which("sbctl")))
+    return probe_command(argv, out, files, images, secure_boot_on() and bool(shutil.which("sbctl")),
+                         ask_first=ask_first)
 
 
 def fixes_command(fixes, out, result=None):
@@ -2303,7 +2331,10 @@ def fixes_command(fixes, out, result=None):
     the probe into out for recheck_boot(log, probe=out). result: a file of this user's (fixes.result_file()) for
     what came of each fix (fixes.read_results). Run it in a pty: sudo asks for the password there, pacman and the
     space fix ask before they change anything. Exit status: the runner's (fixes.OK … fixes.NOT_ENOUGH)."""
-    return boot_probe_command(catalogue.command(fixes, result) or ["true"], out)
+    # sudo that asks for a password: asked once, at the start, and kept fresh (the space fix alone may wait
+    # minutes for an answer and for btrfs), so the look right after the fixes still has the ticket
+    ask = elevation_command() == "sudo" and sudo_asks_password()
+    return boot_probe_command(catalogue.command(fixes, result) or ["true"], out, ask_first=ask)
 
 
 def probe_targets():

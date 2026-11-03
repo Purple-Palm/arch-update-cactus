@@ -531,6 +531,7 @@ class Machine(Patching):
         # The look into the image (as root, after the update) saw the kernel's folder and called it fine. The
         # next update, in the same boot, said "reboot when convenient"; the machine did not boot.
         self.patch(engine, "running_kernel", lambda: "7.2.10-arch1-1")
+        self.patch(fixes.space, "free", lambda path="/": 300 * 2 ** 20)
         image = self.boot_file("initramfs-linux.img", modules=False)
         self.linux(self.boot_file("vmlinuz-linux"), image, index=False)
         self.after = {"linux": "7.2.14.arch1-1"}
@@ -593,9 +594,12 @@ class Machine(Patching):
         self.assertEqual(self.checks(carry=True)["problems"], [])
 
     def test_a_full_disk_is_a_problem(self):
+        self.patch(fixes.space, "free", lambda path="/": 300 * 2 ** 20)
         r = self.checks(failures={"No space left on device"})
         self.assertEqual((r["verdict"], r["problems"]), (2, [engine.DISK_FULL]))
         self.assertEqual(self.fix_keys(r), ["space"])          # F frees room first; the update is to run again
+        self.patch(fixes.space, "free", lambda path="/": 50 * 2 ** 30)
+        self.assertEqual(self.fix_keys(self.checks(failures={"No space left on device"})), [])   # full elsewhere
 
     def test_a_summary_a_full_disk_did_not_let_be_written_still_warns(self):
         self.linux(self.boot_file("vmlinuz-linux"), self.boot_file("initramfs-linux.img", data=b""))
@@ -995,10 +999,11 @@ class Machine(Patching):
 
         def terminal(app, argv, intro):
             # what the catalogue's runner writes: every fix done and checked, or the first one put back
-            if "arch-update-fix" in argv and status in (0, fixes.ROLLED_BACK):
+            first = {0: "ok", fixes.ROLLED_BACK: "rolledback", fixes.NOT_ENOUGH: "notenough"}.get(status)
+            if "arch-update-fix" in argv and first:
                 with open(argv[argv.index("arch-update-fix") + 1], "w", encoding="utf-8") as f:
                     for i, fix in enumerate(plan):
-                        f.write(f"{fix['key']} {'ok' if status == 0 else 'rolledback' if i == 0 else 'skipped'}\n")
+                        f.write(f"{fix['key']} {'ok' if status == 0 else first if i == 0 else 'skipped'}\n")
             return status, set(seen)
         self.patch(self.ui, "run_in_terminal", terminal)
         self.said.clear()
@@ -1011,7 +1016,8 @@ class Machine(Patching):
         # mkinitcpio -P exited 1 and wrote the image all the same: the look finds it whole, it is not fixed
         text, colour = self.fix_key(res, 1, {"errors were encountered during the build"})
         self.assertEqual(colour, self.ui.BAD)
-        self.assertTrue(text.startswith("НЕ перезагружайся: исправление не прошло"), text)
+        self.assertTrue(text.startswith("НЕ перезагружайся: всё ещё"), text)        # what is still wrong, first
+        self.assertTrue(any(s.startswith("✗ Исправление не прошло") for s in self.said), self.said)
         self.assertTrue(any("НЕ перезагружайся" in s for s in self.said), self.said)
         self.assertEqual(engine.unresolved()["log"], r["log"])
         self.assertNotIn("resolved", self.summary(r))
@@ -1023,6 +1029,21 @@ class Machine(Patching):
         text, colour = self.fix_key(res, 0)
         self.assertEqual((colour, engine.unresolved()), (self.ui.GOOD, None))
         self.assertIn("resolved", self.summary(r))
+
+    def test_too_little_room_even_for_the_fixes_still_says_do_not_reboot(self):
+        """The space fix could not make room even for the boot fixes after it: they did not run, the machine still
+        does not boot — the result says so in red, not "место освободил"."""
+        self.patch(fixes.space, "free", lambda path="/": 100 * 2 ** 20)
+        kernel, image = self.boot_file("vmlinuz-linux"), self.boot_file("initramfs-linux.img", data=b"")
+        self.linux(kernel, image)
+        r = self.checks(failures={"No space left on device"})
+        self.assertEqual(self.fix_keys(r), ["space", "initramfs"])
+        text, colour = self.fix_key(dict(r), fixes.NOT_ENOUGH)
+        self.assertEqual(colour, self.ui.BAD)
+        self.assertTrue(text.startswith("НЕ перезагружайся: всё ещё"), text)
+        self.assertTrue(any(s.startswith("✗ Всё ещё") for s in self.said), self.said)
+        self.assertTrue(any("Места не хватило даже для исправлений" in s for s in self.said), self.said)
+        self.assertEqual(engine.unresolved()["log"], r["log"])
 
     def test_a_problem_not_about_booting_keeps_the_warning(self):
         lock = os.path.join(self.tmp, "db.lck")
@@ -1318,15 +1339,35 @@ echo "installing"
         hooks = os.path.join(self.tmp, "hooks")
         etc = os.path.join(self.tmp, "etc-hooks")
         os.makedirs(hooks)
+        # snap-pac 3's own hooks (their [Action] parts, as shipped)
         write(os.path.join(hooks, "05-snap-pac-pre.hook"),
-              "[Action]\nWhen = PreTransaction\nExec = /usr/share/libalpm/scripts/snap-pac pre\n", 0o644)
+              "[Trigger]\nOperation = Upgrade\nType = Package\nTarget = *\n\n[Action]\nDescription = Performing "
+              "snapper pre snapshots for the following configurations...\nDepends = snap-pac\nWhen = PreTransaction\n"
+              "Exec = /usr/share/libalpm/scripts/snap-pac pre\nNeedsTargets\nAbortOnFail\n", 0o644)
+        write(os.path.join(hooks, "10-snap-pac-removal.hook"),
+              "[Trigger]\nOperation = Remove\nType = Package\nTarget = snap-pac\n\n[Action]\nDepends = snap-pac\n"
+              "When = PreTransaction\nExec = /usr/bin/bash -c \"rm -f /tmp/snap-pac-pre_*\"\n", 0o644)
+        write(os.path.join(hooks, "zz-snap-pac-post.hook"),
+              "[Action]\nWhen = PostTransaction\nExec = /usr/share/libalpm/scripts/snap-pac post\n", 0o644)
         write(os.path.join(hooks, "60-other.hook"), "[Action]\nWhen = PostTransaction\nExec = /bin/snapper\n",
               0o644)
+        root_config = os.path.join(self.tmp, "snapper-root")
+        ini = os.path.join(self.tmp, "snap-pac.ini")
         self.patch(engine, "HOOK_DIRS", (hooks, etc))
+        self.patch(engine, "SNAPPER_ROOT", root_config)
+        self.patch(engine, "SNAP_PAC_INI", ini)
+        self.assertEqual(self.REAL_HOOKS(), [])               # snapper has no config for / : snap-pac snaps nothing
+        write(root_config, 'SUBVOLUME="/"\n', 0o644)
         self.assertEqual(self.REAL_HOOKS(), ["05-snap-pac-pre.hook"])
+        write(ini, "[root]\nsnapshot = no\n", 0o644)            # switched off in snap-pac.ini
+        self.assertEqual(self.REAL_HOOKS(), [])
+        os.remove(ini)
         os.makedirs(etc)
         os.symlink(os.devnull, os.path.join(etc, "05-snap-pac-pre.hook"))     # switched off by the user
-        self.assertEqual(self.REAL_HOOKS(), [])
+        self.assertEqual(self.REAL_HOOKS(), [])               # and its removal hook takes no snapshot
+        write(os.path.join(etc, "00-timeshift-autosnap.hook"),
+              "[Action]\nWhen = PreTransaction\nExec = /usr/bin/timeshift-autosnap\nAbortOnFail\n", 0o644)
+        self.assertEqual(self.REAL_HOOKS(), ["00-timeshift-autosnap.hook"])
 
     def test_a_pacman_that_found_too_little_room_itself(self):
         self.stub("fake-update", "#!/bin/bash\necho 'error: Partition / too full: 12 blocks needed, 3 blocks free'\n"
@@ -1445,7 +1486,8 @@ class Probe(Stubs):
         self.stub("sudo", '#!/bin/bash\ncase "$1" in\n'
                           '-n) shift; [ -f "$T/ticket" ] || exit 1\n    case "$1" in ""|-v|true) exit 0 ;; esac\n'
                           '    exec "$@" ;;\n'
-                          '-v) read -rsp "[sudo] password for tester: " pw; echo\n'
+                          '-v) [ -f "$T/ticket" ] && exit 0\n'
+                          '    read -rsp "[sudo] password for tester: " pw; echo\n'
                           '    [ "$pw" = secret ] && touch "$T/ticket" || { echo "Sorry, try again."; exit 1; } ;;\n'
                           '*) if [ ! -f "$T/ticket" ]; then read -rsp "[sudo] password for tester: " pw; echo\n'
                           '    [ "$pw" = secret ] && touch "$T/ticket" || exit 1; fi\n    exec "$@" ;;\n'
@@ -1538,6 +1580,17 @@ class Probe(Stubs):
         self.assertEqual(child.exitstatus, fixes.ROLLED_BACK)
         self.assertEqual(fixes.read_results(result), [("mount", "rolledback")])
         self.assertIsNotNone(engine.read_probe(out))
+
+    def test_a_long_fix_keeps_its_password(self):
+        """The space fix may wait minutes for an answer and for btrfs: F asks for the password once, first, and
+        keeps the ticket fresh while the fixes run, so the look after them still sees the closed /boot."""
+        argv = engine.fixes_command(engine.fix_commands({"boot": [{"kind": "unmounted", "target": "/boot",
+                                                                    "text": "t"}]}), "/dev/null")
+        self.assertIn("sudo -v || exit 125", argv[2])
+        self.patch(engine, "sudo_asks_password", lambda: False)
+        argv = engine.fixes_command(engine.fix_commands({"boot": [{"kind": "unmounted", "target": "/boot",
+                                                                    "text": "t"}]}), "/dev/null")
+        self.assertNotIn("sudo -v || exit 125", argv[2])
 
     def test_without_a_ticket_the_look_fails_silently(self):
         self.stub("fake-update", '#!/bin/bash\nrm -f "$T/ticket"\necho "==> The update has been applied"\n')

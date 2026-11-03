@@ -2697,6 +2697,10 @@ def merge(res, data):
     for k in ("problems", "warnings", "notes", "ok", "verdict", "services", "boot", "fixes", "resolved"):
         if k in data:
             res[k] = data[k]
+    if "space" in data:                         # too little room: as the summary says it now (gone once freed)
+        res["space"] = data["space"]
+    else:
+        res.pop("space", None)
     return True
 
 
@@ -2744,7 +2748,8 @@ FREE_HINT = "освободи место (например: sudo pacman -Sc) и 
 # The status line after F, by what came of the fixes (fixes.outcome): short, it has a row of its own.
 FIX_SAYS = {"rolledback": "не помогло, всё вернул как было", "nothing": "ничего не менял",
             "error": "закончилось с ошибкой", "notenough": "место освободил, но его всё ещё мало",
-            "rollbackfailed": "вернуть как было не удалось — копии в /tmp", "seen": "в выводе была ошибка"}
+            "rollbackfailed": "вернуть как было не удалось — копии в /tmp", "seen": "в выводе была ошибка",
+            "stopped": "сделано не всё"}
 
 
 def low_space():
@@ -2764,7 +2769,8 @@ def fix_problems(app, res, plan):
     root). A fix that was not done (put back, or its output said an error) fixed nothing: what was found stays,
     whatever the look says now, and the menu goes on warning. Only when every fix was done and checked and nothing
     is wrong any more is the update marked fixed (engine.mark_resolved; a problem that is not about booting, a
-    pacman lock left behind, keeps the warning). Returns what came of it: (text, colour); res follows the update's
+    pacman lock left behind, keeps the warning). Whatever else came of it, a problem with booting still there is
+    said first, in red, with НЕ перезагружайся. Returns what came of it: (text, colour); res follows the update's
     summary."""
     log = res.get("log")
     try:
@@ -2773,13 +2779,17 @@ def fix_problems(app, res, plan):
     except OSError:
         out = None
     result = fixes.result_file()
+    keys = [f.get("key") for f in plan]
     intro = [("[Arch-Update] Исправляю" + (", по порядку:" if len(plan) > 1 else ":"), None, True)]
     for i, fix in enumerate(plan, 1):
         intro += [(f"  {i}. {fix['label']}" if len(plan) > 1 else f"  {fix['label']}", None, False),
                   ("     " + (fix.get("how") or shlex.join(fix["argv"])), DIM, False)]
-    intro.append(("Сначала сохраню копии того, что меняется, потом проверю, что получилось; если не получится — "
-                  "верну всё как было.", DIM, False))
-    keys = {f.get("key") for f in plan}
+    if any(k != "space" for k in keys):
+        intro.append(("Прежде чем менять файлы, сохраню их копии, потом проверю, что получилось; если не "
+                      "получится — верну всё как было.", DIM, False))
+    if "space" in keys:
+        intro.append(("Место: удаляю только кэш pacman (установленные версии остаются) и старый журнал; снимки "
+                      "snapper — только если ответишь «да».", DIM, False))
     asks = "sudo спросит пароль, если нужно" + ("; pacman спросит, прежде чем что-то менять"
                                                 if "kernel" in keys else "")
     intro.append((asks + ".", DIM, False))
@@ -2788,15 +2798,16 @@ def fix_problems(app, res, plan):
         intro.append((f"{space[:1].upper()}{space[1:]}: сначала освободи место (например: sudo pacman -Sc), "
                       "иначе исправление не пройдёт.", WARN, True))
     status, seen = run_in_terminal(app, engine.fixes_command(plan, out or os.devnull, result), intro)
-    results = fixes.read_results(result)
+    results = fixes.read_results(result) if result else None       # no file for them: the exit status tells
     kind, how = fixes.outcome(status, results, plan)
+    states = dict(results or [])
     failed = kind != "ok" or bool(seen)
     if kind == "ok" and seen:                   # done and checked, but something in its output said an error
         how = "в выводе " + ", ".join(f"«{m}»" for m in sorted(seen)[:2])
     short = FIX_SAYS.get(kind if kind != "ok" else "seen", how)
-    engine.journal_event(log, "ИСПРАВЛЕНИЕ", "по клавише F: " + fixes.journal_text(status, results, plan)
+    engine.journal_event(log, "ИСПРАВЛЕНИЕ", "по клавише F: " + fixes.journal_text(status, results or [], plan)
                          + "".join(f", в выводе «{m}»" for m in sorted(seen)[:2]))
-    if dict(results).get("space") == "ok":
+    if states.get("space") == "ok" or (results is None and kind == "ok" and "space" in keys):
         engine.space_freed(log)
     say_plain(app.s, "\nПроверяю файлы загрузки ещё раз…", DIM)
     old = {i.get("text") for i in res.get("boot") or [] if isinstance(i, dict)}
@@ -2820,7 +2831,8 @@ def fix_problems(app, res, plan):
     if not failed and left == [] and not rest and log:
         res["resolved"] = engine.mark_resolved(log) or res.get("resolved")
     disk = "No space left on device" in seen
-    only_space = keys == {"space"}
+    only_space = set(keys) == {"space"}
+    room = "partial" in states.values()         # room for the fixes, not yet for the update
     if left is None:
         text = "не удалось проверить — НЕ перезагружайся, сначала: sudo ls -l /boot"
         lines = [("✗ " + text, BAD, True)]
@@ -2830,11 +2842,23 @@ def fix_problems(app, res, plan):
         lines = [("✗ Исправление не помогло, и вернуть всё как было не удалось — копии остались в /tmp "
                   "(путь выше). НЕ перезагружайся.", BAD, True),
                  ("Отправь отчёт (S): по нему будет видно, что случилось.", WARN, False)]
+    elif left:                                  # a problem with booting is still there: that first, in red
+        more = f" (и ещё {len(left) - 1})" if len(left) > 1 else ""
+        text, colour = f"НЕ перезагружайся: всё ещё {short_problem(left[0])}{more}", BAD
+        lines = [("✗ Всё ещё: " + short_problem(p), BAD, False) for p in left] + \
+            [("НЕ перезагружайся, пока это не исправлено.", BAD, True)]
+        if failed:
+            lines.insert(0, ("✗ Исправление не прошло: " + how + ".", BAD, True))
+        if kind == "rolledback":
+            lines.insert(1, ("Всё, что оно меняло, вернул как было (сверил с копиями).", None, False))
+        if kind == "notenough":
+            lines.append(("Места не хватило даже для исправлений — что ещё занимает место, написано выше.",
+                          WARN, False))
+        if disk:
+            lines.append(("На диске нет места: " + FREE_HINT + ".", WARN, True))
     elif kind == "notenough":
         text, colour = short, WARN
         lines = [("! Место освободил, но его всё ещё мало — что ещё занимает место, написано выше.", WARN, True)]
-        if not only_space:
-            lines.append(("Остальные исправления не делал: им нужно место.", WARN, False))
     elif failed and only_space:
         text, colour = f"место освободить не вышло: {how}", WARN
         lines = [("! Место освободить не вышло: " + how + ".", WARN, True)]
@@ -2843,14 +2867,6 @@ def fix_problems(app, res, plan):
         lines = [("✗ Исправление не прошло: " + how + ". НЕ перезагружайся.", BAD, True)]
         if kind == "rolledback":
             lines.append(("Всё, что оно меняло, вернул как было (сверил с копиями).", None, False))
-        if disk:
-            lines.append(("На диске нет места: " + FREE_HINT + ".", WARN, True))
-        lines += [("✗ Всё ещё: " + short_problem(p), BAD, False) for p in left]
-    elif left:
-        more = f" (и ещё {len(left) - 1})" if len(left) > 1 else ""
-        text, colour = f"НЕ перезагружайся: всё ещё {short_problem(left[0])}{more}", BAD
-        lines = [("✗ Всё ещё: " + short_problem(p), BAD, False) for p in left] + \
-            [("НЕ перезагружайся, пока это не исправлено.", BAD, True)]
     elif only_space:
         text, colour = "место освобождено — запусти обновление ещё раз", GOOD
         lines = [("✓ Место освобождено. Запусти обновление ещё раз.", GOOD, True)]
@@ -2862,6 +2878,11 @@ def fix_problems(app, res, plan):
     else:
         text = "исправлено: проблем с загрузкой больше не нашёл"
         lines, colour = [("✓ Проблем с загрузкой больше не нашёл.", GOOD, True)], GOOD
+    if room and left == []:
+        lines.append(("Для обновления места ещё мало — освободи его, прежде чем обновляться (F в итоге "
+                      "обновления сделает это снова).", WARN, False))
+        if colour == GOOD:
+            text, colour = text + "; для обновления места ещё мало", WARN
     back_to_canvas(app, lines)
     return text, colour
 

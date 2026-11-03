@@ -64,6 +64,7 @@ class Runner(unittest.TestCase):
         write(self.image, "OLD\n" + listing(), 0o600)
         write(self.kernel, "KERNEL-OLD\n", 0o644)
         self.result = os.path.join(self.t, "result")
+        self.lock = os.path.join(self.t, "db.lck")          # pacman's lock: none, unless a test makes one
         self.env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", T=self.t, IMAGES=self.image)
         # stand-ins: what they do is set by files in $T (mode-*) and by $IMAGES
         self.stub("lsinitcpio", 'case $(head -n 1 "$1") in BROKEN*) exit 1 ;; esac\ntail -n +2 "$1"\n')
@@ -75,6 +76,7 @@ for f in $IMAGES; do
         good) printf 'NEW\n%s' "$(cat "$T/good-listing")" >"$f" ;;
         nomodules) printf 'NEW\n%s' "$(cat "$T/bare-listing")" >"$f"; echo "==> WARNING: No modules were added to the image. This is probably not what you want." ;;
         truncated) : >"$f"; echo "==> ERROR: errors were encountered during the build. The image may not be complete."; exit 1 ;;
+        tmpleft) printf 'NEW-PARTIAL' >"$f.tmp"; echo "zstd: error 70 : Write error : No space left on device"; exit 1 ;;
         slow) sleep 2; printf 'NEW\n%s' "$(cat "$T/good-listing")" >"$f" ;;
     esac
 done
@@ -93,13 +95,36 @@ echo "==> Initcpio image generation successful"
     def stub(self, name, body):
         write(os.path.join(self.bin, name), "#!/bin/bash\n" + body)
 
-    def run_fixes(self, *fixes_args, stdin="", timeout=60):
-        """The runner with these fixes: [(key, [args])]. Returns (exit status, output, results)."""
-        argv = ["bash", "-c", fixes.runner(), "arch-update-fix", self.result]
+    def argv(self, *fixes_args):
+        argv = ["bash", "-c", fixes.runner(), "arch-update-fix", self.result, self.lock]
         for key, args in fixes_args:
             argv += [key, *args, "--"]
-        p = subprocess.run(argv, input=stdin, capture_output=True, text=True, env=self.env, timeout=timeout)
+        return argv
+
+    def run_fixes(self, *fixes_args, stdin="", timeout=60):
+        """The runner with these fixes: [(key, [args])]. Returns (exit status, output, results)."""
+        write(self.result, "", 0o600)
+        p = subprocess.run(self.argv(*fixes_args), input=stdin, capture_output=True, text=True, env=self.env,
+                           timeout=timeout)
         return p.returncode, p.stdout + p.stderr, fixes.read_results(self.result)
+
+    def run_talking(self, *fixes_args, answers=(), before=None):
+        """The runner in a terminal of its own, answering its questions as they come: answers [(what it asks,
+        what to type)]. before: typed before anything was asked. Returns (exit status, output, results)."""
+        import pexpect
+        write(self.result, "", 0o600)
+        argv = self.argv(*fixes_args)
+        child = pexpect.spawn(argv[0], argv[1:], env=self.env, timeout=30, encoding="utf-8")
+        if before:
+            child.send(before)
+        for question, typed in answers:
+            child.expect_exact(question)
+            time.sleep(0.4)                     # the question waits for its answer (drain is done)
+            child.send(typed)
+        child.expect(pexpect.EOF)
+        out = child.before
+        child.close()
+        return child.exitstatus, out, fixes.read_results(self.result)
 
     def image_spec(self, path=None, kver=KVER):
         return f"i:{kver}:1:{path or self.image}"
@@ -142,6 +167,15 @@ echo "==> Initcpio image generation successful"
         status, out, _ = self.run_fixes(("initramfs", ["p:linux", self.image_spec()]))
         self.assertEqual(status, fixes.ROLLED_BACK, out)
         self.assertEqual(digest(self.image), before)
+
+    def test_what_mkinitcpio_left_half_written_goes_too(self):
+        """A full /boot: mkinitcpio writes <image>.tmp first and leaves it when the build fails."""
+        before = digest(self.image)
+        write(os.path.join(self.t, "mode-mkinitcpio"), "tmpleft", 0o644)
+        status, out, _ = self.run_fixes(("initramfs", ["p:linux", self.image_spec()]))
+        self.assertEqual(status, fixes.ROLLED_BACK, out)
+        self.assertEqual(digest(self.image), before)
+        self.assertFalse(os.path.exists(self.image + ".tmp"))
 
     def test_an_image_for_another_kernel_is_put_back(self):
         before = digest(self.image)
@@ -188,8 +222,7 @@ echo "==> Initcpio image generation successful"
     def test_ctrl_c_does_not_cut_a_fix_off(self):
         import pexpect
         write(os.path.join(self.t, "mode-mkinitcpio"), "slow", 0o644)
-        argv = ["bash", "-c", fixes.runner(), "arch-update-fix", self.result, "initramfs", "p:linux",
-                self.image_spec(), "--"]
+        argv = self.argv(("initramfs", ["p:linux", self.image_spec()]))
         child = pexpect.spawn(argv[0], argv[1:], env=self.env, timeout=30)
         child.expect("mkinitcpio -p linux")
         time.sleep(0.3)
@@ -227,6 +260,20 @@ echo "==> Initcpio image generation successful"
         self.assertEqual(status, fixes.ROLLED_BACK, out)
         self.assertFalse(os.path.exists(os.path.join(self.mods, KVER, "modules.dep")))
         self.assertEqual(read(self.ld), "LDCACHE-OLD")
+
+    def test_with_no_room_beside_a_file_it_comes_back_with_its_mode(self):
+        """Putting back writes beside the file first; where that cannot be (a full partition), the file the fix
+        left goes and the copy takes its place, with the copy's mode and time."""
+        args = self.depmod_setup()
+        os.utime(self.ld, (1_700_000_000, 1_700_000_000))
+        self.stub("depmod", "exit 1\n")
+        self.stub("ldconfig", f': >"{self.ld}"\nexit 1\n')
+        os.symlink("/nonexistent-folder/x", self.ld + ".arch-update-new")     # nothing can be written beside it
+        status, out, _ = self.run_fixes(("depmod", args))
+        self.assertEqual(status, fixes.ROLLED_BACK, out)
+        self.assertEqual(read(self.ld), "LDCACHE-OLD")
+        self.assertEqual(stat.S_IMODE(os.stat(self.ld).st_mode), 0o644)
+        self.assertEqual(int(os.stat(self.ld).st_mtime), 1_700_000_000)
 
     def test_a_strange_kernel_version_is_refused(self):
         args = self.depmod_setup()
@@ -306,33 +353,71 @@ printf 'Avail\n%s\n' "$v"
         self.stub("snapper", r'''echo "snapper $*" >>"$T/calls"
 case "$*" in
     *list-configs*) printf 'config\nroot\n' ;;
+    *get-config*) printf 'key,value\nNUMBER_CLEANUP,%s\nNUMBER_LIMIT,50\n' "$(cat "$T/number-cleanup" 2>/dev/null || echo yes)" ;;
     *" list "*) echo "number,cleanup"; for i in $(seq 1 40); do echo "$i,number"; done ;;
 esac
 ''')
 
-    def test_space_freed_without_asking(self):
+    def test_space_freed_without_touching_snapshots(self):
         self.space_stubs([10 ** 9, 3 * 10 ** 9])
-        status, out, results = self.run_fixes(("space", [str(2 * 10 ** 9)]))
-        self.assertEqual(status, fixes.OK, out)
+        status, out, results = self.run_fixes(("space", [str(2 * 10 ** 9), str(2 * 10 ** 9)]))
+        self.assertEqual((status, results), (fixes.OK, [("space", "ok")]), out)
         calls = read(os.path.join(self.t, "calls"))
         self.assertIn("-Sc --noconfirm", calls)
         self.assertIn("journalctl --vacuum-size=200M", calls)
-        self.assertIn("snapper -c root cleanup number", calls)
-        self.assertNotIn("set-config", calls)
+        self.assertNotIn("snapper", calls)                    # room enough already: snapshots not even looked at
 
     def test_snapshots_go_only_when_the_user_says_yes(self):
+        want = str(2 * 10 ** 9)
         self.space_stubs([10 ** 9])
-        status, out, results = self.run_fixes(("space", [str(2 * 10 ** 9)]), stdin="\n")
+        question = "Удалить лишние по его же правилам (snapper cleanup number)?"
+        status, out, results = self.run_talking(("space", [want, want]), answers=[(question, "\r")])
+        self.assertEqual((status, results), (fixes.NOT_ENOUGH, [("space", "notenough")]), out)
+        self.assertNotIn("cleanup number", read(os.path.join(self.t, "calls")))
+        # yes, and yes again to keeping only the last 10
+        for f in ("calls", "df-n"):
+            os.remove(os.path.join(self.t, f))
+        self.space_stubs([10 ** 9, 10 ** 9, 10 ** 9, 5 * 10 ** 9])   # before, before snapper, after its cleanup, then
+        status, out, results = self.run_talking(("space", [want, want]), answers=[
+            (question, "y\r"), ("Оставить 10 последних снимков? [y/N]", "y\r")])
+        self.assertEqual((status, results), (fixes.OK, [("space", "ok")]), out)
+        calls = read(os.path.join(self.t, "calls"))
+        self.assertIn("snapper -c root cleanup number", calls)
+        self.assertIn("set-config NUMBER_LIMIT=10 NUMBER_LIMIT_IMPORTANT=5", calls)
+
+    def test_a_key_pressed_before_the_question_is_no_yes(self):
+        want = str(2 * 10 ** 9)
+        self.space_stubs([10 ** 9])
+        question = "Удалить лишние по его же правилам (snapper cleanup number)?"
+        status, out, _ = self.run_talking(("space", [want, want]), before="y\r", answers=[(question, "\r")])
         self.assertEqual(status, fixes.NOT_ENOUGH, out)
-        self.assertEqual(results, [("space", "notenough")])
-        self.assertIn("Оставить 10 последних снимков? [y/N]", out)
-        self.assertNotIn("set-config", read(os.path.join(self.t, "calls")))
-        os.remove(os.path.join(self.t, "calls"))
-        os.remove(os.path.join(self.t, "df-n"))
-        self.space_stubs([10 ** 9, 10 ** 9, 10 ** 9, 5 * 10 ** 9])
-        status, out, _ = self.run_fixes(("space", [str(2 * 10 ** 9)]), stdin="y\n")
+        self.assertNotIn("cleanup number", read(os.path.join(self.t, "calls")))
+
+    def test_snapshots_snapper_does_not_clean_itself_are_left_alone(self):
+        write(os.path.join(self.t, "number-cleanup"), "no", 0o644)
+        self.space_stubs([10 ** 9])
+        status, out, _ = self.run_fixes(("space", [str(2 * 10 ** 9), str(2 * 10 ** 9)]))
+        self.assertEqual(status, fixes.NOT_ENOUGH, out)
+        self.assertIn("NUMBER_CLEANUP не yes", out)
+        self.assertNotIn("[y/N]", out)
+        self.assertNotIn("cleanup number", read(os.path.join(self.t, "calls")))
+
+    def test_room_for_the_fixes_is_enough_for_them_to_go_on(self):
+        """The Chromebook: not 2 GB free after all, but 1 GB: depmod and mkinitcpio need far less, they run."""
+        self.space_stubs([10 ** 9])
+        write(os.path.join(self.t, "number-cleanup"), "no", 0o644)
+        self.stub("mountpoint", 'test -e "$T/mounted"\n')
+        self.stub("mount", ': >"$T/mounted"\n')
+        status, out, results = self.run_fixes(("space", [str(2 * 10 ** 9), str(512 * 2 ** 20)]), ("mount", ["/boot"]))
         self.assertEqual(status, fixes.OK, out)
-        self.assertIn("set-config NUMBER_LIMIT=10 NUMBER_LIMIT_IMPORTANT=5", read(os.path.join(self.t, "calls")))
+        self.assertEqual(results, [("space", "partial"), ("mount", "ok")])
+        self.assertIn("для исправлений хватает, для обновления нужно около", out)
+        # below even that: the fixes after it do not run (they would fail for want of room)
+        os.remove(os.path.join(self.t, "mounted"))
+        os.remove(os.path.join(self.t, "df-n"))
+        self.space_stubs([100 * 2 ** 20])
+        status, out, results = self.run_fixes(("space", [str(2 * 10 ** 9), str(512 * 2 ** 20)]), ("mount", ["/boot"]))
+        self.assertEqual((status, results), (fixes.NOT_ENOUGH, [("space", "notenough"), ("mount", "skipped")]))
 
     # ── the driver ──
 
@@ -340,11 +425,28 @@ esac
         status, out, results = self.run_fixes(("nosuchfix", []))
         self.assertEqual((status, results), (fixes.NO_BACKUP, [("nosuchfix", "unknown")]))
         self.stub("pgrep", "echo 123\n")
+        # a pacman somewhere (a container's own) without this machine's lock is not this machine's pacman
+        status, out, results = self.run_fixes(("initramfs", ["p:linux", self.image_spec()]))
+        self.assertEqual(status, fixes.OK, out)
+        write(self.lock, "", 0o644)
         before = digest(self.image)
         status, out, results = self.run_fixes(("initramfs", ["p:linux", self.image_spec()]))
         self.assertEqual((status, results), (fixes.REFUSED, [("initramfs", "refused")]))
         self.assertIn("работает pacman", out)
         self.assertEqual(digest(self.image), before)
+
+    def test_the_result_file_is_written_only_when_it_is_the_users_own_plain_file(self):
+        target = os.path.join(self.t, "somebody-elses")
+        write(target, "", 0o644)
+        os.symlink(target, self.result + ".link")
+        argv = self.argv(("nosuchfix", []))
+        argv[argv.index(self.result)] = self.result + ".link"
+        subprocess.run(argv, capture_output=True, env=self.env, timeout=30)
+        self.assertEqual(read(target), "")                    # a link put in its place: nothing written through it
+        write(self.result, "", 0o600)
+        subprocess.run(self.argv(("nosuchfix", [])), capture_output=True, env=dict(self.env, SUDO_UID="12345"),
+                       timeout=30)
+        self.assertEqual(read(self.result), "")               # not owned by the user who ran sudo
 
     def test_the_runner_passes_shellcheck(self):
         if not shutil.which("shellcheck"):
@@ -374,6 +476,7 @@ class Plans(unittest.TestCase):
         self.patch(engine, "installed_versions", lambda: {"linux": "7.2.14.arch1-1"})
         self.patch(engine, "cached_package", lambda p, v: None)
         self.patch(engine, "run", lambda cmd, **k: "")
+        self.patch(fixes.space, "free", lambda path="/": 50 * 2 ** 30)       # room enough, unless a test says not
 
     def tearDown(self):
         for (obj, name), value in self.saved.items():
@@ -392,9 +495,11 @@ class Plans(unittest.TestCase):
         res = {"problems": [engine.DISK_FULL],
                "boot": [{"kind": "depmod", "kvers": [KVER], "text": "depmod"},
                         {"kind": "initcpio", "text": "в initramfs не попал ни один модуль"}]}
+        self.patch(fixes.space, "free", lambda path="/": 300 * 2 ** 20)      # its disk, nearly full
         plan = fixes.plan(res)
         self.assertEqual([f["key"] for f in plan], ["space", "depmod", "initramfs"])
-        self.assertEqual(plan[0]["args"], [str(fixes.space.AFTER_FULL)])
+        # 2 GiB wanted for the update, but the boot fixes go on from 512 MiB
+        self.assertEqual(plan[0]["args"], [str(fixes.space.AFTER_FULL), str(fixes.space.LOW)])
         self.assertEqual(plan[1]["args"][-1], KVER)
         self.assertEqual(plan[2]["args"], ["p:linux", f"i:{KVER}:1:/boot/initramfs-linux.img"])
         argv = fixes.command(plan, "/home/u/.local/state/arch-update-auto/fix-result-x")
@@ -403,8 +508,18 @@ class Plans(unittest.TestCase):
         self.assertEqual(argv.count("--"), 3)
 
     def test_before_the_update_the_disk_was_too_small(self):
+        self.patch(fixes.space, "free", lambda path="/": 10 ** 9)
         plan = fixes.plan({"space": {"need": 3 * 10 ** 9, "free": 10 ** 9}})
-        self.assertEqual([(f["key"], f["args"]) for f in plan], [("space", [str(3 * 10 ** 9)])])
+        self.assertEqual([(f["key"], f["args"]) for f in plan], [("space", [str(3 * 10 ** 9)] * 2)])
+        # room was made meanwhile (by hand): nothing to free, F is not offered
+        self.patch(fixes.space, "free", lambda path="/": 4 * 10 ** 9)
+        self.assertEqual(fixes.plan({"space": {"need": 3 * 10 ** 9, "free": 10 ** 9}}), [])
+        self.assertEqual(self.keys({"problems": [engine.DISK_FULL]}), [])     # it ran full elsewhere
+        # a nearly full disk under other fixes: room for them first (1 GiB wanted, 512 MiB enough to go on)
+        self.patch(fixes.space, "free", lambda path="/": 300 * 2 ** 20)
+        plan = fixes.plan({"boot": [{"kind": "unmounted", "target": "/boot", "text": "t"}]})
+        self.assertEqual([(f["key"], f["args"]) for f in plan],
+                         [("space", [str(2 ** 30), str(fixes.space.LOW)]), ("mount", ["/boot"])])
 
     def test_nothing_for_a_clean_result_or_odd_input(self):
         self.assertEqual(fixes.plan({}), [])
@@ -450,6 +565,18 @@ class Plans(unittest.TestCase):
         self.assertEqual(fixes.outcome(81, [("initramfs", "rollbackfailed")], plan)[0], "rollbackfailed")
         self.assertEqual(fixes.outcome(1, [], plan)[0], "nothing")
         self.assertEqual(fixes.outcome(84, [("space", "notenough")])[0], "notenough")
+        # no file for the results (a full /home): the exit status tells
+        self.assertEqual(fixes.outcome(0, None, plan)[0], "ok")
+        self.assertEqual(fixes.outcome(80, None, plan)[0], "rolledback")
+        self.assertEqual(fixes.outcome(1, None, plan)[0], "nothing")
+        # room for the fixes, not yet for the update; one done, the next could not even begin
+        two = [fixes.fix("space", "освободить место", ["sudo", "pacman", "-Sc"], ["1", "1"])] + plan
+        self.assertEqual(fixes.outcome(0, [("space", "partial"), ("initramfs", "ok")], two),
+                         ("ok", "исправлено и проверено; для обновления места ещё мало"))
+        kind, text = fixes.outcome(82, [("space", "ok"), ("initramfs", "nobackup")], two)
+        self.assertEqual(kind, "stopped")
+        self.assertIn("сделано: освободить место", text)
+        self.assertEqual(fixes.outcome(fixes.SUDO_REFUSED, [], plan)[0], "nothing")
         self.assertIn("собрать initramfs заново: не помогло", fixes.journal_text(80, [("initramfs", "rolledback")], plan))
 
 

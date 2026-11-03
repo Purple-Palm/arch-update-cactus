@@ -17,8 +17,8 @@ A fix module has:
   KEY      its name: in the runner (the bash functions <KEY>_backup, <KEY>_apply, <KEY>_verify and, when putting
            the kept files back is not the way to undo it, <KEY>_rollback), in the result file and in the journal
   SCRIPT   those bash functions; they may use the helpers of RUNNER (step, good, warn, bad, keep, room_for,
-           put_back, image_ok, nonempty, free_bytes, size) and set failed_as to end without a rollback (nothing
-           to undo, e.g. "notenough")
+           put_back, image_ok, nonempty, free_bytes, size, drain) and set failed_as to end without a rollback
+           (nothing to undo, e.g. "notenough"), or done_as for a success of another kind ("partial")
   plan(ctx) what it would do about the result in ctx: a list of fix() dicts, [] when it does not apply
 The order of CATALOGUE is the order they run in: the space first (the others need it), then what the next one
 builds on (the module lists before the initramfs that holds the modules, the initramfs before its signature).
@@ -37,6 +37,7 @@ import engine
 
 RESULT_STATES = {
     "ok": "исправлено и проверено",
+    "partial": "места хватило для исправлений, но для обновления его ещё мало",
     "rolledback": "не помогло — вернул всё как было",
     "rollbackfailed": "не помогло, и вернуть как было удалось не всё",
     "nobackup": "не смог сохранить копии — ничего не менял",
@@ -47,6 +48,7 @@ RESULT_STATES = {
 }
 # The runner's exit status: 0 every fix done and checked. The first one that was not ends the run with
 OK, ROLLED_BACK, ROLLBACK_FAILED, NO_BACKUP, REFUSED, NOT_ENOUGH = 0, 80, 81, 82, 83, 84
+SUDO_REFUSED = 125          # engine.ASK_SUDO_FIRST: the password was refused or the question cancelled
 NAME = re.compile(r"[\w.+@-]+")          # a package or a DKMS module
 KVER = re.compile(r"[\w.+~-]+")          # a kernel version
 BOOT_TARGETS = ("/boot", "/efi", "/boot/efi")
@@ -130,6 +132,7 @@ def plan(res):
         except Exception:
             if getattr(engine, "LOG", None):
                 engine.LOG.event("ОШИБКА", f"fixes.{mod.KEY}: {traceback.format_exc()}")
+    space.finish(ctx)
     return ctx.planned
 
 
@@ -151,7 +154,8 @@ def command(fixes, result=None):
     fixes = known(fixes)
     if not fixes:
         return []
-    argv = [engine.elevation_command(), "bash", "-c", runner(), "arch-update-fix", result or "/dev/null"]
+    argv = [engine.elevation_command(), "bash", "-c", runner(), "arch-update-fix", result or "/dev/null",
+            engine.PACMAN_LOCK]
     for f in fixes:
         argv += [f["key"], *f["args"], "--"]
     return argv
@@ -191,14 +195,26 @@ def labels(fixes):
     return {f["key"]: f["label"] for f in known(fixes)}
 
 
+BY_STATUS = {OK: "ok", ROLLED_BACK: "rolledback", ROLLBACK_FAILED: "rollbackfailed", NO_BACKUP: "nobackup",
+             REFUSED: "refused", NOT_ENOUGH: "notenough"}
+
+
 def outcome(status, results, fixes=()):
-    """(kind, text) of a run: kind "ok", "notenough", "rolledback", "rollbackfailed", "nothing" (nothing was
-    changed: no copies, refused, sudo said no) or "error"; text says it in a line."""
+    """(kind, text) of a run: kind "ok" (every fix done and checked; "partial" among them: room enough for the fixes,
+    not yet for the update), "notenough", "rolledback", "rollbackfailed", "stopped" (some done, then one could not
+    even begin), "nothing" (nothing was changed: no copies, refused, sudo said no) or "error"; text says it in a
+    line. results None: there was no file for them (a full /home), the exit status alone tells."""
     names = labels(fixes)
+    if results is None:                         # no result file: as the runner's exit status says
+        state = BY_STATUS.get(status)
+        results = [(f["key"], state) for f in known(fixes)][:1 if state != "ok" else None] if state else []
     states = dict(results)
-    if status == OK and results and all(s == "ok" for _, s in results):
+    done = [k for k, s in results if s in ("ok", "partial")]
+    if status == OK and results and all(s in ("ok", "partial") for _, s in results):
+        if "partial" in states.values():
+            return "ok", "исправлено и проверено; для обновления места ещё мало"
         return "ok", "исправлено и проверено"
-    first = next(((k, s) for k, s in results if s not in ("ok", "skipped")), None)
+    first = next(((k, s) for k, s in results if s not in ("ok", "partial", "skipped")), None)
     name = names.get(first[0], first[0]) if first else ""
     if status == ROLLBACK_FAILED or "rollbackfailed" in states.values():
         return "rollbackfailed", f"«{name}» не помогло, и вернуть как было удалось не всё — копии в /tmp, " \
@@ -208,9 +224,14 @@ def outcome(status, results, fixes=()):
     if status == ROLLED_BACK or "rolledback" in states.values():
         return "rolledback", f"«{name}» не помогло — вернул всё как было"
     if status in (NO_BACKUP, REFUSED) or (first and first[1] in ("nobackup", "refused", "unknown")):
-        return "nothing", f"«{name}»: {RESULT_STATES[first[1]]}" if first else "ничего не менял"
+        what = f"«{name}»: {RESULT_STATES[first[1]]}" if first else "ничего не менял"
+        if done:                                # the ones before it did their part
+            return "stopped", f"сделано: {', '.join(names.get(k, k) for k in done)}; дальше {what}"
+        return "nothing", what
     if status is None:
         return "nothing", "не запустилось"
+    if status == SUDO_REFUSED:
+        return "nothing", "пароль sudo не принят — ничего не менял"
     if not results:
         return "nothing", f"не начал (код {status}: пароль не принят или отменён?)"
     return "error", f"закончилось с ошибкой (код {status})"
@@ -230,8 +251,17 @@ RUNNER_HEAD = r"""
 set -u
 umask 077
 export LANGUAGE=en LC_MESSAGES=C.UTF-8 LC_NUMERIC=C.UTF-8
-result=${1:-/dev/null}
-shift
+result=${1:-/dev/null} lock=${2:-/var/lib/pacman/db.lck}
+shift 2
+# What came of each fix goes into the user's own result file: only a plain file of theirs (never through a link
+# somebody put there), opened once.
+if [ "$result" != /dev/null ]; then
+    if [ -L "$result" ] || [ ! -f "$result" ] \
+            || { [ -n "${SUDO_UID:-}" ] && [ "$(stat -c %u -- "$result" 2>/dev/null)" != "$SUDO_UID" ]; }; then
+        result=/dev/null
+    fi
+fi
+exec 3>>"$result" || exec 3>/dev/null
 keep_work=0
 work=$(mktemp -d /tmp/arch-update-fix.XXXXXXXX 2>/dev/null) || work=
 trap 'if [ -n "$work" ] && [ "$keep_work" != 1 ]; then rm -rf -- "$work"; fi' EXIT
@@ -242,7 +272,7 @@ step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 good() { printf '\033[32m  ✓ %s\033[0m\n' "$*"; }
 warn() { printf '\033[33m  ! %s\033[0m\n' "$*"; }
 bad() { printf '\033[31m  ✗ %s\033[0m\n' "$*"; }
-note() { printf '%s\n' "$*" >>"$result" 2>/dev/null || true; }
+note() { printf '%s\n' "$*" >&3 2>/dev/null || true; }
 free_bytes() { df --output=avail -B1 -- "$1" 2>/dev/null | tail -n 1 | tr -dc 0-9; }
 size() {
     awk -v b="${1:-0}" 'BEGIN { if (b < 0) b = -b
@@ -250,6 +280,11 @@ size() {
 }
 nonempty() {
     if [ -s "$1" ]; then good "$1 на месте"; else bad "$1 нет или он пустой"; return 1; fi
+}
+# drain: keys pressed before a question are no answer to it
+drain() {
+    local _
+    while read -r -s -t 0.2 -n 1 _ 2>/dev/null; do :; done
 }
 
 # room_for <file>…: room in /tmp for copies of them, with some to spare
@@ -306,11 +341,14 @@ put_back() {
                 continue
             fi
         else
-            rm -f -- "$f.arch-update-new" "$f"
+            rm -f -- "$f.arch-update-new" "$f"     # no room beside it: the one the fix left goes first
             if ! cp -- "$work/$i" "$f" 2>/dev/null; then
+                rm -f -- "$f"                       # half a copy is worse than none (the copy stays in $work)
                 failed+=("$f")
                 continue
             fi
+            chmod --reference="$work/$i" -- "$f" 2>/dev/null
+            touch --reference="$work/$i" -- "$f" 2>/dev/null
         fi
         if [ "$(sha256sum <"$f")" != "$(cat "$work/$i.sum")" ]; then failed+=("$f"); fi
     done
@@ -354,13 +392,13 @@ run_fix() {
     local key=$1
     shift
     kept=()
-    failed_as=
+    failed_as='' done_as=''
     if ! declare -F "${key}_apply" >/dev/null; then
         bad "исправления «$key» в этой версии нет"
         note "$key unknown"
         return 82
     fi
-    if pgrep -x pacman >/dev/null 2>&1; then
+    if [ -e "$lock" ] && pgrep -x pacman >/dev/null 2>&1; then
         bad "сейчас работает pacman — дождись, пока он закончит, и попробуй снова"
         note "$key refused"
         return 83
@@ -377,7 +415,7 @@ run_fix() {
     fi
     if "${key}_apply" "$@" && "${key}_verify" "$@"; then
         good "готово, проверено"
-        note "$key ok"
+        note "$key ${done_as:-ok}"
         clear_kept
         return 0
     fi

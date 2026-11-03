@@ -42,8 +42,9 @@ kernel_files() {
     local a
     for a; do
         case $a in
-            k:*|u:*) printf '%s\n' "${a#?:}" ;;
-            i:*) printf '%s\n' "${a#i:*:*:}" ;;
+            k:*) printf '%s\n' "${a#k:}" ;;
+            u:*) printf '%s\n%s\n' "${a#u:}" "${a#u:}.tmp" ;;          # and mkinitcpio's leftover, see initramfs
+            i:*) printf '%s\n%s\n' "${a#i:*:*:}" "${a#i:*:*:}.tmp" ;;
         esac
     done
 }

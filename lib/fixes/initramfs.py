@@ -5,7 +5,7 @@ them lacks modules).
 
 mkinitcpio -p <preset> for every installed kernel with a preset (only those: a preset of a kernel no longer
 installed would fail mkinitcpio -P for nothing). Kept first: every image and UKI of those presets (in /tmp, room
-checked first). Verified: mkinitcpio ended well and said nothing of errors, and every image is there, built for its
+checked first), and the "<image>.tmp" mkinitcpio may leave behind (kept as missing: it goes on a rollback). Verified: mkinitcpio ended well and said nothing of errors, and every image is there, built for its
 kernel and with that kernel's module list in it (lsinitcpio); every UKI is there. Otherwise all of them back as
 they were, each checked against its copy."""
 
@@ -35,12 +35,16 @@ SCRIPT = r"""
 # initramfs p:<preset>… i:<image spec>… u:<unified kernel image>…
 INITCPIO_TROUBLE='errors were encountered during the build|No modules were added to the image|image generation FAILED|No space left on device'
 initramfs_backup() {
-    local a files=()
+    local a f files=()
     for a; do
         case $a in
-            i:*) files+=("${a#i:*:*:}") ;;
-            u:*) files+=("${a#u:}") ;;
+            i:*) f=${a#i:*:*:} ;;
+            u:*) f=${a#u:} ;;
+            *) continue ;;
         esac
+        # and mkinitcpio's "<image>.tmp", which it writes first when there is room and leaves behind when the
+        # build fails: kept as missing, so putting back removes it (a full /boot is what made the build fail)
+        files+=("$f" "$f.tmp")
     done
     room_for "${files[@]}" && keep "${files[@]}"
 }
