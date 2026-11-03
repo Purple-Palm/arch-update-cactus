@@ -25,7 +25,7 @@ const MAX_LOG = 1024 * 1024; // bytes of the log in it
 const MAX_DEVICE = 32 * 1024; // characters of the device object as JSON
 const LISTS = { // update.<list>: [most items, longest item]
   changed: [5000, 256], added: [5000, 256], removed: [5000, 256],
-  problems: [200, 4000], warnings: [200, 4000], ok: [200, 4000],
+  problems: [200, 4000], warnings: [200, 4000], ok: [200, 4000], notes: [200, 4000],
 };
 const BODY_MAX = 65000; // characters of an issue body (GitHub takes 65,536)
 const TAIL = 200; // lines of the log shown in the issue
@@ -579,12 +579,13 @@ function updateRows(u) {
   ];
 }
 
-// Problems, warnings and what is fine, one a line, as the summary screen shows them.
+// Problems, warnings, what is fine and the notes (what needs nothing now; they never change the verdict), one a
+// line, as the summary screen shows them.
 function findings(u) {
   const lines = [];
   let size = 0;
   let more = 0;
-  for (const [mark, list] of [['✗', u.problems], ['⚠', u.warnings], ['✓', u.ok]]) {
+  for (const [mark, list] of [['✗', u.problems], ['⚠', u.warnings], ['✓', u.ok], ['·', u.notes]]) {
     for (const item of list) {
       const line = `${mark} ${cut(clean(item).replace(/\s+/g, ' ').trim(), 500)}`;
       if (size + line.length > 12000) {

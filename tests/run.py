@@ -23,6 +23,10 @@ demo does not do that, and nothing of it changes.
 One run (80x24) without --demo starts with such a summary of its own and a stand-in update that leaves
 a service waiting: F under the menu's warning and R on the summary go to the plain terminal (where
 the stand-in sudo only says what it would run) and back with Enter, and what came of them is kept.
+One run (80x24) without --demo has a stand-in for the server for the reports that answers after two seconds
+(never the real server): S under the menu's warning, then the summary opened from the menu before the answer came
+(it says how the report fared, no toast left over); then an update, S on its summary and Enter at once (the program
+waits for the answer, says it, then closes). Both reports are recorded with their issues; nothing is switched on.
 One run (80x24) takes "Обычный Arch-Update" and types a password ahead while the update gets ready
 (a stand-in pacman makes that take two seconds): it must reach neither the screen nor the journal.
 The output is rendered with pyte; the test fails on a UI exception, a screen that never shows
@@ -34,6 +38,7 @@ up, or a bad exit. A text snapshot of every stage is written to tests/out/<cols>
 Needs python-pexpect and python-pyte (pip: pexpect pyte).
 """
 import glob
+import http.server
 import json
 import os
 import shutil
@@ -115,9 +120,35 @@ def boot_id():
         return f.read().strip()
 
 
+class StandInRelay:
+    """A stand-in for the server for the reports, on this machine (never the real one): every report gets 201 and the
+    next issue's number, from 7 on, after a pause long enough for the program to be left meanwhile."""
+
+    def __init__(self, delay=2.0):
+        self.got, self.delay = [], delay
+        relay = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                relay.got.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+                time.sleep(relay.delay)
+                answer = json.dumps({"ok": True, "issue": 6 + len(relay.got)}).encode()
+                self.send_response(201)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(answer)))
+                self.end_headers()
+                self.wfile.write(answer)
+
+            def log_message(self, *args):
+                pass
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_port}/report"
+
+
 class Run:
     def __init__(self, cols, rows, name=None, reports_on=False, slow_pacman=False, demo=True, seed=None,
-                 update=NO_UPDATE):
+                 update=NO_UPDATE, relay=None):
         self.cols, self.rows = cols, rows
         self.reports_on = reports_on
         self.name = name or f"{cols}x{rows}"
@@ -148,8 +179,9 @@ class Run:
             for k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
                 env[k] = proxy
             env["no_proxy"] = env["NO_PROXY"] = "127.0.0.1,localhost"
-            env["ARCH_UPDATE_REPORT_URL"] = f"http://127.0.0.1:{closed_port()}/report"
+            env["ARCH_UPDATE_REPORT_URL"] = relay.url if relay else f"http://127.0.0.1:{closed_port()}/report"
             env["ARCH_UPDATE_AUTO_NOTIFY"] = "0"
+        self.relay = relay
         if stubs:
             stub = os.path.join(self.home, "stub")
             os.makedirs(stub)
@@ -325,6 +357,15 @@ class Run:
         if "S — отправить отчёт" not in self.text():
             self.snapshot("summary-keys-FAILED")
             self.failures.append("итог: нет клавиши «S — отправить отчёт»")
+        if "закроется через" in self.text():
+            # «любая клавиша — оставить»: S as that key only stops the countdown, and sends nothing
+            self.send("s")
+            if not self.gone("summary-kept", "закроется через", timeout=5):
+                return
+            time.sleep(0.5)
+            if DEMO_SAYS in self.text():
+                self.snapshot("summary-kept-FAILED")
+                self.failures.append("итог: S, что остановила отсчёт, ещё и сработала")
         self.send("s")
         self.wait("summary-demo-key", DEMO_SAYS, timeout=5)
         self.send(ENTER)
@@ -429,7 +470,7 @@ class Run:
             self.failures.append(f"настройки: выключены, а ID машины ({rid}) не показан")
         # Restarting the services by itself: on with a fresh press, explained, saved; off again.
         self.send(DOWN, DOWN)
-        if not self.wait("settings-services", "▸ Перезапускать сервисы сами", timeout=5):
+        if not self.wait("settings-services", "▸ Перезапускать сервисы автоматически", timeout=5):
             return
         if "dbus" not in self.text() or "клавиша R" not in self.text():
             self.failures.append("настройки: нет объяснения, что перезапускается и что делает R")
@@ -439,7 +480,7 @@ class Run:
             if not self.wait(f"settings-services-{'on' if on else 'off'}",
                              "перезапускаться сами" if on else "только по клавише R", timeout=5):
                 return
-            if self.switch("Перезапускать сервисы сами") != ("ВКЛ" if on else "ВЫКЛ") or \
+            if self.switch("Перезапускать сервисы автоматически") != ("ВКЛ" if on else "ВЫКЛ") or \
                     self.setting("restart_services") is not on:
                 self.failures.append(f"настройки: перезапуск сервисов не {'включился' if on else 'выключился'}"
                                      f" (settings.json: {self.setting('restart_services')!r})")
@@ -573,7 +614,8 @@ class Run:
         if not self.gone("menu-news", "загружаю новости"):
             return
         screen = self.text()
-        if "НЕ перезагружайся" not in screen or "F — исправить" not in screen or "S — отправить отчёт" not in screen:
+        if "НЕ перезагружайся" not in screen or "F — собрать initramfs заново" not in screen or \
+                "S — отправить отчёт" not in screen:
             self.snapshot("menu-banner-FAILED")
             self.failures.append("меню: нет предупреждения о последнем обновлении с клавишами F и S")
         for key in ("f", "ы"):                      # F, and S on the Russian layout
@@ -601,6 +643,64 @@ class Run:
             return
         self.send("q")
         self.after.append(self.bad_untouched)
+
+    def sends(self):
+        """Without --demo, with the stand-in for the server for the reports: S under the menu's warning and the summary
+        opened before the answer came; then an update's summary, S and Enter at once."""
+        if not self.wait("menu", "/boot/initramfs-linux.img", timeout=40):
+            return
+        if not self.gone("menu-news", "загружаю новости"):
+            return
+        self.send("s")
+        if not self.wait("menu-sending", "отправляю отчёт", timeout=5):
+            return
+        self.send(DOWN, DOWN)
+        if not self.wait("menu-last", "▸ Последнее обновление", timeout=5):
+            return
+        self.send(ENTER)
+        if not self.wait("summary-sending", "Нужна проверка", timeout=10):
+            return
+        if not self.wait("summary-sent", "отчёт отправлен разработчику (№ 7)", timeout=30):
+            return
+        time.sleep(0.5)
+        if "отправляю отчёт" in self.text():
+            self.snapshot("summary-sent-FAILED")
+            self.failures.append("итог из меню: «отправляю отчёт…» осталось после ответа сервера")
+        time.sleep(1.2)                             # the summary ignores keys for its first second
+        self.send(ENTER)
+        if not self.wait("menu-again", "▸ Последнее обновление", timeout=10):
+            return
+        if "S — " in self.text():                  # it went out: not offered again here
+            self.failures.append("меню: «S — отправить отчёт» предлагается и после того, как отчёт ушёл")
+        self.send(UP, UP)
+        if not self.wait("menu-auto", "▸ Обновить автоматически", timeout=5):
+            return
+        self.send(ENTER)
+        if not self.wait("dashboard", "мини-игры", timeout=20):
+            return
+        if not self.wait("summary", "S — отправить отчёт", timeout=90):
+            return
+        time.sleep(1.2)
+        self.send("s", ENTER)                       # and leave at once: the answer is waited for
+        if not self.wait("summary-waits", "дожидаюсь ответа сервера", timeout=5):
+            return
+        if self.wait("summary-answer", "отчёт отправлен разработчику (№ 8)", timeout=30):
+            self.after.append(self.sends_kept)
+
+    def sends_kept(self):
+        try:
+            with open(os.path.join(self.state, "reports", "manual.json"), encoding="utf-8") as f:
+                records = json.load(f)
+        except (OSError, ValueError) as e:
+            records = e
+        issues = sorted(r.get("issue") for r in records.values()) if isinstance(records, dict) else records
+        if issues != [7, 8]:
+            self.failures.append(f"отправленные вручную отчёты не записаны: {records!r}")
+        if len(self.relay.got) != 2:
+            self.failures.append(f"серверу пришло отчётов: {len(self.relay.got)}, а не 2")
+        if self.setting("reports") is True or not self.setting("report_id"):
+            self.failures.append(f"settings.json после отправки вручную: reports={self.setting('reports')!r}, "
+                                 f"report_id={self.setting('report_id')!r}")
 
     def keys(self):
         """Without --demo, with the stand-ins: F under the menu's warning and R on the summary of an update go to
@@ -755,6 +855,9 @@ def main():
                                         kwargs={"slow_pacman": True}))
         threads.append(threading.Thread(target=run, args=((80, 24), results, "80x24-keys", Run.keys),
                                         kwargs={"demo": False, "update": ONE_UPDATE,
+                                                "seed": lambda r: r.seed_bad("logs")}))
+        threads.append(threading.Thread(target=run, args=((80, 24), results, "80x24-sends", Run.sends),
+                                        kwargs={"demo": False, "update": ONE_UPDATE, "relay": StandInRelay(),
                                                 "seed": lambda r: r.seed_bad("logs")}))
         for cols, rows in ((80, 24), (200, 60)):
             threads.append(threading.Thread(target=run, args=((cols, rows), results, f"{cols}x{rows}-settings",

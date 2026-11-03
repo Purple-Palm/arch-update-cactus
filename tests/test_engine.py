@@ -13,8 +13,10 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
+import time
 import types
 import unittest
 
@@ -208,6 +210,14 @@ class Services(Patching):
         rec = engine.services_record(r, failed_now=["sshd.service"])
         self.assertEqual((rec["restarted"], rec["failed"]), (["cups.service"], ["sshd.service"]))
 
+    def test_the_way_to_the_network_and_package_daemons_keep_running(self):
+        for unit in ("wpa_supplicant-nl80211@wlan0.service", "wpa_supplicant-wired@eth0.service",
+                     "netctl-ifplugd@eth0.service", "systemd-resolved.service", "mullvad-daemon.service",
+                     "nordvpnd.service", "warp-svc.service", "netbird.service", "virtlogd.service",
+                     "virtlockd.service", "packagekit.service", "pamac-daemon.service"):
+            self.assertTrue(engine.keeps_running(unit, "", ""), unit)
+        self.assertFalse(engine.keeps_running("systemd-journald.service", "", ""))
+
     def test_the_restart_command_never_takes_an_unsafe_service(self):
         self.patch(engine, "display_manager", lambda: "sddm.service")
         self.patch(engine, "own_service", lambda: "")
@@ -239,6 +249,7 @@ class Machine(Patching):
         self.dm = "display-manager.service"
         self.owners = {}
         self.after = {}                 # pacman -Q after the update
+        self.newer = {}                 # pacman -Qu: what the repository has newer
         self.runs = 0
         real_run = engine.run
 
@@ -249,6 +260,8 @@ class Machine(Patching):
                 return "".join(f"{f} is owned by {self.owners[f]} 1.0-1\n" for f in cmd[2:] if f in self.owners)
             if cmd[:2] == ["pacman", "-Qtdq"]:
                 return "".join(f"{p}\n" for p in self.orphans)
+            if cmd[:2] == ["pacman", "-Qu"]:
+                return "".join(f"{p} {self.after.get(p, '1')} -> {self.newer[p]}\n" for p in cmd[2:] if p in self.newer)
             if cmd[:4] == ["sudo", "-n", "bash", "-c"] and cmd[5:6] == ["probe"]:
                 self.probed.append(cmd[6:])
                 return self.probe
@@ -267,11 +280,14 @@ class Machine(Patching):
         self.patch(engine, "installed_versions", lambda: dict(self.after))
         self.patch(engine, "running_kernel", lambda: KVER)
         self.patch(engine, "is_chromebook", lambda: False)
-        # lsinitcpio for the images the user may read: the kernel version written next to the image
+        self.patch(engine, "PACMAN_CACHE", os.path.join(self.tmp, "pkg"))
+        # lsinitcpio for the images the user may read: the kernel version written next to the image; as mkinitcpio
+        # builds them, its folder always, its module list only when there are modules in it (not with .nomods)
         stub = os.path.join(self.tmp, "bin")
         os.makedirs(stub)
         write(os.path.join(stub, "lsinitcpio"), '#!/bin/bash\n[ -s "$1" ] || exit 1\nk=$(cat "$1.kver") || exit 1\n'
-                                                'echo "usr/lib/modules/$k/modules.dep"\n')
+                                                'echo "usr/lib/modules/$k/kernel"\n'
+                                                '[ -e "$1.nomods" ] || echo "usr/lib/modules/$k/modules.dep.bin"\n')
         self.env(PATH=stub + os.pathsep + os.environ["PATH"])
         self.pacman_log("")
         engine.LOG = engine.RunLog()
@@ -292,18 +308,23 @@ class Machine(Patching):
         os.replace(engine.LOG.path[:-4] + ".raw", path[:-4] + ".raw")
         engine.LOG.path = path
 
-    def kernel(self, pkg, kver, preset=None, owned=True):
+    def kernel(self, pkg, kver, preset=None, owned=True, index=True):
+        """A kernel as its package and pacman's depmod hook leave it: its modules listed (modules.order) and, unless
+        depmod failed (index=False), their module list (modules.dep.bin)."""
         d = os.path.join(engine.MODULES_DIR, kver)
         os.makedirs(d)
         open(os.path.join(d, "modules.builtin"), "w").close()
+        write(os.path.join(d, "modules.order"), "kernel/drivers/nvme/host/nvme.ko\n", 0o644)
+        if index:
+            write(os.path.join(d, "modules.dep.bin"), "index", 0o644)
         if owned:
             self.owners[os.path.join(d, "modules.builtin")] = pkg
         if preset is not None:
             with open(os.path.join(engine.PRESET_DIR, pkg + ".preset"), "w") as f:
                 f.write(preset)
 
-    def linux(self, kernel, image):
-        self.kernel("linux", KVER, f'ALL_kver="{kernel}"\nPRESETS=(default)\ndefault_image="{image}"\n')
+    def linux(self, kernel, image, **kw):
+        self.kernel("linux", KVER, f'ALL_kver="{kernel}"\nPRESETS=(default)\ndefault_image="{image}"\n', **kw)
 
     def supply(self, name, **files):
         d = os.path.join(engine.POWER_DIR, name)
@@ -312,12 +333,14 @@ class Machine(Patching):
             with open(os.path.join(d, k), "w") as f:
                 f.write(f"{v}\n")
 
-    def boot_file(self, name, data=b"x" * 64, mode=0o644, kver=KVER):
+    def boot_file(self, name, data=b"x" * 64, mode=0o644, kver=KVER, modules=True):
         path = os.path.join(self.tmp, name)
         with open(path, "wb") as f:
             f.write(data)
         with open(path + ".kver", "w") as f:
             f.write(kver)
+        if not modules:                 # an image mkinitcpio put no module into
+            open(path + ".nomods", "w").close()
         os.chmod(path, mode)
         return path
 
@@ -334,13 +357,15 @@ class Machine(Patching):
         return paths
 
     @staticmethod
-    def probe_says(sizes=(), images=(), sbctl=None):
+    def probe_says(sizes=(), images=(), sbctl=None, without_modules=()):
         """What a probe as root prints: sizes [(path, bytes or None: no such file)], images [(path, status,
-        [kernel versions])], sbctl's output."""
+        [kernel versions])] (with their module lists, but for the images in without_modules), sbctl's output."""
         lines = ["sudo-ok"]
         for path, size in sizes:
             lines += [f"file {path}"] + ([f"size {size} {path}"] if size is not None else [])
-        lines += [f"image {rc} {','.join(kvers) or '-'} {path}" for path, rc, kvers in images]
+        for path, rc, kvers in images:
+            lines += [f"image {rc} {','.join(kvers) or '-'} {path}",
+                      f"indexed {'-' if path in without_modules else ','.join(kvers) or '-'} {path}"]
         if sbctl is not None:
             lines += ["sbctl"] + [f"sbctl {line}" for line in sbctl.splitlines()]
         return "\n".join(lines) + "\n"
@@ -458,6 +483,25 @@ class Machine(Patching):
         self.assertEqual(r["fixes"], [{"key": "kernel", "argv": ["sudo", "pacman", "-S", "linux"],
                                        "label": "переустановить ядро (linux): вернёт файл ядра и initramfs"}])
 
+    def test_the_kernel_comes_back_as_it_was_installed(self):
+        image = self.boot_file("initramfs-linux.img", mode=0o000)
+        self.linux(f"{self.tmp}/gone", image)
+        self.after = {"linux": "7.2.11.arch1-1"}
+        # pacman's cache has the installed version: that very file, whatever the repository has meanwhile
+        os.makedirs(engine.PACMAN_CACHE)
+        for name in ("linux-7.2.11.arch1-1-x86_64.pkg.tar.zst", "linux-7.2.11.arch1-1-x86_64.pkg.tar.zst.sig",
+                     "linux-7.2.10.arch1-1-x86_64.pkg.tar.zst", "linux-headers-7.2.11.arch1-1-x86_64.pkg.tar.zst"):
+            write(os.path.join(engine.PACMAN_CACHE, name), "", 0o644)
+        self.newer = {"linux": "7.2.12.arch1-1"}
+        r = self.checks(before=dict(self.after))
+        self.assertEqual(r["fixes"][0]["argv"], ["sudo", "pacman", "-U", os.path.join(
+            engine.PACMAN_CACHE, "linux-7.2.11.arch1-1-x86_64.pkg.tar.zst")])
+        # not in the cache: from the repository, unless that would update the kernel alone
+        shutil.rmtree(engine.PACMAN_CACHE)
+        self.assertEqual(self.checks(before=dict(self.after))["fixes"], [])
+        self.newer = {}
+        self.assertEqual(self.checks(before=dict(self.after))["fixes"][0]["argv"], ["sudo", "pacman", "-S", "linux"])
+
     def test_an_empty_image_is_rebuilt(self):
         self.linux(self.boot_file("vmlinuz-linux"), self.boot_file("initramfs-linux.img", data=b""))
         r = self.checks()
@@ -467,8 +511,118 @@ class Machine(Patching):
     def test_failed_mkinitcpio_in_the_output_is_rebuilt(self):
         self.linux(self.boot_file("vmlinuz-linux"), self.boot_file("initramfs-linux.img"))
         r = self.checks(failures={"Initcpio image generation FAILED"})
-        self.assertIn("в выводе: «Initcpio image generation FAILED»", r["problems"])
+        self.assertIn("mkinitcpio не собрал initramfs: «Initcpio image generation FAILED» — НЕ перезагружайся "
+                      "(сначала: sudo mkinitcpio -P)", r["problems"])
         self.assertEqual(self.fix_keys(r), ["initramfs"])
+        # what mkinitcpio says when it went on after errors and wrote the image all the same
+        for said in ("errors were encountered during the build", "No modules were added to the image"):
+            r = self.checks(failures={said})
+            self.assertEqual(r["verdict"], 2, said)
+            self.assertTrue(any(said in p and "НЕ перезагружайся" in p for p in r["problems"]), r["problems"])
+            self.assertEqual(self.fix_keys(r), ["initramfs"])
+
+    def test_the_chromebook_that_did_not_boot(self):
+        # 2026-11-02: the disk filled up during the update. depmod could not write the new kernel's module list,
+        # mkinitcpio then found no modules and wrote an initramfs without any; pacman only said "command failed".
+        # The look into the image (as root, after the update) saw the kernel's folder and called it fine. The
+        # next update, in the same boot, said "reboot when convenient"; the machine did not boot.
+        self.patch(engine, "running_kernel", lambda: "7.2.10-arch1-1")
+        image = self.boot_file("initramfs-linux.img", modules=False)
+        self.linux(self.boot_file("vmlinuz-linux"), image, index=False)
+        self.after = {"linux": "7.2.14.arch1-1"}
+        failures = {"No space left on device", "error: command failed to execute correctly", "depmod: FATAL",
+                    "No modules were added to the image", "errors were encountered during the build"}
+        self.new_run()
+        first = self.checks(before={"linux": "7.2.11.arch1-1"}, failures=failures, carry=True)
+        self.assertEqual(first["verdict"], 2)
+        self.assertIn(engine.DISK_FULL, first["problems"])
+        kinds = [i["kind"] for i in first["boot"]]
+        self.assertIn("depmod", kinds)
+        self.assertIn("initcpio", kinds)
+        self.assertTrue(any(i["kind"] == "image" and "нет модулей ядра" in i["text"] for i in first["boot"]))
+        self.assertEqual(kinds.count("depmod"), 1)          # the module list missing says what depmod failed on
+        self.assertEqual(self.fix_keys(first), ["depmod", "initramfs"])
+        self.assertEqual(first["fixes"][0]["argv"], ["sudo", "depmod", KVER])
+        self.assertFalse(any(o.startswith("ядро и initramfs") for o in first["ok"]), first["ok"])
+        self.assertFalse(any("перезагрузись" in n for n in first["notes"]), first["notes"])
+        self.assertTrue(any("только когда проблемы выше будут исправлены" in n for n in first["notes"]))
+        # opened again and updated again, in the same boot: nothing new to install, still red
+        self.new_run()
+        self.after = {"linux": "7.2.14.arch1-1"}
+        second = self.checks(before=dict(self.after), carry=True)
+        self.assertEqual(second["verdict"], 2)
+        self.assertFalse(any("перезагрузись" in n for n in second["notes"]), second["notes"])
+        self.assertEqual(engine.unresolved()["log"], second["log"])
+        # depmod and mkinitcpio -P went through (F): the next look finds nothing more
+        write(engine.module_index(KVER), "index", 0o644)
+        os.remove(image + ".nomods")
+        self.assertEqual(engine.recheck_boot(second["log"]), [])
+        self.assertTrue(engine.mark_resolved(second["log"]))
+        self.assertIsNone(engine.unresolved())
+
+    def test_a_root_only_image_without_modules_is_found_by_the_probe(self):
+        kernel, image = self.closed_boot("vmlinuz-linux", "initramfs-linux.img")
+        self.linux(kernel, image)
+        probe = self.probe_says(sizes=[(kernel, 64), (image, 64)], images=[(image, 0, [KVER])],
+                                without_modules=[image])
+        r = self.checks(probe=engine.parse_probe(probe))
+        self.assertTrue(any(f"в {image} нет модулей ядра" in p for p in r["problems"]), r["problems"])
+        self.assertEqual(self.fix_keys(r), ["initramfs"])
+        # a kernel without loadable modules boots without them: nothing to miss there
+        os.remove(os.path.join(engine.MODULES_DIR, KVER, "modules.order"))
+        self.assertEqual(self.checks(probe=engine.parse_probe(probe))["problems"], [])
+
+    def test_depmod_failing_on_lists_already_there_is_kept_until_they_are_written_again(self):
+        self.linux(self.boot_file("vmlinuz-linux"), self.boot_file("initramfs-linux.img"))
+        index = engine.module_index(KVER)
+        os.utime(index, (1, 1))                           # from before the update
+        self.new_run()
+        first = self.checks(failures={"depmod: FATAL"}, carry=True)
+        self.assertEqual(self.fix_keys(first), ["depmod", "initramfs"])
+        self.assertTrue(any("depmod: FATAL" in p for p in first["problems"]), first["problems"])
+        self.new_run()
+        second = self.checks(carry=True)
+        self.assertTrue(any(p.startswith("не исправлено после обновления") and "depmod" in p
+                            for p in second["problems"]), second["problems"])
+        os.utime(index)                                   # sudo depmod went through
+        self.new_run()
+        self.assertEqual(self.checks(carry=True)["problems"], [])
+
+    def test_a_full_disk_is_a_problem(self):
+        r = self.checks(failures={"No space left on device"})
+        self.assertEqual((r["verdict"], r["problems"]), (2, [engine.DISK_FULL]))
+        self.assertEqual(r["fixes"], [])
+
+    def test_a_summary_a_full_disk_did_not_let_be_written_still_warns(self):
+        self.linux(self.boot_file("vmlinuz-linux"), self.boot_file("initramfs-linux.img", data=b""))
+        self.new_run()
+
+        def full(path, data):
+            raise OSError(28, "No space left on device")
+        self.patch(engine, "write_json", full)
+        r = self.checks(failures={"No space left on device"})
+        self.assertFalse(os.path.exists(engine.summary_path(r["log"])))
+        bad = engine.unresolved()
+        self.assertEqual(bad["log"], r["log"])
+        self.assertIn(engine.DISK_FULL, bad["problems"])
+        self.assertTrue(any("пустой" in p for p in bad["problems"]), bad["problems"])
+
+    def test_after_a_fix_that_failed_nothing_found_before_is_dropped(self):
+        kernel, image = self.closed_boot("vmlinuz-linux", "initramfs-linux.img")
+        self.linux(kernel, image)
+        r = self.checks(failures={"errors were encountered during the build"})
+        self.assertEqual(self.fix_keys(r), ["initramfs"])
+        # mkinitcpio -P failed again (exit 1); the look right after it finds the image whole
+        out = os.path.join(self.tmp, "probe.out")
+        write(out, self.probe_says(sizes=[(kernel, 64), (image, 64)], images=[(image, 0, [KVER])]), 0o600)
+        left = engine.recheck_boot(r["log"], probe=out, failed=True)
+        self.assertTrue(any("errors were encountered" in p for p in left), left)
+        self.assertFalse(engine.mark_resolved(r["log"]))
+        self.assertEqual(engine.unresolved()["log"], r["log"])
+        self.assertEqual([f["key"] for f in self.summary(r)["fixes"]], ["initramfs"])
+        # it went through the second time
+        self.assertEqual(engine.recheck_boot(r["log"], probe=out), [])
+        self.assertTrue(engine.mark_resolved(r["log"]))
 
     def test_a_kernel_partition_to_flash_has_no_fix_here(self):
         r = self.checks(failures={"You can do this later by running: # dd if=/boot/vmlinux.kpart of=/dev/mmcblk0p1"})
@@ -512,15 +666,20 @@ class Machine(Patching):
 
     def test_a_closed_boot_rebuilt_by_mkinitcpio_is_judged_by_its_output(self):
         self.linux(*self.closed_boot("vmlinuz-linux", "initramfs-linux.img"))
-        self.pacman_log("[ALPM] running '90-mkinitcpio-install.hook'...\n"
-                        "[ALPM-SCRIPTLET] ==> Image generation successful\n")
-        r = self.checks()
-        self.assertEqual(r["problems"], [])
-        self.assertIn("initramfs собран заново (по выводу mkinitcpio)", r["ok"])
+        for said in ("==> Initcpio image generation successful", "==> Image generation successful"):   # v38 on, v37
+            self.pacman_log(f"[ALPM] running '90-mkinitcpio-install.hook'...\n[ALPM-SCRIPTLET] {said}\n")
+            r = self.checks()
+            self.assertEqual(r["problems"], [])
+            self.assertIn("initramfs собран заново (по выводу mkinitcpio)", r["ok"])
         self.pacman_log("[ALPM] running '90-mkinitcpio-install.hook'...\n")   # no word on the result
         r = self.checks()
         self.assertEqual(r["problems"], [])
         self.assertTrue(any("sudo ls -l /boot" in w for w in r["warnings"]), r["warnings"])
+        # one of two presets went wrong: not built whole
+        self.pacman_log("[ALPM-SCRIPTLET] ==> Initcpio image generation successful\n"
+                        "[ALPM-SCRIPTLET] ==> WARNING: errors were encountered during the build. The image may not "
+                        "be complete.\n")
+        self.assertNotIn("initramfs собран заново (по выводу mkinitcpio)", self.checks()["ok"])
 
     def test_a_closed_boot_is_looked_into_through_sudo_when_it_asks_nothing(self):
         kernel, image = self.closed_boot("vmlinuz-linux", "initramfs-linux.img")
@@ -790,7 +949,7 @@ class Machine(Patching):
         self.assertTrue(any("не исправлено" in p and "Initcpio" in p for p in second["problems"]))
         self.new_run()
         self.pacman_log("[ALPM] running '90-mkinitcpio-install.hook'...\n"
-                        "[ALPM-SCRIPTLET] ==> Image generation successful\n")
+                        "[ALPM-SCRIPTLET] ==> Initcpio image generation successful\n")
         third = self.checks(carry=True)
         self.assertEqual(third["problems"], [])
 
@@ -814,6 +973,58 @@ class Machine(Patching):
         self.assertEqual(third["problems"], [])
         self.assertIn("ядро и initramfs на месте", third["ok"])
 
+    # ── F (arch-update-ui's fix_problems), the plain terminal it runs the fixes in stubbed: a fix that ended with an
+    #    error fixed nothing and the warning stays, whatever the look right after it says; one that went through ends
+    #    the warning only when no problem is left, one that is not about booting included.
+
+    def fix_key(self, res, status, seen=()):
+        if not hasattr(self, "ui"):
+            path = os.path.join(ROOT, "bin", "arch-update-ui")
+            self.patch(sys, "argv", [path])
+            loader = importlib.machinery.SourceFileLoader("arch_update_ui", path)
+            self.ui = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+            loader.exec_module(self.ui)
+            self.said = []
+            self.patch(self.ui, "back_to_canvas", lambda app, lines: self.said.extend(text for text, _, _ in lines))
+            self.patch(self.ui, "say_plain", lambda *a, **k: None)
+        self.patch(self.ui, "run_in_terminal", lambda app, argv, intro: (status, set(seen)))
+        self.said.clear()
+        return self.ui.fix_problems(types.SimpleNamespace(s=None), res, engine.fix_commands(res))
+
+    def test_a_fix_that_failed_fixed_nothing(self):
+        self.linux(self.boot_file("vmlinuz-linux"), self.boot_file("initramfs-linux.img"))
+        r = self.checks(failures={"errors were encountered during the build"})
+        res = dict(r)
+        # mkinitcpio -P exited 1 and wrote the image all the same: the look finds it whole, it is not fixed
+        text, colour = self.fix_key(res, 1, {"errors were encountered during the build"})
+        self.assertEqual(colour, self.ui.BAD)
+        self.assertTrue(text.startswith("исправление не прошло (код 1, «errors were encountered during the build»)"))
+        self.assertTrue(any("НЕ перезагружайся" in s for s in self.said), self.said)
+        self.assertEqual(engine.unresolved()["log"], r["log"])
+        self.assertNotIn("resolved", self.summary(r))
+        self.assertEqual([f["key"] for f in self.summary(r)["fixes"]], ["initramfs"])
+        # a full disk: said so
+        self.fix_key(res, 1, {"No space left on device"})
+        self.assertTrue(any("нет места" in s for s in self.said), self.said)
+        # it went through
+        text, colour = self.fix_key(res, 0)
+        self.assertEqual((colour, engine.unresolved()), (self.ui.GOOD, None))
+        self.assertIn("resolved", self.summary(r))
+
+    def test_a_problem_not_about_booting_keeps_the_warning(self):
+        lock = os.path.join(self.tmp, "db.lck")
+        write(lock, "", 0o644)
+        self.patch(engine, "PACMAN_LOCK", lock)           # pacman was cut off: its lock is left behind
+        self.linux(self.boot_file("vmlinuz-linux"), self.boot_file("initramfs-linux.img", data=b""))
+        r = self.checks()
+        self.assertEqual(len(r["problems"]), 2)
+        write(os.path.join(self.tmp, "initramfs-linux.img"), "x" * 64, 0o644)      # mkinitcpio -P went through
+        text, colour = self.fix_key(dict(r), 0)
+        self.assertEqual(colour, self.ui.WARN)
+        self.assertIn("остался замок pacman", text)
+        self.assertEqual(engine.unresolved()["log"], r["log"])
+        self.assertNotIn("resolved", self.summary(r))
+
     def test_the_demo_carries_nothing(self):
         kernel, image = self.closed_boot("vmlinuz-linux", "initramfs-linux.img")
         self.linux(kernel, image)
@@ -835,12 +1046,21 @@ class Summaries(Patching):
         self.boot = os.path.join(self.dir, "boot_id")
         write(self.boot, "boot-a\n", 0o644)
         self.patch(engine, "BOOT_ID", self.boot)
+        self.stat = os.path.join(self.dir, "stat")       # this boot began on 2026-11-03 at 09:00, local time
+        write(self.stat, f"cpu  1 2 3\nbtime {int(time.mktime((2026, 11, 3, 9, 0, 0, 0, 0, -1)))}\n", 0o644)
+        self.patch(engine, "PROC_STAT", self.stat)
 
     def update(self, stamp, verdict, boot="boot-a", started=True, **more):
         data = dict(verdict=verdict, started=started, boot_id=boot, problems=["p"] if verdict == 2 else [], **more)
         write(os.path.join(self.dir, stamp + ".json"), json.dumps(data), 0o644)
         write(os.path.join(self.dir, stamp + ".log"), "", 0o644)
         return os.path.join(self.dir, stamp + ".log")
+
+    def journal(self, stamp, text):
+        """A journal without a summary: an older version's, or one whose summary a full disk did not let be written."""
+        path = os.path.join(self.dir, stamp + ".log")
+        write(path, text, 0o644)
+        return path
 
     def test_boot_id(self):
         self.assertEqual(engine.boot_id(), "boot-a")
@@ -870,11 +1090,63 @@ class Summaries(Patching):
 
     def test_marked_resolved_it_is_not(self):
         log = self.update("2026-11-03_10-00-00", 2)
+        # a problem still there (a pacman lock left behind, a failed hook): it stays a problem
+        self.assertFalse(engine.mark_resolved(log))
+        self.assertEqual(engine.unresolved()["log"], log)
+        engine._update_summary(log, lambda d: d.update(problems=[]))      # recheck_boot found it gone
         self.assertTrue(engine.mark_resolved(log))
         self.assertIsNone(engine.unresolved())
+        self.assertIn("resolved", engine.last_update())
         with open(log, encoding="utf-8") as f:
             self.assertIn("ИСПРАВЛЕНО]", f.read())
         self.assertFalse(engine.mark_resolved(os.path.join(self.dir, "2026-11-03_09-00-00.log")))
+
+    def test_without_a_summary_the_journal_says_it(self):
+        # The Chromebook's disk was full: the summary could not be written, the journal was (its file was open).
+        log = self.journal("2026-11-03_12-50-12", "[12:50:12 СТАРТ] arch-update, режим: автоответы\n"
+                                                  "[12:57:54 КОНЕЦ] arch-update завершился, код 0\n"
+                                                  "[12:57:54 ПАКЕТЫ] обновлены: linux 7.2.11.arch1-1→7.2.14.arch1-1\n"
+                                                  "[12:57:55 ПРОБЛЕМА] в выводе: «No space left on device»\n"
+                                                  "[12:57:55 ВНИМАНИЕ] есть пакеты-сироты\n"
+                                                  "\n══════ /var/log/pacman.log за это обновление ══════\n"
+                                                  "[12:57:56 ПРОБЛЕМА] what a hook printed\n")
+        bad = engine.unresolved()
+        self.assertEqual((bad["log"], bad["verdict"], bad["problems"]), (log, 2, ["в выводе: «No space left on device»"]))
+        self.assertEqual((bad["began"], bad["boot"], bad["services"]), ("2026-11-03T12:50:12", [], {}))
+        # a run without a result (cut off, or still running) says nothing either way
+        self.journal("2026-11-03_13-00-00", "[13:00:00 СТАРТ] arch-update, режим: автоответы\n")
+        self.assertEqual(engine.unresolved()["log"], log)
+        self.assertIsNone(engine.unresolved(exclude=log))
+        # the old version's code 11 is no problem any more
+        self.journal("2026-11-03_13-10-00", "[13:15:00 ПАКЕТЫ] обновлены: —\n"
+                                            "[13:15:00 ПРОБЛЕМА] arch-update завершился с кодом 11\n")
+        self.assertIsNone(engine.unresolved())
+        os.remove(os.path.join(self.dir, "2026-11-03_13-10-00.log"))
+        # fixed with F and looked at again: its journal says so
+        self.assertTrue(engine.mark_resolved(log))
+        self.assertIsNone(engine.unresolved())
+
+    def test_a_journal_from_before_this_boot_is_no_warning(self):
+        self.journal("2026-11-03_08-30-00", "[08:30:00 ПАКЕТЫ] обновлены: —\n[08:30:01 ПРОБЛЕМА] нет /boot/x\n")
+        self.assertIsNone(engine.unresolved())
+        write(self.stat, "cpu 1 2 3\n", 0o644)            # no telling when this boot began
+        self.journal("2026-11-03_10-00-00", "[10:00:00 ПАКЕТЫ] обновлены: —\n[10:00:01 ПРОБЛЕМА] нет /boot/x\n")
+        self.assertIsNone(engine.unresolved())
+
+    def test_a_summary_of_another_shape_breaks_nothing(self):
+        log = self.update("2026-11-03_10-00-00", 2)
+        write(log[:-4] + ".json", json.dumps({"verdict": 2, "boot_id": "boot-a", "problems": ["p", 1],
+                                              "boot": [{"kind": "dkms", "kvers": 5, "text": "t"}, "x"],
+                                              "services": {"waiting": 7, "later": ["x", 2]}, "warnings": "x",
+                                              "fixes": [{"argv": "sudo"}]}), 0o644)
+        bad = engine.unresolved()
+        self.assertEqual((bad["problems"], bad["warnings"], bad["fixes"]), (["p"], [], []))
+        self.assertEqual((bad["boot"], bad["services"]), ([{"kind": "dkms", "text": "t"}], {"later": ["x"]}))
+        self.assertEqual(engine.fix_commands(bad), [])
+        self.patch(engine, "boot_state", lambda *a, **k: ([], [], [], {}))    # nothing of this machine's own
+        self.assertEqual(engine.recheck_boot(log), [])
+        s = engine.read_json(log[:-4] + ".json")
+        self.assertEqual((s["verdict"], s["problems"], s["boot"], s["warnings"]), (2, ["p"], [], []))
 
     def test_settings(self):
         self.assertEqual(engine.read_settings(), {})

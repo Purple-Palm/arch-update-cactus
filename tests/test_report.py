@@ -165,7 +165,7 @@ def relay_takes(r):
         when = datetime.datetime.strptime(r.get("time"), "%Y-%m-%dT%H:%M:%SZ")
     except (TypeError, ValueError):
         return False
-    lists = ("changed", "added", "removed", "problems", "warnings", "ok")
+    lists = ("changed", "added", "removed", "problems", "warnings", "ok", "notes")
     return (r.get("schema") == 1 and re.fullmatch(r"[0-9a-f]{8}", str(r.get("id"))) is not None
             and 2020 <= when.year <= 2099 and r["time"].endswith("Z") and isinstance(r.get("device"), dict)
             and isinstance(r.get("updater", {}), dict) and isinstance(u, dict)
@@ -210,12 +210,19 @@ class Reports(unittest.TestCase):
     def setUp(self):
         shutil.rmtree(os.path.join(HOME, ".local"), ignore_errors=True)
         self.saved_who, self.saved_sender = report._who, report.start_sender
+        self.saved_stat, report._UNSAVED = report.engine.PROC_STAT, None
         report.start_sender = lambda: None            # the tests send by hand, in this process
         os.environ["ARCH_UPDATE_REPORT_URL"] = ""     # never the real relay: a test that sends sets its own
         self.server = None
+        # This boot began an hour ago: the journals made up here are from earlier boots, unless a test says so.
+        self.boot_began = int(time.time()) - 3600
+        report.engine.PROC_STAT = os.path.join(HOME, "stat")
+        with open(report.engine.PROC_STAT, "w") as f:
+            f.write(f"cpu  1 2 3\nbtime {self.boot_began}\n")
 
     def tearDown(self):
         report._who, report.start_sender = self.saved_who, self.saved_sender
+        report.engine.PROC_STAT = self.saved_stat
         os.environ.pop("ARCH_UPDATE_REPORT_URL", None)
         self.stop_relay()
 
@@ -1118,6 +1125,86 @@ class Reports(unittest.TestCase):
         self.assertEqual(report.send_pending(), (0, 0))
         self.assertEqual(len(Relay.got), 1)
         self.assertEqual(report._read_json(report.RECORDS)["2026-10-31_17-42-38.log"]["time"], Relay.got[0]["time"])
+
+    def test_the_update_the_menu_warns_about_stays(self):
+        # Red in this very boot, nothing fixed: deleting it would end the menu's «НЕ перезагружайся».
+        stamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(self.boot_began + 600))
+        summary = {"verdict": 2, "problems": ["нет /boot/initramfs-linux.img — НЕ перезагружайся"], "started": True,
+                   "boot_id": report.engine.boot_id()}
+        path = self.journal(stamp, BROKEN_BOOT, summary)
+        self.assertTrue(report.is_unresolved(path))
+        self.assertFalse(report.delete_local(path))
+        self.assertTrue(os.path.exists(path) and os.path.exists(path[:-4] + ".json"))
+        # one without a summary (a full disk did not let it be written): its journal says it all the same
+        os.remove(path[:-4] + ".json")
+        self.assertFalse(report.delete_local(path))
+        # fixed and looked at again (or rebooted since): it goes
+        report._write_json(path[:-4] + ".json", dict(summary, verdict=0, problems=[], resolved="2026-11-03T13:00:00"))
+        self.assertTrue(report.delete_local(path))
+        self.assertFalse(os.path.exists(path))
+
+    def test_a_deleted_update_leaves_no_report_behind(self):
+        self.relay()
+        report.set_consent(True)
+        path = self.journal("2026-10-31_17-42-38", BROKEN_BOOT)
+        report.after_update({"verdict": 2, "log": path, "problems": ["x"]}, mode="auto")
+        self.assertEqual(report.send_pending(), (1, 0))
+        self.assertIn("Initcpio image generation FAILED", report.preview())
+        refused = os.path.join(report.REJECTED, "20261031-174600-beef.json")      # one the relay refused, before
+        report._write_json(refused, {"schema": 1, "log": BROKEN_BOOT})
+        self.assertTrue(report.delete_local(path))
+        self.assertEqual(os.listdir(report.SENT), [])
+        self.assertFalse(os.path.exists(refused))
+        self.assertNotIn("Initcpio image generation FAILED", report.preview())
+
+    def test_reports_the_version_before_sent_by_itself_count_as_sent(self):
+        # 152651e sent the automatic reports and kept no record of which update each was of.
+        self.zone("UTC0")
+        self.relay()
+        older = self.journal("2026-10-30_21-00-00", WARNED)
+        path = self.journal("2026-10-31_17-42-38", BROKEN_BOOT)
+        old = {"schema": 1, "id": "1a2b3c4d", "time": "2026-10-31T17:46:01Z", "log": BROKEN_BOOT,
+               "update": {"verdict": 2}}
+        report._write_json(os.path.join(report.SETTINGS), {"reports": True, "report_id": "1a2b3c4d"})
+        report._write_json(os.path.join(report.SENT, "20261031-174601-abcd.json"), old)
+        Relay.filed[("1a2b3c4d", "2026-10-31T17:46:01Z")] = 7                  # the relay filed it as № 7
+        newest, before = report.local_updates()
+        self.assertTrue(newest["sent"])
+        self.assertEqual(before["sent"], "")                                    # not the one before it
+        self.assertEqual(report.report_state(path)["sent"], newest["sent"])
+        self.assertEqual(report.send_now(path), (True, "этот отчёт уже у разработчика (№ 7)", 7))
+        self.assertEqual(Relay.got[0]["time"], "2026-10-31T17:46:01Z")
+        self.assertTrue(report.delete_local(older))
+        self.assertTrue(os.path.exists(os.path.join(report.SENT, "20261031-174601-abcd.json")))   # not its report
+
+    def test_an_account_renamed_since_is_taken_out_too(self):
+        self.relay()
+        report._who = lambda: WHO                                              # the account is "cactus" now
+        path = self.journal("2026-10-31_17-42-38", BROKEN_BOOT + "[sudo] password for vanya:\n"
+                                                    "  -> /home/vanya/.cache/yay/brave-bin\n"
+                                                    "doas (vanya@vanya-chromebook) password:\n"
+                                                    "vanya-chromebook kernel: usb 1-1: new device\n"
+                                                    "  -> BUILDDIR=/home/build/makepkg\n==> Starting build()...\n")
+        self.assertTrue(report.send_now(path)[0])
+        log = Relay.got[0]["log"]
+        self.assertNotIn("vanya", log)
+        for kept in ("[sudo] password for <user>:", "/home/<user>/.cache/yay/brave-bin", "(<user>@<host>) password:",
+                     "BUILDDIR=/home/<user>/makepkg", "==> Starting build()"):   # a folder's name is no word to hide
+            self.assertIn(kept, log)
+
+    def test_a_send_that_failed_leaves_no_id(self):
+        path = self.journal("2026-10-31_17-42-38", BROKEN_BOOT)
+        os.environ["ARCH_UPDATE_REPORT_URL"] = "http://127.0.0.1:9/report"     # nobody listens on port 9
+        self.assertFalse(report.send_now(path, timeout=3)[0])
+        self.relay(503)
+        self.assertFalse(report.send_now(path)[0])
+        self.assertEqual(report.status()["id"], "")
+        self.assertFalse(os.path.exists(report.SETTINGS))
+        tried = {r["id"] for r in Relay.got}
+        self.relay()
+        self.assertTrue(report.send_now(path)[0])
+        self.assertEqual({Relay.got[0]["id"]}, tried)                          # the same ID it tried with
+        self.assertEqual(report.report_id(), Relay.got[0]["id"])
 
     def test_settings_keep_each_other(self):
         self.assertEqual(report.option("restart_services", False), False)   # nothing written yet

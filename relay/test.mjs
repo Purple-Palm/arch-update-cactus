@@ -269,6 +269,20 @@ test('warnings and problems stay open with their labels; a Chromebook is marked'
   assert.ok(!calls.some((c) => c.kind === 'close'));
 });
 
+test('the notes are shown after the rest, and checked like the other lists', async () => {
+  const worker = await load();
+  const calls = github();
+  const res = await send(worker, sample({ update: { verdict: 0, notes: ['сервисы ждут перезапуска: netctl@<instance>'] } }));
+  assert.equal(res.status, 201);
+  const body = calls.find((c) => c.kind === 'issue').body.body;
+  assert.ok(body.includes('✓ упавших сервисов нет\n· сервисы ждут перезапуска: netctl@<instance>'), body);
+  for (const notes of ['x', [1], Array(201).fill('n'), ['n'.repeat(4001)]]) {
+    assert.equal((await send(worker, sample({ update: { notes } }), { ip: '203.0.113.90' })).status, 400, String(notes));
+  }
+  assert.equal((await send(worker, sample({ update: { notes: undefined } }), { ip: '203.0.113.91' })).status, 201,
+    'a report from before there were notes');
+});
+
 test('a run that never started is labelled so, and counts its packages in Russian', async () => {
   const worker = await load();
   const calls = github();

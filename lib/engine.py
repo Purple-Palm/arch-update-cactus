@@ -85,12 +85,30 @@ UNKNOWN_PROMPT = re.compile(
     r"|(?i:(?:enter|select|choose|password|passphrase|user ?name|login|answer|input)[^\n]*:)$"
 )
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>78]")
+# What went wrong, in the output. mkinitcpio goes on after a hook or a module failed and writes the image all the
+# same ("errors were encountered during the build"), and one without a single module when the kernel's module list
+# is missing (depmod failed: a full disk) — the Chromebook that did not boot any more.
 FAILURE_MARKERS = re.compile(r"Initcpio image generation FAILED|error: command failed to execute correctly"
+                             r"|errors were encountered during the build|No modules were added to the image"
+                             r"|depmod: FATAL|No space left on device"
                              r"|An error has occurred during the update process"
                              r"|invalid or corrupted package \(PGP signature\)|is unknown trust|is marginal trust"
                              r"|You can do this later by running: #? ?dd if=\S+ of=\S+", re.I)
 KERNEL_FLASH = re.compile(r"dd if=\S+ of=\S+")   # depthcharge kernels (ARM Chromebooks): flash by hand
 KEYRING_TROUBLE = re.compile(r"PGP signature|unknown trust|marginal trust", re.I)
+# The markers that say mkinitcpio built a broken or incomplete image (or none), and what the summary says of each.
+INITCPIO_SAYS = {"initcpio image generation failed": "mkinitcpio не собрал initramfs",
+                 "errors were encountered during the build": "mkinitcpio собрал initramfs с ошибками — он может быть "
+                                                             "неполным",
+                 "no modules were added to the image": "в initramfs не попал ни один модуль ядра — система с ним "
+                                                       "не загрузится"}
+DISK_FULL = ("на диске кончилось место («No space left on device») — часть файлов не записалась: освободи место "
+             "(например: sudo pacman -Sc) и обнови ещё раз")
+# mkinitcpio's "the image was built" (v38 on: "Initcpio image generation successful"; v37: "Image generation
+# successful"), and what says it was not, or not whole.
+IMAGE_BUILT = re.compile(r"(?i)image generation successful")
+IMAGE_TROUBLE = re.compile(r"(?i)image generation FAILED|errors were encountered during the build"
+                           r"|No modules were added to the image")
 PASSWORD_LINE = re.compile(r"(?i)(?:pass(?:word|phrase)|пароль)[^\n]{0,120}:[^\S\n]*$")
 # arch-update's restart_services.sh lists what checkservices found under a header ("1 - cups.service"), asks
 # which to restart, then says how each restart went.
@@ -122,17 +140,20 @@ KEEP_RUNNING = re.compile(r"^(?:" + "|".join([
     r"auditd",
     # the way to the network: Wi-Fi on the Chromebooks, an SSH session, the update report still to go out;
     # one that did not come back would leave the machine offline until a reboot
-    r"NetworkManager", r"wpa_supplicant(?:@.*)?", r"iwd", r"systemd-networkd", r"dhcpcd(?:@.*)?", r"connman",
-    r"netctl(?:-auto)?@.*", r"ModemManager", r"tailscaled", r"zerotier-one", r"openvpn.*", r"strongswan.*",
-    r"wg-quick@.*",
+    r"NetworkManager", r"wpa_supplicant(?:-nl80211|-wired)?(?:@.*)?", r"iwd", r"systemd-networkd", r"dhcpcd(?:@.*)?",
+    r"connman", r"netctl(?:-auto|-ifplugd)?@.*", r"systemd-resolved", r"ModemManager", r"tailscaled", r"zerotier-one",
+    r"openvpn.*", r"strongswan.*", r"wg-quick@.*", r"mullvad-daemon", r"nordvpnd", r"warp-svc", r"netbird",
     # the keyboard and the mouse in use (Bluetooth, key remappers like keyd on Chromebooks), a shared desktop
     r"bluetooth", r"keyd", r"kanata.*", r"kmonad.*", r"input-remapper.*", r"udevmon", r"xremap.*",
     r"xrdp(?:-sesman)?", r"gnome-remote-desktop", r"teamviewerd", r"anydesk", r"rustdesk", r"x0vncserver.*",
     r"vncserver.*", r"x11vnc.*",
     # NVIDIA's daemons: the new driver works only with its new kernel module, after a reboot
     r"nvidia.*",
-    # containers and machines go down with them, and not all of them come back by themselves
-    r"docker", r"systemd-nspawn@.*", r"libvirt-guests",
+    # containers and machines go down with them, and not all of them come back by themselves; the virtual
+    # machines' logs and locks
+    r"docker", r"systemd-nspawn@.*", r"libvirt-guests", r"virtlogd", r"virtlockd",
+    # they run package transactions of their own: a restart in the middle of one would cut pacman off
+    r"packagekit", r"pamac-daemon",
     # the disks: these set up encrypted disks, swap and file systems once at boot (never listed as running;
     # here in case a later arch-update lists more than running services)
     r"systemd-cryptsetup@.*", r"systemd-zram-setup@.*", r"systemd-fsck@.*", r"systemd-remount-fs",
@@ -156,7 +177,9 @@ POWER_DIR = "/sys/class/power_supply"
 STATE_DIR = os.path.expanduser("~/.local/state/arch-update-auto")
 SETTINGS = os.path.join(STATE_DIR, "settings.json")   # written by report.py (and the settings screen)
 BOOT_ID = "/proc/sys/kernel/random/boot_id"           # changes with every boot
+PROC_STAT = "/proc/stat"                              # its btime: when this boot began
 CGROUP = "/proc/self/cgroup"
+PACMAN_CACHE = "/var/cache/pacman/pkg"
 REBOOT_PKGS = re.compile(
     r"^(linux(?:-lts|-zen|-hardened)?|linux-firmware.*|nvidia.*|lib32-nvidia-utils|opencl-nvidia|"
     r"amd-ucode|intel-ucode|systemd|glibc|mesa|lib32-mesa|plasma-workspace|kwin|qt6-base|wayland|"
@@ -234,6 +257,26 @@ def boot_id():
         return ""
 
 
+def boot_started():
+    """When this boot began, in seconds since the epoch (the kernel's btime); None if that cannot be read."""
+    try:
+        with open(PROC_STAT) as f:
+            for line in f:
+                if line.startswith("btime "):
+                    return float(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def free_mib(path="/"):
+    """Free space where path is, in MiB for the user (what the update's own files get); None if unknown."""
+    try:
+        return shutil.disk_usage(path).free // 2 ** 20
+    except OSError:
+        return None
+
+
 def pacman_busy():
     return os.path.exists(PACMAN_LOCK) and bool(run(["pgrep", "-x", "pacman"]).strip())
 
@@ -251,6 +294,20 @@ def kernel_packages():
             if m:
                 kernels[m.group(2)] = os.path.basename(os.path.dirname(m.group(1)))
     return kernels
+
+
+def module_index(kver):
+    """The module list depmod writes for a kernel: modprobe, udev and mkinitcpio find the kernel's modules by it."""
+    return os.path.join(MODULES_DIR, kver, "modules.dep.bin")
+
+
+def modular(kver):
+    """The kernel has modules to load (modules.order lists them, as every Arch kernel's does): it boots only with
+    its module list, and with an initramfs that holds some of them."""
+    try:
+        return os.path.getsize(os.path.join(MODULES_DIR, kver, "modules.order")) > 0
+    except OSError:
+        return False
 
 
 def preset_files(pkg):
@@ -279,6 +336,7 @@ def preset_files(pkg):
 # whose first line says it got that far: a sudo that may not run it (sudoers allows other commands only) leaves
 # nothing, never a file that looks missing. It prints:
 #   sudo-ok, file <path> (looked at), size <bytes> <path> (it exists), image <lsinitcpio status> <kver,kver|-> <path>,
+#   indexed <kver,kver|-> <path> (the kernels whose module list, modules.dep.bin, is in that image: it has modules),
 #   sbctl (asked), sbctl <line of its output>
 # Arguments: <sbctl 0|1> <n> <boot file>... <m> <image>...
 PROBE = r"""
@@ -298,7 +356,10 @@ for f in "${images[@]}"; do
     l=$(timeout 60 lsinitcpio "$f" 2>/dev/null)
     rc=$?
     k=$(printf '%s\n' "$l" | sed -n 's|^usr/lib/modules/\([^/][^/]*\)/.*|\1|p' | sort -u | paste -sd, -)
+    d=$(printf '%s\n' "$l" | sed -n 's|^usr/lib/modules/\([^/][^/]*\)/modules\.dep\(\.bin\)\{0,1\}$|\1|p' \
+        | sort -u | paste -sd, -)
     printf 'image %s %s %s\n' "$rc" "${k:--}" "$f"
+    printf 'indexed %s %s\n' "${d:--}" "$f"
 done
 if [ "$sb" = 1 ]; then
     echo sbctl
@@ -362,11 +423,12 @@ def read_probe(path):
 def parse_probe(text):
     """What a probe printed: None when sudo would have asked (nothing was looked at), else {"files": {paths looked
     at}, "sizes": {path: bytes} of those that exist, "images": {path: (lsinitcpio's status, {kernel versions
-    inside})}, "sbctl": its output, None if not asked}."""
+    inside})}, "indexed": {path: {kernel versions whose module list is inside}}, "sbctl": its output, None if not
+    asked}."""
     lines = (text or "").splitlines()
     if lines[:1] != ["sudo-ok"]:
         return None
-    probe, sb = {"files": set(), "sizes": {}, "images": {}, "sbctl": None}, None
+    probe, sb = {"files": set(), "sizes": {}, "images": {}, "indexed": {}, "sbctl": None}, None
     for line in lines[1:]:
         kind, _, rest = line.partition(" ")
         if kind == "file" and rest:
@@ -379,6 +441,10 @@ def parse_probe(text):
             parts = rest.split(" ", 2)
             if len(parts) == 3 and parts[0].isdigit():
                 probe["images"][parts[2]] = (int(parts[0]), set(parts[1].split(",")) - {"-", ""})
+        elif kind == "indexed":
+            kvers, _, path = rest.partition(" ")
+            if path:
+                probe["indexed"][path] = set(kvers.split(",")) - {"-", ""}
         elif kind == "sbctl":
             sb = (sb + [rest]) if sb is not None else []
     if sb is not None:
@@ -1403,20 +1469,136 @@ def summaries(logdir=None):
     for path in sorted(glob.glob(os.path.join(logdir or logs_dir(), "20*.json")), reverse=True):
         data = read_json(path)
         if data:
+            data = normal_summary(data)
             data["log"] = path[:-len(".json")] + ".log"
             yield data
 
 
-def unresolved(logdir=None):
-    """The newest update, if it found problems (verdict 2) in this very boot and they were not marked fixed:
-    until a reboot or a fix the menu keeps saying so. A run that did not start changed nothing: the update
-    before it counts (unless that run is red itself, an unmounted /boot). None otherwise."""
-    this_boot = boot_id()
-    for data in summaries(logdir):
-        if data.get("boot_id", "") != this_boot:
-            return None
+def normal_summary(d):
+    """A summary as the code that reads it expects it, whatever wrote it (another version of the updater, a hand):
+    lists of text, the problems with booting and the fixes as dicts, the services as lists of names. What is of
+    another type is left out."""
+    def plain(v):
+        if isinstance(v, list):
+            return [x for x in v if isinstance(x, str)]
+        return v if isinstance(v, (str, int, float, bool)) or v is None else None
+
+    def item(i):                                # lists where lists belong (kvers, files, argv), else a plain value
+        return {k: plain(v) for k, v in i.items()
+                if plain(v) is not None and isinstance(v, list) == (k in ("kvers", "files", "argv"))}
+    for k in ("changed", "added", "removed", "problems", "warnings", "notes", "ok"):
+        d[k] = plain(d.get(k)) if isinstance(d.get(k), list) else []
+    for k in ("boot", "fixes"):
+        items = d.get(k) if isinstance(d.get(k), list) else []
+        d[k] = [item(i) for i in items if isinstance(i, dict)]
+    d["fixes"] = [f for f in d["fixes"] if f.get("argv")]
+    svc = d.get("services") if isinstance(d.get("services"), dict) else {}
+    d["services"] = {k: plain(v) for k, v in svc.items() if isinstance(v, list)}
+    if not (type(d.get("verdict")) is int and d["verdict"] in (0, 1, 2)):
+        d["verdict"] = None
+    return d
+
+
+# The updater's own lines in a journal (RunLog.event): "[17:45:45 ПАКЕТЫ] обновлены: …". Looked for from the newline
+# before them: a pattern with a fixed start is found quickly, and a journal can be megabytes long.
+JOURNAL_EVENT = re.compile(r"\n\[(\d\d):(\d\d):(\d\d) ([^\]\n]{1,40})\] ?([^\n]*)")
+PACMAN_PART = "\n══════ /var/log/pacman.log за это обновление ══════"     # after the updater's last lines
+JOURNAL_WHOLE, JOURNAL_HEAD = 4 * 2 ** 20, 2 ** 19     # bytes of a journal read whole; of a longer one (a long AUR
+                                                       # build) its head and the rest from its end, where the result is
+JOURNAL_NAME = re.compile(r"20\d\d-\d\d-\d\d_\d\d-\d\d-\d\d\.log")
+
+
+def journal_events(path, text=None):
+    """The updater's own lines in a journal, up to its pacman.log part: [(hours, minutes, seconds, kind, text)].
+    text: the journal as journal_text read it. Raises OSError."""
+    text = journal_text(path) if text is None else text
+    end = text.find(PACMAN_PART)
+    return JOURNAL_EVENT.findall("\n" + (text if end == -1 else text[:end]))
+
+
+def journal_text(path):
+    """A journal, whole, or of a longer one its head and its end. Raises OSError."""
+    with open(path, "rb") as f:
+        size = os.fstat(f.fileno()).st_size
+        if size <= JOURNAL_WHOLE:
+            data = f.read()
+        else:
+            data = f.read(JOURNAL_HEAD)
+            f.seek(size - (JOURNAL_WHOLE - JOURNAL_HEAD))
+            data += b"\n" + f.read()
+    return data.decode("utf-8", "replace")
+
+
+# mark_resolved's line, written after the pacman.log part like everything that comes after the update (a fix, R)
+RESOLVED_LINE = re.compile(r"\n\[\d\d:\d\d:\d\d ИСПРАВЛЕНО\] ")
+
+
+def journal_began(log):
+    """When the update of a journal began (its name: local time), in seconds since the epoch; None for another name."""
+    try:
+        return time.mktime(time.strptime(os.path.basename(log)[:19], "%Y-%m-%d_%H-%M-%S"))
+    except (ValueError, OverflowError):
+        return None
+
+
+def journal_result(log):
+    """What a journal's own lines say of its update, for one without a summary (an older version's, or one whose
+    summary a full disk did not let be written), shaped like a summary; None when it has no result at all (cut off,
+    or still running)."""
+    try:
+        whole = journal_text(log)
+    except OSError:
+        return None
+    result, started, problems, warnings = False, True, [], []
+    for _, _, _, kind, text in journal_events(log, whole):
+        text = text.rstrip()
+        if kind == "ПАКЕТЫ" and text.startswith("обновлены:"):         # the checks' first line
+            result = True
+        elif kind == "НЕ НАЧАТО":                                      # only a boot partition not mounted is a problem
+            result, started = True, False
+            (problems if "не смонтирован" in text else warnings).append(text)
+        elif kind == "ПРОБЛЕМА" and text != "arch-update завершился с кодом 11":     # a warning since
+            problems.append(text)
+        elif kind == "ВНИМАНИЕ":
+            warnings.append(text)
+    resolved = bool(RESOLVED_LINE.search(whole))
+    if not result:
+        return None
+    began = journal_began(log)
+    return normal_summary({"verdict": 2 if problems else 1 if warnings else 0, "problems": problems,
+                           "warnings": warnings, "started": started, "resolved": resolved, "journal_only": True,
+                           "began": datetime.datetime.fromtimestamp(began).isoformat() if began else None})
+
+
+def unresolved(logdir=None, exclude=None):
+    """The newest update of this very boot, if it found problems (verdict 2) and they are not fixed: until a reboot
+    or a fix the menu keeps saying so. From its summary, or for one without (an older version's, or one a full disk
+    did not let be written) from its journal's own lines. A run that did not start changed nothing: the update
+    before it counts (unless that run is red itself, an unmounted /boot); one without a result (cut off, or still
+    running) says nothing either way. exclude: a journal to pass over (the run being checked now). None otherwise."""
+    this_boot, boot_began = boot_id(), boot_started()
+    skip = os.path.realpath(exclude) if exclude else None
+    for log in sorted(glob.glob(os.path.join(logdir or logs_dir(), "20*.log")), reverse=True):
+        if not JOURNAL_NAME.fullmatch(os.path.basename(log)) or (skip and os.path.realpath(log) == skip):
+            continue
+        data = read_json(log[:-4] + ".json")
+        if data:
+            if data.get("boot_id", "") != this_boot:
+                return None
+            data = normal_summary(data)
+        else:
+            began = journal_began(log)
+            if began is None or boot_began is None or began < boot_began - 60:
+                return None                         # an earlier boot's, or no telling
+            data = journal_result(log)
+            if data is None:
+                continue
+            if data["resolved"]:                    # a fix went through, and the problems were looked at again
+                return None
+        data["log"] = log
         if data.get("started", True) or data.get("verdict") == 2:
-            return data if data.get("verdict") == 2 and not data.get("resolved") else None
+            # Marked fixed only once no problem was left (mark_resolved): one still there is still a problem.
+            return data if data.get("verdict") == 2 else None
     return None
 
 
@@ -1439,6 +1621,7 @@ def _update_summary(log, change):
     data = read_json(path)
     if not data:
         return None
+    data = normal_summary(data)
     change(data)
     if data.get("started", True):
         data["verdict"] = 2 if data.get("problems") else (1 if data.get("warnings") else 0)
@@ -1453,9 +1636,18 @@ def _update_summary(log, change):
 
 
 def mark_resolved(log):
-    """The problems of that update are fixed (a fix went through and recheck_boot found nothing more): the
-    menu stops warning about them. False if its summary could not be updated."""
-    done = _update_summary(log, lambda d: d.update(resolved=now_iso())) is not None
+    """The problems of that update are fixed (a fix went through and recheck_boot found nothing more): the menu
+    stops warning about them. Only once its summary has no problem left: one that is not about booting (a pacman
+    lock left behind, a failed hook) keeps it red, and the warning stays (False). For an update without a summary
+    (a full disk did not let it be written) the caller has looked: its journal says it, which unresolved() reads.
+    False also when nothing could be written."""
+    data = read_json(summary_path(log))
+    if data:
+        if data.get("problems"):
+            return False
+        done = _update_summary(log, lambda d: d.update(resolved=now_iso())) is not None
+    else:
+        done = isinstance(log, str) and os.path.isfile(log)
     if done:
         journal_event(log, "ИСПРАВЛЕНО", "проблемы этого обновления отмечены исправленными")
     return done
@@ -1493,21 +1685,30 @@ def _exists(path):
     return True
 
 
-def boot_state(probe=None, pacman_log=None, changed=(), earlier=(), since=None, found=(), event=_event):
-    """The boot partitions, the installed kernels' boot files, their DKMS modules and the Secure Boot signatures,
-    as they are now. Returns (issues, warnings, ok, kernels): issues are the problems with booting as dicts
-    {"kind", "text", …} (see fix_commands), kernels {package: version}.
+def boot_state(probe=None, pacman_log=None, changed=(), earlier=(), since=None, found=(), event=_event, keep=False):
+    """The boot partitions, the installed kernels' module lists and boot files, their DKMS modules and the Secure
+    Boot signatures, as they are now. Returns (issues, warnings, ok, kernels): issues are the problems with booting
+    as dicts {"kind", "text", …} (see fix_commands), kernels {package: version}.
     probe: what a probe found as root after the update (parse_probe); without one, or for what it did not look
     at, a probe is tried now (it works when sudo asks nothing). pacman_log: this update's part of pacman.log, to
     judge a /boot nobody could look into by what the update did to it. earlier: issues found before (by an
     earlier update of this boot, or by this one's own check); those this look can neither confirm nor rule out
     stay, as found then (since: when that was, None for this update's own). found: issues this update has
-    found already (in its output), so that an earlier one of the same kind is not said twice."""
+    found already (in its output), so that an earlier one of the same kind is not said twice. keep: a fix of
+    them has just failed: what this look does not find again stays all the same (a look that finds nothing
+    wrong after a failed mkinitcpio may have missed what it left out)."""
     issues, warnings, ok, unverified, looked_into = [], [], [], set(), set()
     for t in unmounted_boot():
         issues.append({"kind": "unmounted", "target": t,
                        "text": f"{t} не смонтирован — ядро могло записаться не туда, НЕ перезагружайся"})
     kernels = kernel_packages()
+    # The module list (depmod writes it, the kernel package's hook runs depmod): without it nothing finds the
+    # kernel's modules, mkinitcpio puts none into the initramfs and the machine does not boot.
+    for pkg, kver in sorted(kernels.items()):
+        if modular(kver) and not os.path.exists(module_index(kver)):
+            issues.append({"kind": "depmod", "pkg": pkg, "kver": kver, "path": module_index(kver),
+                           "text": f"у ядра {kver} нет списка модулей (depmod не отработал) — НЕ перезагружайся, "
+                                   "система не загрузится"})
     entries, checked = [], 0                    # (kind, path, package, kernel version)
     for pkg, kver in sorted(kernels.items()):
         files = preset_files(pkg)
@@ -1552,25 +1753,34 @@ def boot_state(probe=None, pacman_log=None, changed=(), earlier=(), since=None, 
             issues.append(_file_issue(kind, f, pkg, "empty", f"{f} пустой — НЕ перезагружайся (сначала: "
                                       + (f"sudo pacman -S {pkg})" if kind == "kernel" else "sudo mkinitcpio -P)")))
         elif kind == "image":
+            # Built for this kernel, and with its modules: mkinitcpio makes the kernel's folder in every image,
+            # and its module list (modules.dep.bin) only when it put modules in (none: the image cannot boot).
             if f in readable:
                 try:
                     r = subprocess.run(["lsinitcpio", f], capture_output=True, text=True, timeout=120)
-                    img_ok = r.returncode == 0 and f"usr/lib/modules/{kver}/" in r.stdout
+                    for_kver = r.returncode == 0 and f"usr/lib/modules/{kver}/" in r.stdout
+                    has_modules = bool(re.search(rf"(?m)^usr/lib/modules/{re.escape(kver)}/modules\.dep(?:\.bin)?$",
+                                                 r.stdout))
                 except (OSError, subprocess.SubprocessError):
-                    img_ok = False
+                    for_kver = has_modules = False
             else:
                 p = next((p for p in probes if f in p["images"]), None)
                 if p is None:
                     unverified.add("images")    # a root-only image: its size is all anybody could see
                     continue
                 rc, kvers = p["images"][f]
-                img_ok = rc == 0 and kver in kvers
+                indexed = p.get("indexed", {}).get(f)
+                for_kver = rc == 0 and kver in kvers
+                has_modules = indexed is None or kver in indexed     # None: a probe that did not say
             looked_into.add(f)
-            if not img_ok:
+            if not for_kver:
                 issues.append(_file_issue(kind, f, pkg, "broken", f"{f} обрезан или собран не под ядро {kver} — "
                                                                   "НЕ перезагружайся (сначала: sudo mkinitcpio -P)"))
-    rebuilt = bool(pacman_log) and "Image generation successful" in pacman_log \
-        and "Initcpio image generation FAILED" not in pacman_log
+            elif not has_modules and modular(kver):
+                issues.append(_file_issue(kind, f, pkg, "broken", f"в {f} нет модулей ядра {kver} — НЕ "
+                                                                  "перезагружайся, система с ним не загрузится "
+                                                                  "(сначала: sudo mkinitcpio -P)"))
+    rebuilt = bool(pacman_log) and bool(IMAGE_BUILT.search(pacman_log)) and not IMAGE_TROUBLE.search(pacman_log)
     if "files" in unverified:
         # No look inside: judge by what this update did to the boot files.
         if pacman_log is not None and not any(p in kernels for p in changed) and "mkinitcpio" not in pacman_log:
@@ -1580,7 +1790,7 @@ def boot_state(probe=None, pacman_log=None, changed=(), earlier=(), since=None, 
         else:
             warnings.append("не смог заглянуть в /boot: он закрыт для пользователя — "
                             "перед перезагрузкой проверь: sudo ls -l /boot")
-    elif checked and not any(i["kind"] in ("unmounted", "kernel", "image") for i in issues):
+    elif checked and not any(i["kind"] in ("unmounted", "kernel", "image", "depmod") for i in issues):
         ok.append("ядро и initramfs на месте" if len(kernels) == 1 else f"ядра и initramfs на месте ({checked})")
     # The dkms pacman hook never fails the transaction: a module that didn't build shows up only here.
     for module, kvers in sorted(dkms_built().items()):
@@ -1609,8 +1819,11 @@ def boot_state(probe=None, pacman_log=None, changed=(), earlier=(), since=None, 
 
     def seen_again(i):
         kind, path = i.get("kind"), i.get("path")
-        if kind in ("unmounted", "dkms"):
+        if kind in ("unmounted", "dkms") or (kind == "depmod" and path):
             return True                         # looked at every time
+        if kind == "depmod":                    # depmod failed then: its lists written again since, for every kernel
+            at = i.get("at") if isinstance(i.get("at"), (int, float)) else time.time()
+            return bool(kernels) and all(_mtime(module_index(k)) > at for k in kernels.values())
         if kind in ("kernel", "image"):
             return path in looked_into if i.get("how") == "broken" else path in known
         if kind == "initcpio":                  # mkinitcpio failed then: a new image built since, or all looked into
@@ -1620,7 +1833,7 @@ def boot_state(probe=None, pacman_log=None, changed=(), earlier=(), since=None, 
         return False                            # a kernel partition to flash by hand: nothing here can tell
     now = {(i["kind"], i.get("path")) for i in list(issues) + list(found)}
     for i in earlier:
-        if not isinstance(i, dict) or not isinstance(i.get("text"), str) or seen_again(i):
+        if not isinstance(i, dict) or not isinstance(i.get("text"), str) or (not keep and seen_again(i)):
             continue
         key = (i.get("kind"), i.get("path"))
         if key in now:
@@ -1632,9 +1845,16 @@ def boot_state(probe=None, pacman_log=None, changed=(), earlier=(), since=None, 
             kept.setdefault("found", i["text"])
             kept["text"] = f"не исправлено после обновления в {kept['since']}: {kept['found']}"
         issues.append(kept)
-    if any(i.get("kind") in ("kernel", "image", "initcpio") for i in issues):
+    if any(i.get("kind") in ("kernel", "image", "initcpio", "depmod") for i in issues):
         ok = [o for o in ok if not re.match(r"(?:ядро|ядра) и initramfs", o)]   # not with a problem still there
     return issues, warnings, ok, kernels
+
+
+def _mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
 
 
 def services_record(responder=None, failed_now=()):
@@ -1709,35 +1929,54 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
         problems.append("остался замок pacman /var/lib/pacman/db.lck — pacman мог прерваться")
     else:
         ok.append("pacman завершился штатно")
+    depmod_failed = False
     for f in sorted(responder.failures):
         flash = KERNEL_FLASH.search(f)
+        initcpio = INITCPIO_SAYS.get(f.lower())
         if flash:
             boot.append({"kind": "flash", "cmd": flash.group(0),
                          "text": "новое ядро не записано в раздел ядра — перед перезагрузкой выполни: "
                                  f"sudo {flash.group(0)}"})
         elif "update process" in f:
             warnings.append(f"в выводе: «{f}»")
-        elif "image generation failed" in f.lower():
-            boot.append({"kind": "initcpio", "text": f"в выводе: «{f}»"})
+        elif initcpio:
+            boot.append({"kind": "initcpio", "text": f"{initcpio}: «{f}» — НЕ перезагружайся (сначала: "
+                                                     "sudo mkinitcpio -P)"})
+        elif f.lower() == "depmod: fatal":
+            depmod_failed = True                # for which kernels: the look below knows them
+        elif f.lower() == "no space left on device":
+            problems.append(DISK_FULL)
         else:
             problems.append(f"в выводе: «{f}»")
     if any(KEYRING_TROUBLE.search(f) for f in responder.failures):
         keyring = "archlinuxarm-keyring" if before.get("archlinuxarm-keyring") else "archlinux-keyring"
         problems.append(f"похоже, устарел keyring: sudo pacman -Sy {keyring} && sudo pacman -Su, потом обнови снова")
 
-    prev = unresolved(LOG.dir) if carry else None       # this run's own summary is not written yet
-    if prev and os.path.realpath(prev["log"]) == os.path.realpath(LOG.path):
-        prev = None
+    # What an earlier update of this boot found wrong with booting and nobody fixed (its summary, or for one
+    # without, its journal); this run's own journal says nothing yet.
+    prev = unresolved(LOG.dir, exclude=LOG.path) if carry else None
     issues, w, o, kernels = boot_state(probe, pacman_log, changed + added, earlier=(prev or {}).get("boot") or (),
                                        since=prev and _when(prev.get("began")) or None, found=boot)
     boot += issues
+    if depmod_failed and not any(i["kind"] == "depmod" for i in issues):
+        # The lists are there (from before?): depmod failed on them all the same, a module may be missing in them.
+        kvers = sorted(kernels.values())
+        boot.append({"kind": "depmod", "kvers": kvers, "at": time.time(),
+                     "text": "depmod не обновил список модулей ядра («depmod: FATAL») — НЕ перезагружайся"
+                             + (f" (сначала: sudo depmod {kvers[0]})" if len(kvers) == 1 else "")})
     problems += [i["text"] for i in boot]
     warnings += w
     ok += o
 
     kernel_new = bool(kernels) and running_kernel() not in kernels.values()
     reboot_pkgs = [p for p in changed + added if REBOOT_PKGS.match(p) or p in kernels]
-    if kernel_new:
+    reboot = kernel_new or bool(reboot_pkgs) or ("reboot" in seen_notes and not kernels)
+    if problems and reboot:
+        # Never "reboot when you like" next to a problem (one an earlier update of this boot left included).
+        notes.append("перезагрузиться понадобится" + (" (обновилось ядро)" if kernel_new else
+                                                       f" (обновились: {', '.join(reboot_pkgs[:8])})" if reboot_pkgs
+                                                       else "") + " — но только когда проблемы выше будут исправлены")
+    elif kernel_new:
         notes.append("обновилось ядро — перезагрузись, когда будет удобно"
                      + (f" (обновились: {', '.join(reboot_pkgs[:8])})" if reboot_pkgs else ""))
     elif reboot_pkgs:
@@ -1746,7 +1985,6 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
         notes.append("arch-update советует перезагрузиться — когда будет удобно")
     elif "reboot" in seen_notes:
         LOG.event("ЯДРО", "arch-update предлагал перезагрузку, но работающее ядро на месте — пропускаю")
-    reboot = kernel_new or bool(reboot_pkgs) or ("reboot" in seen_notes and not kernels)
     if is_chromebook() and {"alsa-ucm-conf", "sof-firmware"} & set(changed + added):
         notes.append("обновились alsa-ucm-conf/sof-firmware: если пропал звук, снова запусти скрипт "
                      "chromebook-linux-audio")
@@ -1811,7 +2049,7 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
     for n in notes:
         LOG.event("ЗАМЕТКА", n)
     if pacman_log is not None:
-        LOG.text("\n══════ /var/log/pacman.log за это обновление ══════\n" + pacman_log)
+        LOG.text(PACMAN_PART + "\n" + pacman_log)
 
     if problems:
         notify("Обновление: нужна проверка", "\n".join(problems), urgent=True)
@@ -1833,11 +2071,15 @@ def fix_commands(res):
     """What the engine knows to do about the problems with booting in a result (or a summary read back), in the
     order to run them: [{"key", "label", "argv"}]. Each one only where it fits a problem found:
       mount      an fstab boot partition that is not mounted
-      kernel     a kernel file missing or empty: the kernel package again (its hooks copy the kernel, build
-                 the initramfs and the DKMS modules, sign); pacman asks before it does anything
+      kernel     a kernel file missing or empty: the installed kernel package again, that very version from
+                 pacman's cache (its hooks copy the kernel, build the initramfs and the DKMS modules, sign), or
+                 from the repository when the cache has not got it; none when the repository has a newer one
+                 (that would update the kernel alone, without its headers and the rest: a partial upgrade);
+                 pacman asks before it does anything
+      depmod     a kernel's module list not written, or depmod failed (a full disk)
       dkms       a DKMS module not built for a kernel
-      initramfs  an initramfs (or UKI) missing, empty or broken, mkinitcpio failed, or after a DKMS build
-                 (the module may belong in the initramfs): mkinitcpio -P, as pacman's hook does
+      initramfs  an initramfs (or UKI) missing, empty or broken, mkinitcpio failed, or after the module lists or a
+                 DKMS build (an image built without them lacks modules): mkinitcpio -P, as pacman's hook does
       sbctl      a boot file not signed for Secure Boot: signed and kept in sbctl's list
     [] when there is nothing to do this way. They ask for the password: run them in a terminal."""
     issues = [i for i in (res or {}).get("boot") or [] if isinstance(i, dict)]
@@ -1846,18 +2088,25 @@ def fix_commands(res):
     for t in dict.fromkeys(i.get("target") for i in issues if i.get("kind") == "unmounted"):
         if isinstance(t, str) and t.startswith("/"):
             fixes.append({"key": "mount", "label": f"смонтировать {t}", "argv": [su, "mount", t]})
-    pkgs = sorted({i.get("pkg") for i in issues if i.get("kind") == "kernel" and isinstance(i.get("pkg"), str)})
-    if pkgs:
-        fixes.append({"key": "kernel", "argv": [su, "pacman", "-S", *pkgs],
-                      "label": f"переустановить ядро ({', '.join(pkgs)}): вернёт файл ядра и initramfs"})
-    kvers = list(dict.fromkeys(k for i in issues if i.get("kind") == "dkms" for k in (i.get("kvers") or [])
-                               if isinstance(k, str) and re.fullmatch(r"[\w.+~-]+", k)))
+    pkgs = sorted({i.get("pkg") for i in issues if i.get("kind") == "kernel" and isinstance(i.get("pkg"), str)
+                   and re.fullmatch(r"[\w.+@-]+", i.get("pkg"))})
+    fixes += kernel_fixes(su, pkgs) if pkgs else []
+
+    def versions(kind):
+        return list(dict.fromkeys(k for i in issues if i.get("kind") == kind
+                                  for k in [i.get("kver")] + list(i.get("kvers") or [])
+                                  if isinstance(k, str) and re.fullmatch(r"[\w.+~-]+", k)))
+    lists = versions("depmod")
+    for kver in lists:
+        fixes.append({"key": "depmod", "label": f"собрать список модулей ядра {kver} (depmod)",
+                      "argv": [su, "depmod", kver]})
+    kvers = versions("dkms")
     nvidia = any(i.get("module") == "nvidia" for i in issues if i.get("kind") == "dkms")
     for kver in kvers:
         fixes.append({"key": "dkms", "argv": [su, "dkms", "autoinstall", "-k", kver],
                       "label": f"собрать {'драйвер NVIDIA' if nvidia else 'модули DKMS'} под ядро {kver}"})
     kinds = {i.get("kind") for i in issues}
-    if kinds & {"image", "initcpio"} or (kvers and glob.glob(os.path.join(PRESET_DIR, "*.preset"))):
+    if kinds & {"image", "initcpio"} or ((kvers or lists) and glob.glob(os.path.join(PRESET_DIR, "*.preset"))):
         fixes.append({"key": "initramfs", "label": "собрать initramfs заново (mkinitcpio -P)",
                       "argv": [su, "mkinitcpio", "-P"]})
     for f in dict.fromkeys(f for i in issues if i.get("kind") == "unsigned" for f in (i.get("files") or [])):
@@ -1865,6 +2114,36 @@ def fix_commands(res):
             fixes.append({"key": "sbctl", "label": f"подписать для Secure Boot: {f}",
                           "argv": [su, "sbctl", "sign", "-s", f]})
     return fixes
+
+
+def kernel_fixes(su, pkgs):
+    """The kernel packages installed again, exactly as they are installed: from pacman's cache when the file of the
+    installed version is there, else from the repository, but only while the repository has no newer one."""
+    installed = installed_versions()
+    cached = {p: cached_package(p, installed[p]) for p in pkgs if p in installed}
+    cached = {p: f for p, f in cached.items() if f}
+    rest = [p for p in pkgs if p not in cached]
+    if any(run(["pacman", "-Qu", p], timeout=20).strip() for p in rest):
+        return []                               # a newer kernel waits: only a whole -Syu may bring it
+    fixes = []
+    if cached:
+        fixes.append({"key": "kernel", "argv": [su, "pacman", "-U", *cached.values()],
+                      "label": f"переустановить ядро ({', '.join(cached)}) из кэша pacman: вернёт файл ядра "
+                               "и initramfs"})
+    if rest:
+        fixes.append({"key": "kernel", "argv": [su, "pacman", "-S", *rest],
+                      "label": f"переустановить ядро ({', '.join(rest)}): вернёт файл ядра и initramfs"})
+    return fixes
+
+
+def cached_package(pkg, version):
+    """The file of that package version in pacman's cache, None when it is not there."""
+    want = re.compile(re.escape(f"{pkg}-{version}-") + PKG_ARCH + r"\.pkg\.tar(?:\.\w+)?")
+    try:
+        found = sorted(n for n in os.listdir(PACMAN_CACHE) if want.fullmatch(n))
+    except OSError:
+        return None
+    return os.path.join(PACMAN_CACHE, found[-1]) if found else None
 
 
 def services_command(names):
@@ -1931,17 +2210,18 @@ def probe_targets():
     return list(dict.fromkeys(files)), list(dict.fromkeys(images))
 
 
-def recheck_boot(log, probe=None):
+def recheck_boot(log, probe=None, failed=False):
     """The problems with booting of that update as they are now (after a fix): the same look as after the update
-    (boot partitions, the kernels' boot files, DKMS, Secure Boot). What cannot be looked at now (a /boot closed to
-    the user while sudo asks for a password) stays as it was found. The update's summary follows: its problems,
-    verdict and fixes. probe: the file boot_probe_command wrote (or parse_probe's dict). Returns the problems
-    with booting, [] when there are none."""
-    data = read_json(summary_path(log))
-    old = [i for i in data.get("boot") or [] if isinstance(i, dict) and isinstance(i.get("text"), str)]
+    (boot partitions, the kernels' module lists and boot files, DKMS, Secure Boot). What cannot be looked at now
+    (a /boot closed to the user while sudo asks for a password) stays as it was found; after a fix that failed
+    (failed: its exit status was not 0, or its output said an error) so does everything found before that this
+    look does not find again. The update's summary follows: its problems, verdict and fixes. probe: the file
+    boot_probe_command wrote (or parse_probe's dict). Returns the problems with booting, [] when there are none."""
+    data = normal_summary(read_json(summary_path(log)))
+    old = [i for i in data["boot"] if isinstance(i.get("text"), str)]
     if isinstance(probe, str):
         probe = read_probe(probe)
-    issues, _, _, _ = boot_state(probe if isinstance(probe, dict) else None, earlier=old,
+    issues, _, _, _ = boot_state(probe if isinstance(probe, dict) else None, earlier=old, keep=failed,
                                  event=lambda kind, msg: journal_event(log, kind, msg))
     texts = [i["text"] for i in issues]
     gone = {i["text"] for i in old}
@@ -1949,9 +2229,10 @@ def recheck_boot(log, probe=None):
     def change(d):
         d["problems"] = [p for p in d.get("problems") or [] if p not in gone] + texts
         d.update(boot=issues, fixes=fix_commands({"boot": issues}), rechecked=now_iso())
-    if data:
+    if read_json(summary_path(log)):
         _update_summary(log, change)
-    journal_event(log, "ПЕРЕПРОВЕРКА", "; ".join(texts) or "проблем с загрузкой не нашёл")
+    journal_event(log, "ПЕРЕПРОВЕРКА", ("после неудачного исправления: " if failed else "")
+                  + ("; ".join(texts) or "проблем с загрузкой не нашёл"))
     return texts
 
 

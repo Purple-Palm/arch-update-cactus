@@ -152,23 +152,31 @@ def report_id():
     return rid if _id_ok(rid) else ""
 
 
-def ensure_id():
+_UNSAVED = None                     # an ID made for a report sent by hand, until one went out with it
+
+
+def ensure_id(save=True):
     """This machine's report ID, made now if it has none: for a report sent by hand, without switching the automatic
-    reports on or counting as the choice about them. One that cannot be saved still serves this report."""
+    reports on or counting as the choice about them. save=False: only for the report about to go (and for the next
+    one this program sends); it is saved with save=True once one went out, so that a machine nothing ever went out
+    from has none in its settings. One that cannot be saved still serves this report."""
+    global _UNSAVED
     rid = report_id()
     if rid:
         return rid
-    rid = secrets.token_hex(4)                        # random: not derived from anything on the machine
+    _UNSAVED = _UNSAVED or secrets.token_hex(4)       # random: not derived from anything on the machine
+    if not save:
+        return _UNSAVED
     try:
         with _locked():
             s = settings()
             if _id_ok(s.get("report_id")):            # made meanwhile
                 return s["report_id"]
-            s["report_id"] = rid
+            s["report_id"] = _UNSAVED
             _write_json(SETTINGS, s)
     except OSError:
         pass
-    return rid
+    return _UNSAVED
 
 
 def option(key, default=None):
@@ -260,6 +268,10 @@ UNIT_AFTER_NAME = (r"(?=(?:-|\\x2d)[\w.\\-]{0,255}\.(?:mount|automount|swap)\b"
                    r"|\.(?:mount|automount|swap|service|socket|timer|path|target)\b)")
 HOME_MOUNT = re.compile(r"(?<![\w-])((?:run-media|home)-)(?!<user>)[^\s,.@\\-]{1,64}(?:\\x2d[^\s,.@\\-]{1,64}){0,8}"
                         r"(?=(?:-|\\x2d)[\w.\\-]{0,255}\.(?:mount|automount)\b|\.(?:mount|automount)\b)")
+# Where a journal shows an account's or a machine's name whatever it is (names_in)
+OLD_USER = re.compile(r"(?i)(?:password for|пароль для) ([^\s:()@<>]{1,64}):")
+OLD_DOAS = re.compile(r"(?i)\(([^\s:()@<>]{1,64})@([^\s:()@<>]{1,253})\) password")
+OLD_HOME = re.compile(r"(?<![\w.-])/home/([^/\s'\"<>:;,()\[\]{}]{1,64})(?=/|[\s'\":;,)\]}]|$)")
 
 
 def _who():
@@ -291,18 +303,37 @@ def _who():
     return users - {""}, hosts - {""}, names - {""}, homes - {""}, machine
 
 
-def scrubber():
+def names_in(text):
+    """(user names, host names, home folders' names) a journal itself shows where only such a name can stand: in a
+    password prompt ("[sudo] password for …:", doas's "(…@…) password:"), as a home folder (/home/…/: a folder
+    such as /home/build is no name to take out of every other word). A journal kept for weeks can be from before
+    the account or the machine was renamed, and it is sent by hand that late too."""
+    users, hosts = set(OLD_USER.findall(text if isinstance(text, str) else "")), set()
+    for user, host in OLD_DOAS.findall(text if isinstance(text, str) else ""):
+        users.add(user)
+        hosts.update({host, host.split(".")[0]})
+    homes = set(OLD_HOME.findall(text if isinstance(text, str) else ""))
+
+    def real(found):
+        return {n for n in found if n and "<" not in n}
+    return real(users), real(hosts), real(homes) - real(users)
+
+
+def scrubber(extra_users=(), extra_hosts=(), extra_homes=()):
     """A function that takes everything personal out of a text (see the module's doc). What it leaves
-    it leaves again: a text scrubbed twice is the text scrubbed once."""
+    it leaves again: a text scrubbed twice is the text scrubbed once. extra_users, extra_hosts: more names to take
+    out besides this machine's own; extra_homes: names to take out only where they are a home folder or a user
+    (names_in)."""
     users, hosts, names, homes, machine = _who()
+    users, hosts = users | set(extra_users), hosts | set(extra_hosts)
     rules = [(TYPED_AHEAD, TYPED_AHEAD_SAYS)]
     for h in sorted(homes, key=len, reverse=True):            # /home/cactus/... → ~/...
         rules.append((re.compile(r"(?<![\w.-])" + re.escape(h) + r"(?![\w.-])"), "~"))
-    for u in users:
+    for u in users | set(extra_homes):
         for h in hosts:
             rules.append((re.compile(re.escape(u) + "@" + re.escape(h), re.I), "<user>@<host>"))
     # In these places a user name is one whatever it is, a common word too (see COMMON).
-    for u in sorted(users, key=len, reverse=True):
+    for u in sorted(users | set(extra_homes), key=len, reverse=True):
         rules.append((re.compile(r"(?i)(password for |пароль для |/home/|user |пользовател[ья] )" + re.escape(u)
                                  + r"(?![\w-])"), r"\1<user>"))
     # Before the e-mail rule (bob:secret@example.com is no address) and that before the names
@@ -592,8 +623,8 @@ def _cut(text):
     return text[:end], text[start:]
 
 
-def build(res, mode="auto", seconds=None, ui=None):
-    """The report of one update, with everything personal taken out."""
+def build(res, mode="auto", seconds=None, ui=None, scrub=None):
+    """The report of one update, with everything personal taken out (by scrub, scrubber()'s by default)."""
     report = {
         "schema": SCHEMA, "id": report_id(),
         "time": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -605,7 +636,7 @@ def build(res, mode="auto", seconds=None, ui=None):
                    "warnings": res.get("warnings", []), "notes": res.get("notes", []), "ok": res.get("ok", [])},
         "log": _log_text(res.get("log")),
     }
-    return clean(report, scrubber())
+    return clean(report, scrub or scrubber())
 
 
 def _prune(folder):
@@ -852,15 +883,12 @@ def preview():
 
 # ───────────────────────────── the updates kept on this machine ─────────────────────────────
 
-JOURNAL = re.compile(r"20\d\d-\d\d-\d\d_\d\d-\d\d-\d\d\.log")             # engine.RunLog's names
+JOURNAL = engine.JOURNAL_NAME                                              # engine.RunLog's names
 QUEUED = re.compile(r"\d{8}-\d{6}-[0-9a-f]{4}\.json")                     # queue()'s names
 RELAY_TIME = re.compile(r"20[2-9]\d-\d\d-\d\dT\d\d:\d\d:\d\dZ")            # what the relay takes: 2020…2099, UTC
-# The updater's own lines in a journal (RunLog.event): "[17:45:45 ПАКЕТЫ] обновлены: …". Looked for from the newline
-# before them: a pattern with a fixed start is found quickly, and a journal can be megabytes long.
-EVENT = re.compile(r"\n\[(\d\d):(\d\d):(\d\d) ([^\]\n]{1,40})\] ?([^\n]*)")
-PACMAN_PART = "\n══════ /var/log/pacman.log за это обновление ══════"    # after the updater's last lines
-WHOLE, HEAD = 4 * 2 ** 20, 2 ** 19  # bytes of a journal read whole; of a longer one (a long AUR build) its head
-                                    # and the rest of WHOLE from its end: the result follows КОНЕЦ, at the end
+# The updater's own lines in a journal, read as the engine reads them (engine.journal_events): of a very long one
+# (a long AUR build) its head and the rest of WHOLE from its end, where the result follows КОНЕЦ.
+WHOLE = engine.JOURNAL_WHOLE
 
 
 def _journals():
@@ -950,30 +978,18 @@ def _from_summary(path, began):
     return u
 
 
-def _journal_events(path):
-    """The updater's own lines in a journal, up to its pacman.log part: [(hours, minutes, seconds, kind, text)]."""
-    with open(path, "rb") as f:
-        size = os.fstat(f.fileno()).st_size
-        if size <= WHOLE:
-            data = f.read()
-        else:
-            data = f.read(HEAD)
-            f.seek(size - (WHOLE - HEAD))
-            data += b"\n" + f.read()
-    text = data.decode("utf-8", "replace")
-    end = text.find(PACMAN_PART)
-    return EVENT.findall("\n" + (text if end == -1 else text[:end]))
-
-
 def _from_journal(path, began):
     """What a journal says of its update in the updater's own lines, the same in the journals of every version: the
     mode (СТАРТ), the exit code (КОНЕЦ), a run that never started (НЕ НАЧАТО), then the checks (ПАКЕТЫ, ПРОБЛЕМА,
-    ВНИМАНИЕ, as system_checks writes them). No checks, no verdict: the update was cut off."""
+    ВНИМАНИЕ, as system_checks writes them), and a fix that went through afterwards (ИСПРАВЛЕНО, for one whose summary
+    could not be written). No checks, no verdict: the update was cut off."""
     u = _blank(began)
     try:
-        events = _journal_events(path)
+        text = engine.journal_text(path)
     except OSError:
         return u
+    events = engine.journal_events(path, text)
+    u["resolved"] = bool(engine.RESOLVED_LINE.search(text))
     checked = False
     day, last = began.date(), began.hour * 3600 + began.minute * 60 + began.second
     for hh, mm, ss, kind, text in events:
@@ -1035,6 +1051,7 @@ def local_updates(n=SHOWN):
     names = _journals()
     names = names[:n] if n is None or n > 0 else []
     records = _records()
+    auto = _auto_reports(records)
     out = []
     for name in names:
         path = os.path.join(LOGS, name)
@@ -1043,7 +1060,7 @@ def local_updates(n=SHOWN):
         except Exception:                           # one journal the list cannot read is listed all the same
             u = dict(_blank(_stamp(name)), seconds=None)
         rec = records.get(name, {})
-        sent, queued = _str(rec.get("sent")), _str(rec.get("queued"))
+        sent, waiting = _sent_of(rec, auto.get(name, []))
         out.append({
             "log": path, "time": u["began"].isoformat(timespec="seconds"),
             "ended": u["ended"].isoformat(timespec="seconds") if u["ended"] else "",
@@ -1051,27 +1068,102 @@ def local_updates(n=SHOWN):
             "packages": len(u["changed"]) + len(u["added"]) + len(u["removed"]),
             "changed": u["changed"], "added": u["added"], "removed": u["removed"], "problems": u["problems"],
             "warnings": u["warnings"], "notes": u["notes"], "ok": u["ok"], "resolved": u["resolved"],
-            "seconds": u["seconds"], "sent": sent, "issue": _issue_of(rec),
-            "waiting": not sent and bool(QUEUED.fullmatch(queued)) and os.path.exists(os.path.join(OUTBOX, queued)),
+            "seconds": u["seconds"], "sent": sent, "issue": _issue_of(rec), "waiting": waiting,
         })
     return out
 
 
+def _sent_of(rec, reports):
+    """(when its report went out, "" if never; whether its automatic report still waits) of one update: its record,
+    or its automatic report in sent/ or the outbox (one the version before this one sent, which kept no record)."""
+    sent = _str(rec.get("sent"))
+    if not sent:
+        for folder, q in reports:
+            if folder == SENT:
+                try:
+                    sent = datetime.datetime.fromtimestamp(os.path.getmtime(os.path.join(SENT, q))).isoformat(
+                        timespec="seconds")
+                    break
+                except (OSError, ValueError, OverflowError):
+                    pass
+    return sent, not sent and any(folder == OUTBOX for folder, _ in reports)
+
+
+def report_state(log):
+    """{"sent", "issue", "waiting"} of one update's report, as local_updates says them: for the menu's warning."""
+    name = os.path.basename(_journal(log) or "")
+    rec = _records().get(name, {}) if name else {}
+    sent, waiting = _sent_of(rec, _auto_reports().get(name, [])) if name else ("", False)
+    return {"sent": sent, "issue": _issue_of(rec), "waiting": waiting}
+
+
+def _queued_at(name):
+    """When queue() queued a report, from its name (local time); None for another name."""
+    try:
+        return datetime.datetime.strptime(name[:15], "%Y%m%d-%H%M%S") if QUEUED.fullmatch(name) else None
+    except ValueError:
+        return None
+
+
+def _auto_reports(records=None):
+    """The automatic reports kept on this machine, waiting, sent or refused, by the journal of their update:
+    {journal's name: [(folder, report's name)]}. after_update links the two in manual.json; a report from before
+    there were records (it was queued as its update ended) is the newest journal's that began before it, within a
+    day."""
+    records = _records() if records is None else records
+    linked = {_str(r.get("queued")): name for name, r in records.items() if _str(r.get("queued"))}
+    starts = sorted((_stamp(n), n) for n in _journals())
+    out = {}
+    for folder in (OUTBOX, SENT, REJECTED):
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for q in sorted(names):
+            at = _queued_at(q)
+            if at is None:
+                continue
+            owner = linked.get(q)
+            if owner is None:
+                before = [n for began, n in starts if began <= at]
+                owner = before[-1] if before and at - _stamp(before[-1]) <= datetime.timedelta(days=1) else None
+            if owner:
+                out.setdefault(owner, []).append((folder, q))
+    return out
+
+
+def _report_time(name):
+    """The time the relay knows this update's report by, if one of its reports went out already (or is on its way):
+    from its record, else from its automatic report itself. None when there is none."""
+    known = _records().get(name, {}).get("time")
+    if isinstance(known, str) and RELAY_TIME.fullmatch(known):
+        return known
+    for folder, q in _auto_reports().get(name, []):
+        t = _read_json(os.path.join(folder, q)).get("time")
+        if isinstance(t, str) and RELAY_TIME.fullmatch(t):
+            return t
+    return None
+
+
 def build_from_log(log, ui=None):
     """The report of one update kept on this machine, put together now from its summary or its journal, everything
-    personal taken out as build() does. Its time is the update's own, when it ended, or the one its report had
-    already: the same update sent again is the same report to the relay, which files no second issue for it. The
-    machine and the updater are described as they are now, and the log says so at its top."""
+    personal taken out as build() does, the names the journal itself shows too (an account or a machine renamed
+    since). Its time is the update's own, when it ended, or the one its report had already: the same update sent
+    again is the same report to the relay, which files no second issue for it. The machine and the updater are
+    described as they are now, and the log says so at its top."""
     u = _update_of(log)
     res = {k: u[k] for k in ("verdict", "started", "exitstatus", "changed", "added", "removed", "problems",
                              "warnings", "notes", "ok")}
     res["log"] = log
-    report = build(res, mode=u["mode"], seconds=u["seconds"], ui=ui)
+    try:
+        with open(log, encoding="utf-8", errors="replace") as f:
+            users, hosts, homes = names_in(f.read())
+    except (OSError, TypeError):
+        users, hosts, homes = set(), set(), set()
+    report = build(res, mode=u["mode"], seconds=u["seconds"], ui=ui, scrub=scrubber(users, hosts, homes))
     if u["mode"] is None and not SWITCHED_TO_MANUAL.search(report["log"]):
         report["log"] = hide_typed_ahead(report["log"])      # no telling how it ran: as if by hand (see clean)
-    known = _records().get(os.path.basename(_journal(log) or ""), {}).get("time")
-    report["time"] = known if isinstance(known, str) and RELAY_TIME.fullmatch(known) else \
-        _relay_time(u["ended"] or u["began"])
+    report["time"] = _report_time(os.path.basename(_journal(log) or "")) or _relay_time(u["ended"] or u["began"])
     report["log"] = (f"[отчёт отправлен вручную {datetime.datetime.now():%d.%m.%Y %H:%M}; устройство и версия "
                      "апдейтера в нём — на это время]\n" + report["log"])
     return report
@@ -1080,8 +1172,9 @@ def build_from_log(log, ui=None):
 def send_now(log, timeout=20, ui=None):
     """The report of one update kept on this machine, sent now because the user asked for it (a key on the summary
     or in the list of the last updates): that key is the consent for this one report, with the automatic reports
-    off too, and switches nothing on. A machine without a report ID gets one. Allowed again for a report that went
-    out already. Returns (sent, what to tell the user, the issue's number or None); never raises."""
+    off too, and switches nothing on. A machine without a report ID gets one, once the report went out. Allowed
+    again for a report that went out already. Returns (sent, what to tell the user, the issue's number or None);
+    never raises."""
     try:
         return _send_now(log, timeout, ui)
     except Exception:
@@ -1097,22 +1190,24 @@ def _send_now(log, timeout, ui):
     url = endpoint()
     if not url:
         return False, "сервер для отчётов не подключён", None
-    rid = ensure_id()
+    rid = ensure_id(save=False)                      # saved once the report went out with it
     report = build_from_log(path, ui=ui)
-    report["id"] = report["id"] or rid               # one that could not be saved serves this report
+    report["id"] = report["id"] or rid
     try:
         code, answer = _post(url, report, timeout, _agent())
     except (OSError, ValueError, http.client.HTTPException):         # offline, DNS, TLS, a garbled answer
         return False, "нет связи с сервером — попробуй позже", None
     if 200 <= code < 300:
+        if report["id"] == rid:
+            ensure_id(save=True)
         name = os.path.basename(path)
         rec = _records().get(name, {})
         again = answer.get("duplicate") is True                       # the relay has this report already
         issue = _issue_of(answer) or _issue_of(rec)                   # the same time: the same log, the same issue
         _record(name, sent=_now(), issue=issue, time=report["time"])
-        queued = _str(rec.get("queued"))
-        if QUEUED.fullmatch(queued):
-            _remove(os.path.join(OUTBOX, queued))    # this update's automatic report, still waiting: it went out now
+        for folder, q in _auto_reports().get(name, []):
+            if folder == OUTBOX:
+                _remove(os.path.join(OUTBOX, q))     # this update's automatic report, still waiting: it went out now
         number = f" (№ {issue})" if issue else ""
         return True, (f"этот отчёт уже у разработчика{number}" if again else
                       f"отчёт отправлен разработчику{number}"), issue
@@ -1127,12 +1222,18 @@ def _send_now(log, timeout, ui):
 
 def delete_local(log):
     """One update deleted from this machine: its journal (.log, .raw), its summary (.json), its record and its
-    automatic report if that still waits to be sent. Only an update in logs/, and not the one running now: anything
+    automatic report wherever that is (waiting, sent or refused: «Что именно уходит» shows it no more). Only an
+    update in logs/, not the one running now, and not the one the menu warns about (engine.unresolved: it found
+    problems in this boot, nothing has fixed them — without it the menu would stop saying not to reboot): anything
     else is refused (False). True once all of it is gone; never raises."""
     try:
         path = _journal(log)
         if not path or (engine.RUNNING and engine.LOG and os.path.realpath(engine.LOG.path) == os.path.realpath(path)):
             return False
+        if is_unresolved(path):
+            return False
+        name = os.path.basename(path)
+        reports = _auto_reports().get(name, [])
         gone = True
         for f in (path, path[:-4] + ".raw", path[:-4] + ".json"):
             try:
@@ -1141,15 +1242,22 @@ def delete_local(log):
                 pass
             except OSError:
                 gone = False
-        name = os.path.basename(path)
-        queued = _str(_records().get(name, {}).get("queued"))
-        if QUEUED.fullmatch(queued):
-            _remove(os.path.join(OUTBOX, queued))
+        for folder, q in reports:
+            _remove(os.path.join(folder, q))
         _record(name, forget=True)
         _point_latest()
         return gone
     except Exception:
         return False
+
+
+def is_unresolved(log):
+    """The update of that journal is the one the menu warns about: it found problems in this boot, unfixed."""
+    try:
+        bad = engine.unresolved(LOGS)
+        return bool(bad) and os.path.realpath(bad["log"]) == os.path.realpath(log)
+    except Exception:                               # no telling: better kept than the warning lost
+        return True
 
 
 def _point_latest():
@@ -1220,7 +1328,7 @@ def _when(iso, year=True):
 def _verdict_words(u):
     if not u["started"]:
         return ("✗ " if u["verdict"] == 2 else "· ") + "не начиналось"
-    if u["verdict"] == 2 and u["resolved"]:
+    if u["resolved"]:                               # it found problems, and a fix and a second look ended them
         return "✓ исправлено"
     return {0: "✓ всё чисто", 1: "⚠ есть что прочитать", 2: "✗ нужна проверка"}.get(u["verdict"], "· без итога")
 
