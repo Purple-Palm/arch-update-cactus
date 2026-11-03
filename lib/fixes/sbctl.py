@@ -1,8 +1,9 @@
-"""«Подписать для Secure Boot»: a boot file sbctl says is not signed (the firmware would refuse it). sbctl sign
--s <file> (signed, and kept in sbctl's list so its pacman hook signs it again on the next update). Kept first:
-the file and sbctl's list of files; put back if sbctl fails or still calls the file unsigned."""
+"""«Подписать для Secure Boot»: boot files sbctl says are not signed (the firmware would refuse them). One fix for
+all of them: sbctl sign -s <file> for each (signed, and kept in sbctl's list so its pacman hook signs it again on
+the next update). Kept first: the files and sbctl's list of files; put back if sbctl fails or still calls a file
+unsigned."""
 
-from fixes import path_ok, fix
+from fixes import path_ok, fix, _quote
 
 KEY = "sbctl"
 DBS = ("/var/lib/sbctl/files.json", "/usr/share/secureboot/files.json")
@@ -10,7 +11,11 @@ DBS = ("/var/lib/sbctl/files.json", "/usr/share/secureboot/files.json")
 
 def plan(ctx):
     files = [f for f in dict.fromkeys(f for i in ctx.of("unsigned") for f in i.get("files") or []) if path_ok(f)]
-    return [fix(KEY, f"подписать для Secure Boot: {f}", [ctx.su, "sbctl", "sign", "-s", f], [f]) for f in files]
+    if not files:
+        return []
+    shown = ", ".join(files[:2]) + (f" и ещё {len(files) - 2}" if len(files) > 2 else "")
+    return [fix(KEY, f"подписать {shown} для Secure Boot", [ctx.su, "sbctl", "sign", "-s", files[0]], files,
+                how=" && ".join(f"{ctx.su} sbctl sign -s {_quote(f)}" for f in files))]
 
 
 SCRIPT = r"""

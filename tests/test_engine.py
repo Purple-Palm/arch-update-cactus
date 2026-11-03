@@ -474,7 +474,7 @@ class Machine(Patching):
         r = self.checks()
         self.assertTrue(any("собран не под ядро" in p and image in p for p in r["problems"]), r["problems"])
         self.assertEqual(self.fix_keys(r), ["initramfs"])
-        self.assertEqual(r["fixes"][0]["argv"], ["sudo", "mkinitcpio", "-P"])
+        self.assertEqual(r["fixes"][0]["argv"], ["sudo", "mkinitcpio", "-p", "linux"])
 
     def test_missing_kernel_file_is_a_problem_with_a_fix(self):
         image = self.boot_file("initramfs-linux.img", mode=0o000)
@@ -483,9 +483,10 @@ class Machine(Patching):
         self.assertTrue(any("НЕ перезагружайся" in p and "/gone" in p for p in r["problems"]), r["problems"])
         self.assertEqual([(f["key"], f["argv"], f["label"]) for f in r["fixes"]],
                          [("kernel", ["sudo", "pacman", "-S", "linux"],
-                           "переустановить ядро (linux): вернёт файл ядра и initramfs")])
-        # the runner keeps the kernel's boot files and checks them after pacman
-        self.assertEqual(r["fixes"][0]["args"], ["r:linux", f"k:{self.tmp}/gone", f"i:{KVER}:1:{image}"])
+                           "переустановить ядро linux (вернёт файл ядра и initramfs)")])
+        # the runner keeps the kernel's boot files and checks them after pacman (and reads pacman's log of it)
+        self.assertEqual(r["fixes"][0]["args"], ["r:linux", f"g:{engine.PACMAN_LOG}", f"k:{self.tmp}/gone",
+                                                 f"i:{KVER}:1:{image}"])
 
     def test_the_kernel_comes_back_as_it_was_installed(self):
         image = self.boot_file("initramfs-linux.img", mode=0o000)

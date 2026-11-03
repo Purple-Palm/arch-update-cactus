@@ -4,8 +4,9 @@ full disk: "depmod: FATAL … No space left on device", the Chromebook that did 
 initramfs and nothing finds the kernel's modules: the machine does not boot.
 
 Kept first: the kernel's module lists (modules.dep, .alias, .symbols … and their .bin) and /etc/ld.so.cache;
-put back if depmod or ldconfig fails or a list is still missing after them. The initramfs fix runs after this
-one: an image built without the lists has no modules."""
+put back if depmod or ldconfig fails or a list is still missing after them. The lists come out readable for all,
+as pacman's own depmod writes them (the runner's apply runs with umask 022): modinfo and lspci -k as a user look
+modules up in them. The initramfs fix runs after this one: an image built without the lists has no modules."""
 
 import engine
 from fixes import KVER, fix
