@@ -2441,14 +2441,17 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
 
 def fix_commands(res):
     """What can be done about the problems a result (or a summary read back) holds, in the order to run them: the
-    fixes catalogue (lib/fixes, one module per fix) planned for it, [{"key", "label", "argv", "how", "args"}]:
+    fixes catalogue (lib/fixes, one module per fix) planned for it, [{"key", "id", "label", "argv", "how", "args"}]
+    (id: the key, or "<key>@<kernel package>" for a fix of one kernel: one kernel's fix that is not done holds up
+    only that kernel's later fixes):
       space      the disk too full for the update, or full during it
-      mount      an fstab boot partition that is not mounted
+      mount      the fstab boot partitions that are not mounted
       depmod     a kernel's module list not written, or depmod failed (a full disk); ldconfig with it
-      kernel     a kernel file missing or empty: that very version of the kernel package again
-      dkms       a DKMS module not built for a kernel
-      initramfs  an initramfs (or UKI) missing, empty or broken, mkinitcpio failed, or after depmod / DKMS
-      sbctl      a boot file not signed for Secure Boot
+      kernel     a kernel file missing or empty: that very version of the kernel package again (per kernel)
+      dkms       a DKMS module not built for a kernel (per kernel)
+      initramfs  an initramfs (or UKI) missing, empty or broken, mkinitcpio failed, or after depmod / DKMS (per
+                 kernel, only the kernels concerned)
+      sbctl      the boot files not signed for Secure Boot
     Each one backs up what it changes, checks what it made and puts everything back when that is not right
     (see lib/fixes). [] when there is nothing to do this way. They ask for the password: run them in a terminal
     (fixes_command)."""

@@ -2750,38 +2750,38 @@ def restart_services(app, res, argv):
 FREE_HINT = "освободи место (например: sudo pacman -Sc) и нажми F ещё раз"
 # The status line after F, by what came of the fixes (fixes.outcome): short, it has a row of its own.
 FIX_SAYS = {"rolledback": "не помогло, всё вернул как было", "nothing": "ничего не менял",
-            "error": "закончилось с ошибкой", "notenough": "место освободил, но его всё ещё мало",
+            "error": "закончилось с ошибкой", "notenough": "места на диске всё ещё мало",
             "rollbackfailed": "вернуть как было не удалось — копии в /tmp", "seen": "в выводе была ошибка",
-            "stopped": "сделано не всё"}
+            "stopped": "сделано не всё", "incomplete": "ядро на месте, но сборка закончилась с ошибкой"}
+# What in a fix's output says a file system ran full: pacman says only "Write failed" then (engine.UNWRITTEN).
+DISK_SAYS = {"No space left on device", engine.UNWRITTEN["could not extract"]}
+# A problem text that already says to update again: "Осталось: …" adds no second "запусти обновление ещё раз".
+AGAIN = re.compile(r"(?:обнови|обновись|запусти обновление) (?:ещё|снова)[^.]*\.?$")
 
 
 def low_space():
-    """What the fixes would run out of: "/" with less than 200 MiB free, /boot with less than 64 MiB (mkinitcpio and
-    depmod write there). "" when there is room, or no telling."""
+    """What the fixes would run out of: (where, free MiB) for "/" with less than 200 MiB free, or /boot with less than
+    64 MiB (mkinitcpio writes there); None when there is room, or no telling. /boot only when it is a file system of
+    its own (else "/" says it)."""
     for path, least in (("/", 200), ("/boot", 64)):
+        if path == "/boot" and not own_file_system(path):
+            continue
         free = engine.free_mib(path)
         if free is not None and free < least:
-            return f"на диске {path} свободно всего {free} МБ"
-    return ""
+            return path, free
+    return None
 
 
-def fix_problems(app, res, plan):
-    """F: the fixes the catalogue has for what the update left (engine.fix_commands, lib/fixes), in order, in the
-    plain terminal, each one with its copies first, its check after and everything put back when it did not work;
-    then a fresh look at the boot files (engine.recheck_boot, with what the probe right after the fixes saw as
-    root). A fix that was not done (put back, or its output said an error) fixed nothing: what was found stays,
-    whatever the look says now, and the menu goes on warning. Only when every fix was done and checked and nothing
-    is wrong any more is the update marked fixed (engine.mark_resolved; a problem that is not about booting, a
-    pacman lock left behind, keeps the warning). Whatever else came of it, a problem with booting still there is
-    said first, in red, with НЕ перезагружайся. Returns what came of it: (text, colour); res follows the update's
-    summary."""
-    log = res.get("log")
+def own_file_system(path):
     try:
-        fd, out = tempfile.mkstemp(prefix="arch-update-probe-")     # 0600: this user's only
-        os.close(fd)
+        return os.stat(path).st_dev != os.stat("/").st_dev
     except OSError:
-        out = None
-    result = fixes.result_file()
+        return False
+
+
+def fix_intro(plan, res):
+    """What the plain terminal says before the fixes run: each one with its line by hand, what it keeps and asks,
+    and a warning when the disk is already too full for them."""
     keys = [f.get("key") for f in plan]
     intro = [("[Arch-Update] Исправляю" + (", по порядку:" if len(plan) > 1 else ":"), None, True)]
     for i, fix in enumerate(plan, 1):
@@ -2796,26 +2796,203 @@ def fix_problems(app, res, plan):
     asks = "sudo спросит пароль, если нужно" + ("; pacman спросит, прежде чем что-то менять"
                                                 if "kernel" in keys else "")
     intro.append((asks + ".", DIM, False))
-    space = low_space() or ("на диске кончалось место" if engine.DISK_FULL in strs(res.get("problems")) else "")
-    if space and "space" not in keys:
-        intro.append((f"{space[:1].upper()}{space[1:]}: сначала освободи место (например: sudo pacman -Sc), "
-                      "иначе исправление не пройдёт.", WARN, True))
-    status, seen = run_in_terminal(app, engine.fixes_command(plan, out or os.devnull, result), intro)
-    results = fixes.read_results(result) if result else None       # no file for them: the exit status tells
-    kind, how = fixes.outcome(status, results, plan)
-    states = dict(results or [])
+    low = low_space()
+    if low and low[0] == "/boot":
+        intro.append((f"На /boot свободно всего {low[1]} МБ: новый initramfs может туда не поместиться — тогда F "
+                      "вернёт всё как было.", WARN, True))
+    elif "space" not in keys and (low or engine.DISK_FULL in strs(res.get("problems"))):
+        said = f"На диске свободно всего {low[1]} МБ" if low else "На диске кончалось место"
+        intro.append((f"{said}: сначала освободи место (например: sudo pacman -Sc), иначе исправление может не "
+                      "пройти.", WARN, True))
+    return intro
+
+
+def fix_result(kind, how, states, keys, left, rest, seen=(), made=(), kept=None, full=(), auto_report=False):
+    """What F says it came to, under the fixes' output (lines: [(text, colour, bold)]) and in the status line (text,
+    colour). kind, how: fixes.outcome; states {id: state}; keys: the keys of the fixes planned; left: the problems
+    with booting the look after them found (None: it could not look); rest: the update's other problems; seen: the
+    failure markers in their output; made: the fixes done (fixes.done); kept: the folder of the copies a failed
+    rollback left; full: the file systems that ran out of room; auto_report: what came of it goes to the developer
+    by itself (report.follow_up_due). A problem with booting still there comes first, in red, with НЕ
+    перезагружайся; so does every fix that was not done (it may have left what no look can see)."""
+    seen = set(seen or ())
     failed = kind != "ok" or bool(seen)
     if kind == "ok" and seen:                   # done and checked, but something in its output said an error
         how = "в выводе " + ", ".join(f"«{m}»" for m in sorted(seen)[:2])
     short = FIX_SAYS.get(kind if kind != "ok" else "seen", how)
-    engine.journal_event(log, "ИСПРАВЛЕНИЕ", "по клавише F: " + fixes.journal_text(status, results or [], plan)
+    only_space = set(keys) == {"space"}
+    other = [m for m in full or () if m != "/"]
+    if other:                                   # pacman -Sc frees nothing there (/boot: an ESP of its own)
+        hint = (f"На {other[0]} не хватило места: освободи там место (что его занимает: sudo du -sh {other[0]}/*) "
+                "и нажми F ещё раз.")
+    elif full or seen & DISK_SAYS:
+        hint = "На диске нет места: " + FREE_HINT + "."
+    else:
+        hint = ""
+    did = [("Сделано: " + ", ".join(made) + ".", None, False)] if made and failed else []
+    # "Исправление не прошло: …", but no second colon: a text that names the fix not begun or the kernel back in
+    # place says it alone, and one that names what was done needs no line of its own for it
+    if kind == "stopped":
+        said, did = how[:1].upper() + how[1:], []
+    elif kind in ("nothing", "incomplete") and how.startswith("«"):
+        said = how
+    else:
+        said = "Исправление не прошло: " + how
+    report = ("Отчёт об этом уйдёт разработчику сам." if auto_report else
+              "Отправь отчёт (S): по нему будет видно, что случилось.")
+    if left is None:
+        text = "не удалось проверить — НЕ перезагружайся, сначала: sudo ls -l /boot"
+        return text, BAD, [("✗ " + text, BAD, True)]
+    still = [("✗ Всё ещё: " + short_problem(p), BAD, False) for p in left]
+    if kind == "rollbackfailed":
+        text = f"НЕ перезагружайся: вернуть как было не удалось — копии в {kept or '/tmp'}"
+        lines = [("✗ " + said + ".", BAD, True)] + did + still + \
+            [("Как вернуть копии на место вручную, написано выше (строки «sudo cp …»).", None, False),
+             (report, WARN, False)]
+        return text, BAD, lines
+    if left:                                    # a problem with booting is still there: that first, in red
+        more = f" (и ещё {len(left) - 1})" if len(left) > 1 else ""
+        text = f"НЕ перезагружайся: всё ещё {short_problem(left[0])}{more}"
+        lines = ([("✗ " + said + ".", BAD, True)] if failed else []) + did + still + \
+            [("НЕ перезагружайся, пока это не исправлено.", BAD, True)]
+        if kind == "incomplete":
+            lines.append(("Файл ядра оставил на месте: без него система не загрузится точно.", None, False))
+        if kind == "notenough":
+            lines.append(("Места не хватило даже для исправлений — что ещё занимает место, написано выше.",
+                          WARN, False))
+        if hint:
+            lines.append((hint, WARN, True))
+        return text, BAD, lines
+    if kind == "notenough":
+        return short, WARN, [("! Места на диске всё ещё мало — что ещё занимает место, написано выше.", WARN, True)]
+    if failed and only_space:
+        return f"место освободить не вышло: {how}", WARN, [("! Место освободить не вышло: " + how + ".", WARN, True)]
+    if failed:
+        lines = [("✗ " + said + ". НЕ перезагружайся.", BAD, True)] + did
+        if kind == "incomplete":
+            lines.append(("Файл ядра оставил на месте: без него система не загрузится точно.", None, False))
+        if hint:
+            lines.append((hint, WARN, True))
+        return f"НЕ перезагружайся: исправление не прошло — {short}", BAD, lines
+    if only_space:
+        text, colour = "место освобождено — запусти обновление ещё раз", GOOD
+        lines = [("✓ Место освобождено. Запусти обновление ещё раз.", GOOD, True)]
+    elif rest:
+        p = short_problem(rest[0])
+        text, colour = f"с загрузкой всё в порядке; осталось: {p}", WARN
+        lines = [("✓ С загрузкой всё в порядке.", GOOD, True),
+                 (f"Осталось: {p.rstrip('.')}. Если обновление пройдёт чисто, предупреждение уйдёт." if AGAIN.search(p)
+                  else f"Осталось: {p} — запусти обновление ещё раз: если оно пройдёт чисто, предупреждение уйдёт.",
+                  WARN, False)]
+    else:
+        text = "исправлено: проблем с загрузкой больше не нашёл"
+        lines, colour = [("✓ Проблем с загрузкой больше не нашёл.", GOOD, True)], GOOD
+    if "partial" in states.values():            # room for the fixes, not yet for the update
+        lines.append(("Для обновления места ещё мало — освободи его, прежде чем обновляться (F в итоге "
+                      "обновления сделает это снова).", WARN, False))
+        if colour == GOOD:
+            text, colour = text + "; для обновления места ещё мало", WARN
+    return text, colour, lines
+
+
+def check_fix_results():
+    """For the self-test: what F says for every way a run of the fixes can end. Red with НЕ перезагружайся whenever
+    a problem with booting is left, or a fix was not done; never green then; the copies' folder, what was done and
+    the way of the report said where they apply. Raises RuntimeError on the first that is not so."""
+    boot = "в /boot/initramfs-linux.img нет модулей ядра 7.2 — НЕ перезагружайся (сначала: sudo mkinitcpio -P)"
+    full = engine.DISK_FULL
+    cases = [  # (fix_result's arguments, colour, words the status or the lines must have, words they must not)
+        (("ok", "исправлено и проверено", {"initramfs@linux": "ok"}, ["initramfs"], [], []), GOOD,
+         ["больше не нашёл"], ["НЕ перезагружайся"]),
+        (("ok", "исправлено и проверено", {"initramfs@linux": "ok"}, ["initramfs"], [], [],
+          {"errors were encountered during the build"}), BAD, ["НЕ перезагружайся", "в выводе"], []),
+        (("rolledback", "«x» не помогло — вернул всё как было", {"initramfs@linux": "rolledback"}, ["initramfs"],
+          [boot], []), BAD, ["НЕ перезагружайся", "Всё ещё", "не помогло"], ["Всё, что оно меняло"]),
+        (("rolledback", "«x» не помогло — вернул всё как было", {"initramfs@linux": "rolledback"}, ["initramfs"],
+          [], []), BAD, ["НЕ перезагружайся"], []),
+        (("rollbackfailed", "«x» не помогло, и вернуть как было удалось не всё — копии в /tmp/arch-update-fix.AbCd1234",
+          {"initramfs@linux": "rollbackfailed"}, ["initramfs"], [boot], [], (), [], "/tmp/arch-update-fix.AbCd1234"),
+         BAD, ["НЕ перезагружайся", "/tmp/arch-update-fix.AbCd1234", "sudo cp", "Отправь отчёт (S)"], []),
+        (("rollbackfailed", "«x» не помогло", {"sbctl": "rollbackfailed"}, ["sbctl"], [], [], (), [], None, (), True),
+         BAD, ["НЕ перезагружайся", "уйдёт разработчику сам"], ["Отправь отчёт"]),
+        (("incomplete", "«x»: файл ядра на месте, но mkinitcpio сообщил об ошибках", {"kernel@linux": "incomplete"},
+          ["kernel"], [], []), BAD, ["НЕ перезагружайся", "Файл ядра оставил"], []),
+        (("incomplete", "«x»: файл ядра на месте, но mkinitcpio сообщил об ошибках", {"kernel@linux": "incomplete"},
+          ["kernel"], ["mkinitcpio собрал initramfs с ошибками — НЕ перезагружайся"], []), BAD,
+         ["НЕ перезагружайся", "Всё ещё: mkinitcpio"], []),
+        (("notenough", "места на диске всё ещё мало", {"space": "notenough", "depmod": "skipped"}, ["space", "depmod"],
+          [boot], [full]), BAD, ["НЕ перезагружайся", "Места не хватило"], ["Место освободил"]),
+        (("notenough", "места на диске всё ещё мало", {"space": "notenough"}, ["space"], [], []), WARN,
+         ["места на диске всё ещё мало"], ["освободил", "НЕ перезагружайся"]),
+        (("ok", "исправлено и проверено", {"space": "ok"}, ["space"], [], []), GOOD, ["место освобождено"], []),
+        (("ok", "исправлено и проверено; для обновления места ещё мало", {"space": "partial", "depmod": "ok"},
+          ["space", "depmod"], [], []), WARN, ["места ещё мало"], ["НЕ перезагружайся"]),
+        (("ok", "исправлено и проверено", {"depmod": "ok"}, ["depmod"], [], [full]), WARN,
+         ["С загрузкой всё в порядке", "Если обновление пройдёт чисто"], ["запусти обновление ещё раз"]),
+        (("ok", "исправлено и проверено", {"depmod": "ok"}, ["depmod"], None, []), BAD, ["НЕ перезагружайся"], []),
+        (("rolledback", "«x» не помогло: на /boot не хватило места — вернул всё как было",
+          {"initramfs@linux": "rolledback"}, ["initramfs"], [boot], [], {"No space left on device"}, [], None,
+          ["/boot"]), BAD, ["НЕ перезагружайся", "На /boot не хватило места", "sudo du -sh /boot/*"], ["pacman -Sc"]),
+        (("rolledback", "«x» не помогло — вернул всё как было", {"depmod": "rolledback"}, ["depmod"], [boot], [],
+          {engine.UNWRITTEN["could not extract"]}), BAD, ["На диске нет места", "pacman -Sc"], []),
+        (("rolledback", "«y» не помогло — вернул всё как было",
+          {"initramfs@linux": "ok", "initramfs@linux-lts": "rolledback"}, ["initramfs", "initramfs"], [boot], [], (),
+          ["собрать заново initramfs ядра linux (mkinitcpio)"]), BAD,
+         ["НЕ перезагружайся", "Сделано: собрать заново initramfs ядра linux"], []),
+        (("nothing", "«смонтировать /boot» не начато: сейчас работает pacman — подожди, пока он закончит, и нажми F "
+                     "ещё раз", {"mount": "refused"}, ["mount"], ["/boot не смонтирован — НЕ перезагружайся"], []),
+         BAD, ["НЕ перезагружайся", "работает pacman"], [": не начал:"]),
+        (("nothing", "не начато (код 1: пароль не принят или отменён?)", {}, ["mount"],
+          ["/boot не смонтирован — НЕ перезагружайся"], []), BAD,
+         ["НЕ перезагружайся", "Исправление не прошло: не начато (код 1"], []),
+        (("stopped", "сделано: смонтировать /boot; «собрать заново initramfs ядра linux (mkinitcpio)» не начато: "
+                     "сейчас работает pacman — подожди, пока он закончит, и нажми F ещё раз",
+          {"mount": "ok", "initramfs@linux": "refused"}, ["mount", "initramfs"], [boot], [], (), ["смонтировать /boot"]),
+         BAD, ["НЕ перезагружайся", "Сделано: смонтировать /boot; «собрать"], ["Исправление не прошло: сделано"]),
+    ]
+    for args, colour, must, never in cases:
+        text, got, lines = fix_result(*args)
+        said = "\n".join([text] + [t for t, _, _ in lines])
+        if got != colour or not all(w in said for w in must) or any(w in said for w in never):
+            raise RuntimeError(f"F's result for {args[0]} ({args[1][:40]}…) says: {said!r}")
+        if "НЕ перезагружайся" in said and got == GOOD:
+            raise RuntimeError(f"F's result is green and says НЕ перезагружайся: {said!r}")
+
+
+def fix_problems(app, res, plan):
+    """F: the fixes the catalogue has for what the update left (engine.fix_commands, lib/fixes), in order, in the
+    plain terminal, each one with its copies first, its check after and everything put back when it did not work;
+    then a fresh look at the boot files (engine.recheck_boot, with what the probe right after the fixes saw as
+    root). A fix that was not done (put back, or its output said an error) fixed nothing: what was found stays,
+    whatever the look says now, and the menu goes on warning. Only when every fix was done and checked and nothing
+    is wrong any more is the update marked fixed (engine.mark_resolved; a problem that is not about booting, a
+    pacman lock left behind, keeps the warning). What it came to: fix_result. Returns (text, colour); res follows
+    the update's summary."""
+    log = res.get("log")
+    try:
+        fd, out = tempfile.mkstemp(prefix="arch-update-probe-")     # 0600: this user's only
+        os.close(fd)
+    except OSError:
+        out = None
+    result = fixes.result_file()
+    keys = [f.get("key") for f in plan]
+    status, seen = run_in_terminal(app, engine.fixes_command(plan, out or os.devnull, result), fix_intro(plan, res))
+    results = fixes.read_results(result) if result else None       # no file for them: the exit status tells
+    kind, how = fixes.outcome(status, results, plan)
+    states = dict(results or [])
+    seen = set(seen or ())
+    failed = kind != "ok" or bool(seen)
+    engine.journal_event(log, "ИСПРАВЛЕНИЕ", "по клавише F: " + fixes.journal_text(status, results, plan)
                          + "".join(f", в выводе «{m}»" for m in sorted(seen)[:2]))
-    if states.get("space") == "ok" or (results is None and kind == "ok" and "space" in keys):
+    if states.get("space") == "ok" or (not results and kind == "ok" and "space" in keys):
         engine.space_freed(log)
     say_plain(app.s, "\nПроверяю файлы загрузки ещё раз…", DIM)
     old = {i.get("text") for i in res.get("boot") or [] if isinstance(i, dict)}
+    # What a fix that stayed said of the initramfs (a kernel back in place whose mkinitcpio reported errors: it is
+    # not put back) is a problem with booting of its own; what a fix that was put back said is gone with it.
+    kept_said = seen if "incomplete" in states.values() else ()
     try:
-        left = engine.recheck_boot(log, probe=out, failed=failed)
+        left = engine.recheck_boot(log, probe=out, failed=failed, markers=kept_said)
     except Exception:
         note_ui_error(traceback.format_exc())
         left = None
@@ -2833,60 +3010,9 @@ def fix_problems(app, res, plan):
     rest = [p for p in strs(res.get("problems")) if p not in (left or [])]     # what is not about booting
     if not failed and left == [] and not rest and log:
         res["resolved"] = engine.mark_resolved(log) or res.get("resolved")
-    disk = "No space left on device" in seen
-    only_space = set(keys) == {"space"}
-    room = "partial" in states.values()         # room for the fixes, not yet for the update
-    if left is None:
-        text = "не удалось проверить — НЕ перезагружайся, сначала: sudo ls -l /boot"
-        lines = [("✗ " + text, BAD, True)]
-        colour = BAD
-    elif kind == "rollbackfailed":
-        text, colour = f"НЕ перезагружайся: {short}", BAD
-        lines = [("✗ Исправление не помогло, и вернуть всё как было не удалось — копии остались в /tmp "
-                  "(путь выше). НЕ перезагружайся.", BAD, True),
-                 ("Отчёт об этом уйдёт разработчику сам." if log and report.follow_up_due(log) else
-                  "Отправь отчёт (S): по нему будет видно, что случилось.", WARN, False)]
-    elif left:                                  # a problem with booting is still there: that first, in red
-        more = f" (и ещё {len(left) - 1})" if len(left) > 1 else ""
-        text, colour = f"НЕ перезагружайся: всё ещё {short_problem(left[0])}{more}", BAD
-        lines = [("✗ Всё ещё: " + short_problem(p), BAD, False) for p in left] + \
-            [("НЕ перезагружайся, пока это не исправлено.", BAD, True)]
-        if failed:
-            lines.insert(0, ("✗ Исправление не прошло: " + how + ".", BAD, True))
-        if kind == "rolledback":
-            lines.insert(1, ("Всё, что оно меняло, вернул как было (сверил с копиями).", None, False))
-        if kind == "notenough":
-            lines.append(("Места не хватило даже для исправлений — что ещё занимает место, написано выше.",
-                          WARN, False))
-        if disk:
-            lines.append(("На диске нет места: " + FREE_HINT + ".", WARN, True))
-    elif kind == "notenough":
-        text, colour = short, WARN
-        lines = [("! Место освободил, но его всё ещё мало — что ещё занимает место, написано выше.", WARN, True)]
-    elif failed and only_space:
-        text, colour = f"место освободить не вышло: {how}", WARN
-        lines = [("! Место освободить не вышло: " + how + ".", WARN, True)]
-    elif failed:
-        text, colour = f"НЕ перезагружайся: исправление не прошло — {short}", BAD
-        lines = [("✗ Исправление не прошло: " + how + ". НЕ перезагружайся.", BAD, True)]
-        if kind == "rolledback":
-            lines.append(("Всё, что оно меняло, вернул как было (сверил с копиями).", None, False))
-    elif only_space:
-        text, colour = "место освобождено — запусти обновление ещё раз", GOOD
-        lines = [("✓ Место освобождено. Запусти обновление ещё раз.", GOOD, True)]
-    elif rest:
-        text, colour = f"с загрузкой всё в порядке; осталось: {short_problem(rest[0])}", WARN
-        lines = [("✓ С загрузкой всё в порядке.", GOOD, True),
-                 ("Осталось: " + short_problem(rest[0]) + " — запусти обновление ещё раз: если оно пройдёт чисто, "
-                  "предупреждение уйдёт.", WARN, False)]
-    else:
-        text = "исправлено: проблем с загрузкой больше не нашёл"
-        lines, colour = [("✓ Проблем с загрузкой больше не нашёл.", GOOD, True)], GOOD
-    if room and left == []:
-        lines.append(("Для обновления места ещё мало — освободи его, прежде чем обновляться (F в итоге "
-                      "обновления сделает это снова).", WARN, False))
-        if colour == GOOD:
-            text, colour = text + "; для обновления места ещё мало", WARN
+    text, colour, lines = fix_result(kind, how, states, keys, left, rest, seen, fixes.done(results, plan),
+                                     getattr(results, "kept", None), getattr(results, "full", ()),
+                                     auto_report=bool(log) and report.follow_up_due(log))
     back_to_canvas(app, lines)
     return text, colour
 
@@ -3275,6 +3401,7 @@ def self_test():
     for name in ("set_consent", "set_option", "after_update", "after_fix", "follow_up_due", "queue", "start_sender",
                  "send_pending", "send_now", "delete_local", "ensure_id", "report_state"):
         setattr(report, name, lambda *a, **kw: None)     # nor the reports' settings.json, outbox and journals
+    check_fix_results()                         # what F says for every way its fixes can end
     for name in ("mark_resolved", "recheck_boot", "services_restarted", "save_summary", "journal_event", "space_freed"):
         setattr(engine, name, lambda *a, **kw: None)     # nor an update's summary or journal
     # What R and F would run, made up here: the self-test asks no display manager, looks at no kernel or preset
