@@ -1127,7 +1127,7 @@ class App:
         (engine.unresolved): until a reboot or a fix the menu warns about it, with its keys (Actions). The chosen
         menu item stays chosen, whatever comes or goes above it."""
         chosen = self.menu_key()
-        job = self.bad.job if self.bad else None
+        old = self.bad
         try:                                 # a summary nobody can read is no reason not to start
             data = engine.unresolved()
             before = report.report_state(data["log"]) if data and self.live and not DEMO else None
@@ -1135,8 +1135,11 @@ class App:
         except Exception:
             note_ui_error(traceback.format_exc())
             self.bad = None
-        if self.bad and job and job.log == self.bad.log:
-            self.bad.job = job                   # a report of it on its way: not offered again meanwhile
+        if self.bad and old and old.log == self.bad.log:
+            # A report of it on its way (by hand, or by itself after F) is not offered again meanwhile; S offered
+            # again after F stays offered.
+            self.bad.job, self.bad.again = old.job, old.again
+            self.bad.sent = old.sent or self.bad.sent
         self.choose(chosen)
 
     def menu_key(self):
@@ -1880,10 +1883,10 @@ class App:
                 n = it.get("packages") or 0
                 known = it.get("started", True) and it.get("verdict") is not None
                 c.put(vx + 23, y, f"{n} {plural(n, 'пакет', 'пакета', 'пакетов')}" if known else "—", quiet)
-                if it.get("sent"):
-                    sent, scol = "отправлен" + (f" (№ {it['issue']})" if it.get("issue") else ""), GOOD
-                elif it.get("waiting"):
+                if it.get("waiting"):                   # its report, or a newer one after F
                     sent, scol = "ждёт отправки", WARN
+                elif it.get("sent"):
+                    sent, scol = "отправлен" + (f" (№ {it['issue']})" if it.get("issue") else ""), GOOD
                 else:
                     sent, scol = "не отправлен", quiet if sel else MUTED
                 c.put(vx + 36, y, fit(sent, x0 + W - vx - 36), scol)
@@ -2841,7 +2844,8 @@ def fix_problems(app, res, plan):
         text, colour = f"НЕ перезагружайся: {short}", BAD
         lines = [("✗ Исправление не помогло, и вернуть всё как было не удалось — копии остались в /tmp "
                   "(путь выше). НЕ перезагружайся.", BAD, True),
-                 ("Отправь отчёт (S): по нему будет видно, что случилось.", WARN, False)]
+                 ("Отчёт об этом уйдёт разработчику сам." if log and report.follow_up_due(log) else
+                  "Отправь отчёт (S): по нему будет видно, что случилось.", WARN, False)]
     elif left:                                  # a problem with booting is still there: that first, in red
         more = f" (и ещё {len(left) - 1})" if len(left) > 1 else ""
         text, colour = f"НЕ перезагружайся: всё ещё {short_problem(left[0])}{more}", BAD
@@ -2906,6 +2910,7 @@ class Actions:
         self.app, self.res, self.sent, self.demo = app, res if isinstance(res, dict) else None, sent, demo
         self.sent_before = sent_before if isinstance(sent_before, dict) else {}
         self.job, self.status, self.pressed = None, None, {}
+        self.again = False                      # F added to the journal since S: S once more, with that
         self.look()
 
     def look(self):
@@ -2920,8 +2925,8 @@ class Actions:
         self.fixes = engine.fix_commands(res) if res else []
 
     def can_send(self):
-        if not self.log or (self.job and (not self.job.done or self.job.ok)):
-            return False                        # on its way, or gone
+        if not self.log or (self.job and (not self.job.done or (self.job.ok and not self.again))):
+            return False                        # on its way, or gone (and nothing new since)
         sent = self.sent                        # this update's report queued by itself, as the reports are on
         return sent is None or not (sent.thread.is_alive() or sent.path)
 
@@ -2952,6 +2957,7 @@ class Actions:
             self.app.toast(DEMO_SAYS)
             return False
         if key == "s":
+            self.again = False
             self.job = self.status = SendJob(self.log, report_ui(self.app), app=self.app)
             return False
         if engine.pacman_busy():                # another update's pacman at work: mkinitcpio twice, or a restart
@@ -2974,7 +2980,9 @@ class Actions:
             log, ui = self.log, report_ui(self.app)
             self.sent = self.app.report_line = ReportLine(lambda: report.after_fix(log, ui=ui))
         else:
-            self.job = None
+            # S again, once a report still on its way has its answer (send_now sends one at a time: the next one
+            # knows what that one had, and is news); no report goes by itself for this update now
+            self.again, self.sent = True, None
 
     def view(self, elapsed, review=None, status=None):
         return summary_view(self.res, elapsed, self.sent, self.keys(), status or self.status, review)
@@ -3115,8 +3123,10 @@ def draw_summary(app, sv, t, demo, left):
     # of its own only while every row of the list still fits with it: no problem or warning ever makes room for
     # it. Else the report's goes onto the journal line, in short, if there is room there, or is left out; what
     # came of a key takes the journal line's place.
+    rows = c.h - 6 - shift - head                                # the list's rows when the note has no row of its own
     own_row = (sv.sent is not None or status is not None) and \
-        head + sum(min(2, len(w)) for w in wraps) <= c.h - 7 - shift
+        head + sum(min(2, len(w)) for w in wraps) <= c.h - 7 - shift and \
+        list_fit(wraps, rows - 1) == list_fit(wraps, rows)       # and no item gives up a line for it
     foot = (c.h - 5 if own_row else c.h - 4) - shift             # the journal line
     # The list ends a row above the journal line. Every item shows, cut alike when it must be (with "…"); only
     # when not even a line each fits, the last row says how many more the journal has: nothing goes unsaid.
@@ -3150,12 +3160,16 @@ def draw_summary(app, sv, t, demo, left):
         for line in cut_lines(wraps[i], per, tw):
             c.put(x0 + 4, y, line, tcol, alpha=a)
             y += 1
-    if hidden:
-        c.put(x0 + 4, y, f"… и ещё {hidden} — в журнале", MUTED, alpha=clamp01((t - 0.7 - shown * 0.08) / 0.35))
+    if hidden:                                  # the journal has the problems, warnings and notes; not the ✓ checks
+        where = "" if any(icon == "✓" for icon, _, _ in sv.lines[shown:]) else " — в журнале"
+        c.put(x0 + 4, y, f"… и ещё {hidden}{where}", MUTED, alpha=clamp01((t - 0.7 - shown * 0.08) / 0.35))
     journal = "журнал: " + sv.log.replace(os.path.expanduser("~"), "~") if sv.log else ""
     jcol, note, ncol = MUTED, "", MUTED
     if status:
         note, ncol = status
+        also = sv.sent.text(short=True) if sv.sent else ""        # its report after F, on its way
+        if also and len(f"{note} · {also}") <= c.w - 4:
+            note = f"{note} · {also}"
     elif sv.sent:
         note = sv.sent.text(short=not own_row)
     if note and not own_row:
@@ -3475,6 +3489,15 @@ def self_test():
                 shot(lambda: draw_summary(app, acts.view(seconds_of(r), review="02.11 12:50"), 2.0, False, None))
             acts.sent = sent                    # queued by itself: no S
             shot(lambda: draw_summary(app, acts.view(463), 2.0, False, 7.5))
+            # S after F: not while a report is still on its way (it knows nothing of F), then once more
+            acts = Actions(app, r)
+            acts.job = types.SimpleNamespace(done=False, ok=False, log=acts.log)
+            acts.after_fix()
+            if acts.can_send():
+                raise RuntimeError("S is offered again while a report is still on its way")
+            acts.job.done = acts.job.ok = True
+            if not acts.can_send():
+                raise RuntimeError("S is not offered again after F")
             shot(lambda: draw_summary(app, acts.view(463), 2.0, True, None))
 
         def items(sv):
@@ -3489,10 +3512,25 @@ def self_test():
         for sv in (summary_view(many, 125, sent), summary_view(full, 125, sent)):
             draw_summary(app, sv, 2.0, False, 7.5)
             shown = sum(ch in "✗⚠✓›" for row in c.ch for ch in row)
-            told = re.search(r"и ещё (\d+) — в журнале", "\n".join("".join(row) for row in c.ch))
+            told = re.search(r"и ещё (\d+)", "\n".join("".join(row) for row in c.ch))
             c.clear()
             if shown + (int(told.group(1)) if told else 0) != len(sv.lines):
                 raise RuntimeError(f"the summary leaves items out unsaid at {w}x{h}")
+        # The report's line takes a row of its own only where no item gives up a line for it: with it, never more
+        # items cut short ("…") than without it.
+        tw = max(10, min(w - 8, 84) - 4)
+        for n3 in range(4):
+            for n1 in range(4):
+                mix = dict(res, problems=[f"проблема {i}: " + "слово " * (tw * 5 // 12) for i in range(n3)],
+                           ok=[f"проверка {i}" for i in range(n1)], warnings=[], notes=[])
+                cut = []
+                for with_line in (sent, None):
+                    draw_summary(app, summary_view(mix, 125, with_line, keys=[("F — исправить", "F")]), 2.0, False,
+                                 None)
+                    cut.append(sum(row.count("…") for row in ("".join(r) for r in c.ch)))
+                    c.clear()
+                if cut[0] > cut[1]:
+                    raise RuntimeError(f"the summary's report line cuts items short at {w}x{h} ({n3}+{n1} items)")
         acts = Actions(app, keyed_full)
         acts.status = statuses[2]
         if items(acts.view(125)) < items(summary_view(keyed_full, 125, keys=acts.keys())):

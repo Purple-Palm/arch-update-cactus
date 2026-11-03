@@ -56,7 +56,7 @@ def print_summary(res):
     for p in res["problems"]:
         say(f"✗ {p}\n", C_RED)
     for w in res["warnings"]:
-        say(f"⚠ {w}\n", C_YEL)
+        say(f"⚠ {w.replace(' (F)', '')}\n", C_YEL)     # no F here: the commands to run follow below
     for n in res.get("notes") or []:          # not this update's problem, or nothing to do now
         say(f"· {n}\n", C_DIM)
     if res.get("head"):
@@ -68,8 +68,11 @@ def print_summary(res):
         say("✓ Обновление прошло нормально.\n", C_GRN)
     fixes = res.get("fixes") or []
     if fixes:
-        # An update that never began changed nothing: a reboot is not what to fix this before, the next try is
-        say("Исправь, потом запусти обновление снова — по порядку, в терминале:\n" if res.get("started") is False
+        # An update that never began changed nothing, and one that stopped before a part of it for want of room
+        # left that part to do: a reboot is not what to fix this before, the next try is
+        space = res.get("space") if isinstance(res.get("space"), dict) else {}
+        again = res.get("started") is False or (space.get("stopped") and all(f.get("key") == "space" for f in fixes))
+        say("Исправь, потом запусти обновление снова — по порядку, в терминале:\n" if again
             else "Исправить до перезагрузки — по порядку, в терминале:\n", C_BOLD)
         for fix in fixes:
             say(f"  {fix.get('how') or shlex.join(fix['argv'])}   # {fix['label']}\n", "")

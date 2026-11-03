@@ -42,6 +42,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -68,6 +69,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 LOGS = os.path.join(engine.STATE_DIR, "logs")
 RECORDS = os.path.join(REPORTS, "manual.json")
 SHOWN = 5                           # updates the list of the last ones offers
+LOCK_WAIT = 120                     # seconds a sender waits for another one that is still at it
 PER_HOUR = 6                        # reports the relay takes from one machine in an hour (relay/worker.js PER_ID)
 
 
@@ -131,16 +133,34 @@ def set_consent(on):
         s["reports_decided"] = datetime.date.today().isoformat()
         if on and not _id_ok(s.get("report_id")):
             s["report_id"] = secrets.token_hex(4)      # random: not derived from anything on the machine
+        dropped = []
         if not on:
             for f in glob.glob(os.path.join(OUTBOX, "*.json")):
                 _remove(f)
+                dropped.append(os.path.basename(f))
         try:
             _write_json(SETTINGS, s)
         except OSError:
             if not on:
                 _remove(SETTINGS)
             raise
+    if dropped:
+        _withdrawn(dropped)                 # after the lock: _locked() cannot be held twice
     return s
+
+
+def _withdrawn(names):
+    """The reports switching off dropped: their updates' records say so, and F sends none of them by itself after
+    that (follow_up_due), not even once the reports are on again — the consent for them was taken back."""
+    try:
+        with _locked():
+            records = _records()
+            for rec in records.values():
+                if _str(rec.get("queued")) in names:
+                    rec["withdrawn"] = True
+            _write_json(RECORDS, records)
+    except OSError:
+        pass
 
 
 def _id_ok(rid):
@@ -707,7 +727,10 @@ def follow_up_due(log):
             return False
         name = os.path.basename(path)
         rec = _records().get(name, {})
-        return bool(_str(rec.get("queued")) or _str(rec.get("sent"))) and _grown(name, path, rec)
+        if rec.get("withdrawn"):                    # its report was taken back by switching the reports off
+            return False
+        went = _str(rec.get("sent")) or state_of(_str(rec.get("queued")))     # "" once the file is gone
+        return bool(went) and _grown(name, path, rec)
     except Exception:
         return False
 
@@ -715,8 +738,10 @@ def follow_up_due(log):
 def after_fix(log, ui=None, demo=False):
     """With consent (never in the demo), after F: that update's report again, now with what came of the fixes, as
     a report of its own (a new time: the relay keeps it beside the first one, which never had those lines). Only
-    when follow_up_due. This update's automatic report still waiting goes: the new one has all it had. Returns the
-    queued file, or None. Never raises: a report must not get in the way of anything."""
+    when follow_up_due. This update's automatic report, if it still waits, goes all the same: it has the update's
+    own verdict and problems, as they were (the relay files it as it was; after F the verdict may be green). The
+    new one says first, among its checks, that it came after F, which issue was the first and what F mended.
+    Returns the queued file, or None. Never raises: a report must not get in the way of anything."""
     if demo:
         return None
     try:
@@ -726,9 +751,15 @@ def after_fix(log, ui=None, demo=False):
         name = os.path.basename(path)
         size = _size(path)                              # before it is read: a line added meanwhile is news again
         report = build_from_log(path, ui=ui, why="fix")
+        first = _issue_of(_records().get(name, {}))
+        before = []
         for folder, q in _auto_reports().get(name, []):
-            if folder == OUTBOX:
-                _remove(os.path.join(OUTBOX, q))
+            u = _read_json(os.path.join(folder, q)).get("update")
+            before += [p for p in (u.get("problems") if isinstance(u, dict) else None) or [] if isinstance(p, str)]
+        update = report["update"]
+        mended = [p for p in dict.fromkeys(before) if p not in (update.get("problems") or [])]
+        head = "отчёт после исправления по клавише F" + (f" (первый отчёт — № {first})" if first else "")
+        update["ok"] = ([f"{head}: исправлено — {p}" for p in mended[:5]] or [head]) + list(update.get("ok") or [])
         queued = queue(report)
         _record(name, queued=os.path.basename(queued), time=report["time"], size=size)
         start_sender()
@@ -758,12 +789,20 @@ def send_pending(timeout=15):
         return 0, len(waiting)
     os.makedirs(REPORTS, exist_ok=True)
     with open(os.path.join(REPORTS, "send.lock"), "w") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            return 0, len(waiting)                     # another sender is at it
+        # Another sender at it: wait for it (a report queued while it is in its last one is not on its list), then
+        # send whatever waits by then. This runs in a process of its own: the wait holds up nothing.
+        deadline = time.monotonic() + LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    return 0, len(waiting)
+                time.sleep(0.25)
         _drop_old_tmp(REPORTS)
-        return _send(waiting, url, timeout)
+        waiting = sorted(glob.glob(os.path.join(OUTBOX, "*.json")))
+        return _send(waiting, url, timeout) if waiting else (0, 0)
 
 
 def _tries(names):
@@ -1116,8 +1155,9 @@ def local_updates(n=SHOWN):
 
 
 def _sent_of(rec, reports):
-    """(when its report went out, "" if never; whether its automatic report still waits) of one update: its record,
-    or its automatic report in sent/ or the outbox (one the version before this one sent, which kept no record)."""
+    """(when its report went out, "" if never; whether a report of it waits: its automatic one, or a newer one after
+    F) of one update: its record, or its automatic report in sent/ or the outbox (one the version before this one
+    sent, which kept no record)."""
     sent = _str(rec.get("sent"))
     if not sent:
         for folder, q in reports:
@@ -1128,7 +1168,7 @@ def _sent_of(rec, reports):
                     break
                 except (OSError, ValueError, OverflowError):
                     pass
-    return sent, not sent and any(folder == OUTBOX for folder, _ in reports)
+    return sent, any(folder == OUTBOX for folder, _ in reports)     # after F: a newer one may wait
 
 
 def report_state(log):
@@ -1201,11 +1241,15 @@ def _local_iso(value):
         return None
 
 
-def _later_than(known):
-    """Now, as the relay takes a time, and never the time it knows already (a second later then): a report of its
-    own."""
+def _later_than(known, path=None):
+    """The time of a report of its own: when the journal was last written to (so the same journal always gets the
+    same time, and a try again after a lost answer is the same report to the relay), as the relay takes a time,
+    and never the time it knows already (a second later then). Now, when the journal says nothing."""
     fmt = "%Y-%m-%dT%H:%M:%SZ"
-    now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    try:
+        now = datetime.datetime.fromtimestamp(os.path.getmtime(path), datetime.timezone.utc).replace(microsecond=0)
+    except (OSError, TypeError, ValueError, OverflowError):
+        now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
     try:
         was = datetime.datetime.strptime(known, fmt).replace(tzinfo=datetime.timezone.utc)
     except (TypeError, ValueError):
@@ -1216,17 +1260,19 @@ def _later_than(known):
 def _grown(name, path, rec=None):
     """The journal of that update has lines its last report did not have (what F did, after the report went):
     longer than the size its record keeps from then; for a record without one (the version before this one kept
-    none), written to more than a few seconds after that report was made or sent."""
+    none), written to more than a few seconds after that report was made (queued; or sent, by hand)."""
     rec = _records().get(name, {}) if rec is None else rec
     size = _size(path)
     if size is None:
         return False
     if type(rec.get("size")) is int:
         return size > rec["size"]
-    made = [t for t in (_queued_at(_str(rec.get("queued"))), _local_iso(rec.get("sent"))) if t]
+    # what the relay has was taken when the automatic report was queued (it may have gone out much later); a report
+    # sent by hand is taken when it is sent
+    made = _queued_at(_str(rec.get("queued"))) or _local_iso(rec.get("sent"))
     try:
         return bool(made) and datetime.datetime.fromtimestamp(os.path.getmtime(path)) > \
-            max(made) + datetime.timedelta(seconds=5)
+            made + datetime.timedelta(seconds=5)
     except (OSError, ValueError, OverflowError, TypeError):
         return False
 
@@ -1236,7 +1282,7 @@ def build_from_log(log, ui=None, why="manual"):
     personal taken out as build() does, the names the journal itself shows too (an account or a machine renamed
     since). Its time is the update's own, when it ended, or the one its report had already: the same update sent
     again is the same report to the relay, which files no second issue for it — unless its journal has grown since
-    that report (what F did): then it is news, under a time of its own (now), and the relay keeps it beside the
+    that report (what F did): then it is news, under a time of its own (_later_than), and the relay keeps it beside the
     first. The machine and the updater are described as they are now, and the log says so at its top, with why it
     was sent: "manual" (S), "fix" (after F, with consent: after_fix)."""
     u = _update_of(log)
@@ -1255,7 +1301,7 @@ def build_from_log(log, ui=None, why="manual"):
     name = os.path.basename(path)
     known = _report_time(name)
     if known and _grown(name, path):
-        report["time"] = _later_than(known)
+        report["time"] = _later_than(known, path)
     else:
         report["time"] = known or _relay_time(u["ended"] or u["began"])
     head = "отчёт после исправления по клавише F" if why == "fix" else "отчёт отправлен вручную"
@@ -1271,9 +1317,13 @@ def send_now(log, timeout=20, ui=None):
     again for a report that went out already. Returns (sent, what to tell the user, the issue's number or None);
     never raises."""
     try:
-        return _send_now(log, timeout, ui)
+        with _SENDING:          # one at a time: a report made while another is on its way knows what that one had
+            return _send_now(log, timeout, ui)
     except Exception:
         return False, "не удалось собрать отчёт", None
+
+
+_SENDING = threading.Lock()
 
 
 def _send_now(log, timeout, ui):
@@ -1441,7 +1491,8 @@ def listing(n=SHOWN):
         known = u["started"] and u["verdict"] is not None
         packages = f"{count} {_plural(count, 'пакет', 'пакета', 'пакетов')}" if known else "—"
         if u["sent"]:
-            sent = f"отправлен {_when(u['sent'], year=False)}" + (f" (№ {u['issue']})" if u["issue"] else "")
+            sent = f"отправлен {_when(u['sent'], year=False)}" + (f" (№ {u['issue']})" if u["issue"] else "") \
+                + ("; новый ждёт отправки" if u["waiting"] else "")
         else:
             sent = "ждёт отправки" if u["waiting"] else "не отправлен"
         lines.append(f"{i:>2}  {_when(u['time'])}  {_verdict_words(u):<21} {packages:<12} {sent}")

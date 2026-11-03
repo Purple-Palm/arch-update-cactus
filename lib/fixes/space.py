@@ -46,7 +46,7 @@ def plan(ctx):
         return []                               # / has the room already: whatever ran full, it is not this
     su = ctx.su
     return [fix(KEY, "освободить место на диске", [su, "pacman", "-Sc"], [str(want)],
-                how=f"{su} pacman -Sc; {su} journalctl --vacuum-size=200M; снимки snapper — только если ответишь «да»")]
+                how=f"{su} pacman -Sc; {su} journalctl --vacuum-size=200M")]   # by hand: commands only
 
 
 def finish(ctx):

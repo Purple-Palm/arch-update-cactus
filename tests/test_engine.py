@@ -1220,6 +1220,21 @@ class AutoSummary(Patching):
         text = "".join(msg for msg, _ in out)
         self.assertIn("✓ Всё прошло чисто — перезагрузись, когда будет удобно.", text)
         self.assertNotIn("перезагрузка не нужна", text)
+        # What to fix before the next try, not before a reboot: an update that never began, and one that stopped
+        # before a part of it for want of room; F is not a key here.
+        space_fix = [{"key": "space", "label": "освободить место на диске", "argv": ["sudo", "pacman", "-Sc"],
+                      "how": "sudo pacman -Sc; sudo journalctl --vacuum-size=200M"}]
+        stopped = "мало места на диске для части обновления (…) — её не ставил: освободи место (F) и обнови ещё раз"
+        for res, again in (({"started": False}, True),
+                           ({"started": True, "space": {"stopped": True}, "warnings": [stopped]}, True),
+                           ({"started": True, "space": {"stopped": False}}, False)):
+            out.clear()
+            auto.print_summary(dict({"changed": [], "added": [], "removed": [], "problems": [], "warnings": [],
+                                     "notes": [], "ok": [], "verdict": 1, "log": "/x.log", "fixes": space_fix}, **res))
+            text = "".join(msg for msg, _ in out)
+            self.assertEqual("Исправь, потом запусти обновление снова" in text, again, text)
+            self.assertEqual("Исправить до перезагрузки" in text, not again, text)
+            self.assertNotIn("(F)", text)
 
 
 class Stubs(Patching):

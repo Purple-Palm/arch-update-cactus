@@ -8,6 +8,7 @@ folder, so the real settings and outbox are never touched.
 """
 import datetime
 import errno
+import fcntl
 import http.server
 import json
 import os
@@ -181,7 +182,7 @@ class Relay(http.server.BaseHTTPRequestHandler):
     report that came) and keeps what it got. Like the relay, it answers a report it files with the
     issue's number, and the same report again (the same machine and time: the same log file, see
     putLog in relay/worker.js) with that number, as a duplicate."""
-    code, got, filed, headers = 201, [], {}, {}
+    code, got, filed, headers, lose = 201, [], {}, {}, 0
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -196,6 +197,10 @@ class Relay(http.server.BaseHTTPRequestHandler):
             Relay.filed[key or len(Relay.got)] = answer["issue"]
         elif code >= 400:
             answer["error"] = "не принят"
+        if Relay.lose > 0:                     # filed, but the answer never reaches the machine
+            Relay.lose -= 1
+            self.close_connection = True
+            return
         self.send_response(code)
         for name, value in Relay.headers.items():
             self.send_header(name, value)
@@ -228,7 +233,7 @@ class Reports(unittest.TestCase):
 
     def relay(self, code=201, headers=None):
         self.stop_relay()
-        Relay.code, Relay.got, Relay.filed, Relay.headers = code, [], {}, headers or {}
+        Relay.code, Relay.got, Relay.filed, Relay.headers, Relay.lose = code, [], {}, headers or {}, 0
         self.server = http.server.HTTPServer(("127.0.0.1", 0), Relay)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         os.environ["ARCH_UPDATE_REPORT_URL"] = f"http://127.0.0.1:{self.server.server_port}/report"
@@ -1149,18 +1154,134 @@ class Reports(unittest.TestCase):
         self.assertIsNone(report.after_fix(path, demo=True))        # never in the demo
         again = report.after_fix(path)
         self.assertIsNotNone(again)
-        # The automatic report that still waited goes: the new one has all it had, and what F did.
-        self.assertEqual(self.waiting(), [os.path.basename(again)])
-        self.assertEqual(report.state_of(first), "")
+        # The automatic report that still waited goes as it was (the update's own verdict and problems, which
+        # after F may be gone from its summary); the new one goes beside it, with what F did, and says so.
+        self.assertEqual(self.waiting(), sorted([os.path.basename(first), os.path.basename(again)]))
         follow = report._read_json(again)
         self.assertIn(line, follow["log"])
         self.assertIn("отчёт после исправления по клавише F", follow["log"])
+        self.assertTrue(follow["update"]["ok"][0].startswith("отчёт после исправления по клавише F"),
+                        follow["update"]["ok"])
         self.assertFalse(report.follow_up_due(path))                # sent once: not twice
         self.relay()
-        self.assertEqual(report.send_pending(), (1, 0))
-        self.assertEqual(Relay.got[0]["time"], follow["time"])
+        self.assertEqual(report.send_pending(), (2, 0))
+        self.assertEqual([r["time"] for r in Relay.got], [report._read_json(os.path.join(report.SENT, n))["time"]
+                                                          for n in sorted(os.listdir(report.SENT))])
+        self.assertIn(follow["time"], [r["time"] for r in Relay.got])
+        self.assertEqual(len(Relay.filed), 2)
         u, = report.local_updates()
-        self.assertEqual((u["issue"], bool(u["sent"])), (1, True))
+        # The record names the issue of the newest report, the one after F (queued in the same second here, the two
+        # may have gone in either order)
+        self.assertEqual((u["issue"], bool(u["sent"]), u["waiting"]),
+                         (Relay.filed[(follow["id"], follow["time"])], True, False))
+
+    def test_a_report_taken_back_by_switching_off_never_goes_after_f(self):
+        # Reports on, this update's report waits (offline); the user switches the reports off (it is dropped), then
+        # on again, then presses F on that update: nothing goes by itself — that report was taken back.
+        report.set_consent(True)
+        path = self.journal("2026-10-31_17-42-38", BROKEN_BOOT)
+        report.after_update({"verdict": 2, "log": path, "problems": ["x"]}, mode="auto")
+        report.set_consent(False)
+        self.assertEqual(self.waiting(), [])
+        report.set_consent(True)
+        self.fixed(path)
+        self.assertFalse(report.follow_up_due(path))
+        self.assertIsNone(report.after_fix(path))
+        self.assertEqual(self.waiting(), [])
+        self.relay()                                                # S is still the user's to press
+        self.assertTrue(report.send_now(path)[0])
+        self.fixed(path, "[08:09:00 ИСПРАВЛЕНИЕ] по клавише F: ещё раз")
+        self.assertFalse(report.follow_up_due(path))                # and taken back it stays
+
+    def test_a_follow_up_that_cannot_be_written_leaves_the_waiting_report(self):
+        report.set_consent(True)
+        path = self.journal("2026-10-31_17-42-38", BROKEN_BOOT)
+        first = report.after_update({"verdict": 2, "log": path, "problems": ["x"]}, mode="auto")
+        self.fixed(path)
+        real = report._write_json
+
+        def full(where, data):
+            if os.path.dirname(where) == report.OUTBOX:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real(where, data)
+        report._write_json = full
+        try:
+            self.assertIsNone(report.after_fix(path))
+        finally:
+            report._write_json = real
+        self.assertEqual(self.waiting(), [os.path.basename(first)])  # the update's own report is still there
+
+    def test_s_pressed_while_one_is_on_its_way_after_f_is_news(self):
+        # S, then F while S's answer is still coming, then S again: the second waits for the first, knows what it
+        # had, and goes as a report of its own (before, it took the first one's time and was a duplicate).
+        def slow(body):
+            time.sleep(1.5)
+            return 201
+        self.relay(slow)
+        path = self.journal("2026-10-31_17-42-38", BROKEN_BOOT)
+        first = []
+        t = threading.Thread(target=lambda: first.append(report.send_now(path)))
+        t.start()
+        time.sleep(0.4)
+        line = self.fixed(path)
+        second = report.send_now(path)
+        t.join()
+        self.assertEqual(first, [(True, "отчёт отправлен разработчику (№ 1)", 1)])
+        self.assertEqual(second, (True, "отчёт отправлен разработчику (№ 2)", 2))
+        self.assertIn(line, Relay.got[1]["log"])
+        self.assertNotEqual(Relay.got[0]["time"], Relay.got[1]["time"])
+
+    def test_a_try_again_after_a_lost_answer_is_the_same_report(self):
+        # The relay files a report even when the answer never reaches the machine: trying again is the same
+        # report (the time comes from the journal, not the clock), not a second issue.
+        self.relay()
+        path = self.journal("2026-10-31_17-42-38", BROKEN_BOOT)
+        self.assertTrue(report.send_now(path)[0])
+        self.fixed(path)
+        Relay.lose = 1
+        self.assertEqual(report.send_now(path), (False, "нет связи с сервером — попробуй позже", None))
+        time.sleep(1.1)                         # a second later by the clock: still the same report
+        self.assertEqual(report.send_now(path), (True, "этот отчёт уже у разработчика (№ 2)", 2))
+        self.assertEqual(len(Relay.filed), 2)
+
+    def test_the_list_says_a_newer_report_waits(self):
+        report.set_consent(True)
+        path = self.journal("2026-10-31_17-42-38", BROKEN_BOOT)
+        report.after_update({"verdict": 2, "log": path, "problems": ["x"]}, mode="auto")
+        self.relay()
+        self.assertEqual(report.send_pending(), (1, 0))
+        self.fixed(path)
+        self.assertIsNotNone(report.after_fix(path))
+        self.relay(503)                                             # the one after F cannot go yet
+        self.assertEqual(report.send_pending(), (0, 1))
+        u, = report.local_updates()
+        self.assertEqual((u["issue"], bool(u["sent"]), u["waiting"]), (1, True, True))
+        self.assertIn("новый ждёт отправки", report.listing())
+
+    def test_a_record_of_the_version_before_counts_from_when_its_report_was_made(self):
+        # Its automatic report waited, F wrote to the journal, then the report went out: what the relay has was
+        # taken when it was queued, so F's lines are news, although the record says it went after them.
+        report.set_consent(True)
+        path = self.journal("2026-10-31_17-42-38", BROKEN_BOOT)
+        report.after_update({"verdict": 2, "log": path, "problems": ["x"]}, mode="auto")
+        records = report._read_json(report.RECORDS)
+        rec = records["2026-10-31_17-42-38.log"]
+        del rec["size"]
+        queued_at = report._queued_at(rec["queued"]).timestamp()
+        rec["sent"] = datetime.datetime.fromtimestamp(queued_at + 3600).isoformat(timespec="seconds")
+        report._write_json(report.RECORDS, records)
+        os.utime(path, (queued_at + 600, queued_at + 600))
+        self.assertTrue(report.follow_up_due(path))
+
+    def test_a_sender_waits_for_another_and_sends_what_was_queued_meanwhile(self):
+        report.set_consent(True)
+        self.relay()
+        os.makedirs(report.REPORTS, exist_ok=True)
+        held = open(os.path.join(report.REPORTS, "send.lock"), "w")
+        fcntl.flock(held, fcntl.LOCK_EX)
+        threading.Timer(1.0, held.close).start()                    # another sender, still at its last report
+        report.queue(report.build(self.result()))                   # queued meanwhile (F's report, say)
+        self.assertEqual(report.send_pending(), (1, 0))
 
     def test_what_f_did_goes_again_after_an_automatic_report_that_went(self):
         report.set_consent(True)
