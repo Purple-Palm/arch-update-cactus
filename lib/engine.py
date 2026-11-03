@@ -100,6 +100,13 @@ UNWRITTEN_LINE = re.compile(r"(?P<what>could not extract|warning given when extr
 # registered as installed, with its files half written: "update again" leaves it so (pacman 7.1: "there is nothing
 # to do"), and a reinstall stops at its own files ("exists in filesystem") when the database lost their list too.
 UNFINISHED = re.compile(r"problem occurred while (?:upgrading|installing) ([A-Za-z0-9@._+-]+)\n")
+# A database entry pacman could not write (a full disk: "could not open file …/desc: No space left on device"): the
+# package stays listed, but pacman cannot read it any more ("invalid or corrupted package" for every reinstall of
+# it) until the entry is taken out first (pacman -Rdd --dbonly). "<name>-<version>-<release>", a whole line.
+UNWRITTEN_ENTRY = re.compile(r"could not update database entry ([A-Za-z0-9@._+-]+?)-[^-\s]+-[^-\s]+\n")
+PKG_NAME = re.compile(r"[A-Za-z0-9@_+][A-Za-z0-9@._+-]*")      # what a package name may be (and nothing a shell reads)
+# What every problem that names half-written packages says, followed by the commands that mend them
+REINSTALL = "поставь заново: "
 # What went wrong, in the output. mkinitcpio goes on after a hook or a module failed and writes the image all the
 # same ("errors were encountered during the build"), and one without a single module when the kernel's module list
 # is missing (depmod failed: a full disk) — the Chromebook that did not boot any more.
@@ -118,20 +125,28 @@ INITCPIO_SAYS = {"initcpio image generation failed": "mkinitcpio не собра
                                                              "неполным",
                  "no modules were added to the image": "в initramfs не попал ни один модуль ядра — система с ним "
                                                        "не загрузится"}
-# The disk ran full during the update ("No space left on device" in the output, or pacman could not write a file
-# with / left with next to no room: FULL_LEFT). lib/fixes/space.py and the UI know it by this very text.
-DISK_FULL = ("на диске кончилось место — часть файлов не записалась: освободи место (например: sudo pacman -Sc) и "
+# The disk ran full during the update ("No space left on device" in the output, pacman could not write a file with /
+# left with next to no room), or a failed update left / with next to no room (FULL_LEFT): what is true of all of them,
+# also after F made room. lib/fixes/space.py and the UI know it by this very text (the UI's "обнови ещё раз" too).
+DISK_FULL = ("во время обновления на диске почти не осталось места — освободи его (например: sudo pacman -Sc) и "
              "обнови ещё раз")
+# The same, as the summaries of 6201a1e…8f4397c (the version on the machines) say it: read back as DISK_FULL
 DISK_FULL_OLD = ("на диске кончилось место («No space left on device») — часть файлов не записалась: освободи место "
-                 "(например: sudo pacman -Sc) и обнови ещё раз")     # the same, as the summaries of 6201a1e say it
+                 "(например: sudo pacman -Sc) и обнови ещё раз")
 FULL_LEFT = 64                   # MiB free on / below which a failed update counts as one that ran out of room
 # The update's room on the disk, looked at when pacman asks before it changes anything. On btrfs the snapshots of /
 # keep every file the update replaces, the one a hook takes at the start of the transaction (snap-pac,
 # timeshift-autosnap) as well as those that are there already (snapper's timeline, Timeshift's schedule, earlier
 # pairs): the transaction needs room for every new file, not only for the difference pacman counts ("Net Upgrade
 # Size"). The Chromebook ran out of space in the middle of one that way (7 MiB counted, about 2 GiB needed).
-SIZE_LINE = re.compile(r"^Total (Installed|Download) Size:\s+([\d.]+)\s+(B|KiB|MiB|GiB|TiB)\s*$", re.M)
+SIZE_LINE = re.compile(r"^(Total Installed|Total Download|Net Upgrade) Size:\s+(-?[\d.]+)\s+(B|KiB|MiB|GiB|TiB)\s*$",
+                       re.M)
 SIZE_UNITS = {"B": 1, "KiB": 2 ** 10, "MiB": 2 ** 20, "GiB": 2 ** 30, "TiB": 2 ** 40}
+SIZE_KEYS = {"Total Installed": "installed", "Total Download": "download", "Net Upgrade": "net"}
+# pacman's own space check (CheckSpace), when it refuses: in blocks of that file system (statvfs f_bsize), the cushion
+# it keeps included. It checks twice: the downloads' room before it downloads, the transaction's after (then it says
+# "checking available disk space" first), each time for every file system concerned (a whole line, never one cut).
+PARTITION_FULL = re.compile(r"Partition (/[^\n]*?) too full: (\d+) blocks needed, (\d+) blocks free\n")
 HOOK_DIRS = ("/usr/share/libalpm/hooks", "/etc/pacman.d/hooks")    # the second overrides the first by name
 # A hook's Exec that takes a snapshot: snap-pac's "snap-pac pre" (not its removal hook, which only deletes its
 # notes in /tmp), timeshift-autosnap, a hand-made snapper create or btrfs subvolume snapshot.
@@ -258,9 +273,11 @@ def notify(title, body, urgent=False):
         pass
 
 
-def run(cmd, timeout=60, env=None):
+def run(cmd, timeout=60, env=None, merge=False):
+    """What a command printed (merge: its errors too, in order), "" when it could not run or took too long."""
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env).stdout
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merge else subprocess.PIPE,
+                              text=True, timeout=timeout, env=env).stdout
     except (OSError, ValueError, subprocess.SubprocessError):
         return ""
 
@@ -452,13 +469,14 @@ def mount_of(path):
 
 
 def pacman_sizes(text):
-    """{"installed": bytes, "download": bytes} from the totals pacman printed before its question (the last list
-    in text), None without them."""
+    """{"installed": bytes, "download": bytes, "net": bytes (Net Upgrade Size, below 0 when the update makes room)}
+    from the totals pacman printed before its question (the last list in text; download and net only when pacman
+    printed them), None without them."""
     start = max(text.rfind("\nPackages ("), text.rfind("\nPackage ("))
     sizes = {}
     for kind, number, unit in SIZE_LINE.findall(text[start:] if start >= 0 else text):
         try:
-            sizes[kind.lower()] = int(float(number) * SIZE_UNITS[unit])
+            sizes[SIZE_KEYS[kind]] = int(float(number) * SIZE_UNITS[unit])
         except ValueError:
             pass
     return sizes if "installed" in sizes else None
@@ -491,6 +509,38 @@ def space_facts(space):
 def space_text(space):
     """Why an update was not begun for want of room, what matters first (the summary may show only its start)."""
     return f"{SPACE_HEAD} — обновление не начинал, система не менялась: {space_facts(space)}"
+
+
+def pacman_refusal(responder):
+    """What pacman's own space check refused (Responder.refused), as the summary of an update that did not begin
+    says it: (text, space) — space {"need", "free"} for the space fix when / was too full, else None (another file
+    system: freeing / does not help it). need: what pacman said it needs on / (its blocks, its cushion included);
+    when it refused after the download, those downloads again (the cache on the same file system: the space fix's
+    pacman -Sc removes packages not installed, and the next update downloads them again); when it refused the
+    download itself, the update's own growth after it (Net Upgrade Size, else Total Installed Size); and SPACE_MARGIN
+    for the hooks. None without pacman's line (it said only "not enough free disk space")."""
+    refused = getattr(responder, "refused", None)
+    if not isinstance(refused, dict):
+        return None
+    mount, needed, free_blocks = refused.get("mount"), refused.get("needed"), refused.get("free")
+    try:
+        bsize = os.statvfs(mount).f_bsize      # pacman's block (it counts in f_bsize)
+    except (OSError, TypeError, ValueError):
+        return None
+    free = free_blocks * bsize                  # as pacman counted it, beside what it needed
+    if mount != "/":
+        short = max(needed - free_blocks, 1) * bsize
+        return (f"{SPACE_HEAD} на {mount} — pacman не начал обновление, система не менялась: не хватает "
+                f"{size_text(-(-short // 2 ** 20) * 2 ** 20)}"), None
+    sizes = getattr(responder, "sizes", None) or {}
+    need = needed * bsize
+    if refused.get("installing"):
+        root, cache = mount_of("/"), mount_of(PACMAN_CACHE)
+        need += sizes.get("download", 0) if cache[1] is not None and cache == root else 0
+    else:
+        need += max(sizes.get("net", sizes.get("installed", 0)), 0)
+    space = {"need": need + SPACE_MARGIN, "free": free}
+    return f"{SPACE_HEAD} — pacman не начал обновление, система не менялась: {space_facts(space)}", space
 
 
 def kernel_packages():
@@ -713,12 +763,170 @@ def owners(paths):
     return found
 
 
-def reinstall_text(names, dbonly):
-    """The command that puts half-written packages whole again. dbonly: pacman's database may have lost their file
-    lists as well (it ran out of room too): written again first (--dbonly touches no file), so that their own files
-    are theirs again; then the ordinary reinstall. Never --overwrite '*': it takes other packages' files as well."""
-    pkgs = " ".join(names)
-    return f"sudo pacman -S --dbonly {pkgs} && sudo pacman -S {pkgs}" if dbonly else f"sudo pacman -S {pkgs}"
+def aur_helper():
+    """The AUR helper arch-update uses: its AURHelper setting, else yay or paru, whichever is installed (yay first, as
+    arch-update looks); None without one."""
+    conf = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                        "arch-update", "arch-update.conf")
+    try:
+        with open(conf) as f:
+            for line in f:
+                m = re.match(r"\s*AURHelper\s*=\s*(\S+)", line)
+                if m and m.group(1) in ("yay", "paru"):
+                    return m.group(1)
+    except OSError:
+        pass
+    return next((h for h in ("yay", "paru") if shutil.which(h)), None)
+
+
+def helper_package(pkg, version):
+    """The file of that package version an AUR helper built and keeps (yay: ~/.cache/yay/<package base>/, paru:
+    ~/.cache/paru/clone/<package base>/, both under XDG_CACHE_HOME when set), None when there is none."""
+    cache = glob.escape(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"))
+    want = re.compile(re.escape(f"{pkg}-{version}-") + PKG_ARCH + r"\.pkg\.tar(?:\.\w+)?")
+    found = [p for d in (os.path.join(cache, "yay", "*"), os.path.join(cache, "paru", "clone", "*"))
+             for p in glob.glob(os.path.join(d, glob.escape(pkg) + "-*.pkg.tar*"))
+             if want.fullmatch(os.path.basename(p))]
+    return max(found, key=_mtime) if found else None
+
+
+def sync_version(pkg):
+    """The version of a package the repositories have (pacman -Si: the first repository that has it), None when none
+    has it. Read from the sync database even for an entry pacman can no longer read (pacman -Qu leaves that out)."""
+    m = re.search(r"^Version\s*:\s*(\S+)", run(["pacman", "-Si", "--", pkg], timeout=20, env=child_env()), re.M)
+    return m.group(1) if m else None
+
+
+def shown_path(path):
+    """A path as a command line for the user shows it: in their home folder from ~ (the shell expands it before
+    sudo), quoted where the shell would read it otherwise."""
+    home = os.path.expanduser("~").rstrip("/")
+    if home and path.startswith(home + "/"):
+        return "~/" + shlex.quote(path[len(home) + 1:])
+    return shlex.quote(path)
+
+
+def reinstall_commands(names, dbonly=True, broken=(), installed=None):
+    """The commands that put half-written packages whole again, from the package file of the installed version
+    where there is one: [(names, command)], one command for each way of doing it (a pacman line fails as a whole,
+    so packages mended one way never share one with those mended another):
+      the file of the installed version, in pacman's cache (pacman -Sc keeps it) or where yay or paru built it:
+          sudo pacman -Udd --dbonly F… && sudo pacman -U F…
+      a repository's package without a file, the repositories at that same version (pacman -Si):
+          sudo pacman -Sdd --dbonly X… && sudo pacman -S X…
+      a repository's package without a file, the repositories at another version: that one, with the whole update
+      (alone it would be a partial upgrade; "update again" alone leaves the package as it is):
+          sudo pacman -Sdd --dbonly X… && sudo pacman -Syu X…
+      a package from the AUR (pacman -Qqm) without a file: built again by the AUR helper, which passes --dbonly on:
+          yay -Sdd --dbonly X… && yay -S X…
+    dbonly: pacman's database may have lost their file lists as well (it ran out of room too): written again first
+    (--dbonly touches no file), so that their own files are theirs again ("exists in filesystem" otherwise); with
+    -dd, so that it writes these entries only (a dependency it pulled in would be registered without its files);
+    then the ordinary reinstall. broken: packages whose entry pacman could not write at all (it cannot read it any
+    more): taken out first (pacman -Rdd --dbonly, which leaves their files). Never --overwrite '*': it takes other
+    packages' files as well. Each verified on pacman 7.1 (yay 13, paru 2): a file list lost, files missing, files
+    zeros at full size, an entry pacman cannot read. A package neither installed nor in a repository is left out.
+    installed: pacman -Q as a dict, if known."""
+    names = [n for n in dict.fromkeys(names or ()) if isinstance(n, str) and PKG_NAME.fullmatch(n)]
+    if not names:
+        return []
+    installed = installed_versions() if installed is None else installed
+    foreign = set(run(["pacman", "-Qqm"], env=child_env()).split())
+    ways = {}                                   # way -> [(name, file)]
+    for n in names:
+        ver = installed.get(n)                  # (none: pacman could not even make its entry)
+        f = (cached_package(n, ver) or helper_package(n, ver)) if ver else None
+        sync = None if f or n in foreign else sync_version(n)
+        if not (f or n in foreign or sync or ver):
+            continue                            # neither installed nor anywhere to install it from
+        way = "file" if f else "aur" if n in foreign else "repo" if sync in (ver, None) else "newer"
+        ways.setdefault(way, []).append((n, f))
+    helper = aur_helper()
+    out = []
+    for way in ("file", "repo", "newer", "aur"):
+        if way not in ways:
+            continue
+        pkgs = [n for n, _ in ways[way]]
+        gone = [n for n in pkgs if n in set(broken or ())]
+        pre = f"sudo pacman -Rdd --dbonly {' '.join(gone)} && " if gone and dbonly else ""
+        what = " ".join(shown_path(f) for _, f in ways[way]) if way == "file" else " ".join(pkgs)
+        if way == "file":
+            cmd = f"sudo pacman -Udd --dbonly {what} && sudo pacman -U {what}" if dbonly else f"sudo pacman -U {what}"
+        elif way == "aur" and helper:
+            cmd = f"{helper} -Sdd --dbonly {what} && {helper} -S {what}" if dbonly else f"{helper} -S {what}"
+        elif way == "aur":
+            cmd = f"собери {what} заново из AUR (makepkg) и поставь файл пакета: sudo pacman -Udd --dbonly <файл> " \
+                  f"&& sudo pacman -U <файл>" if dbonly else f"собери {what} заново из AUR (makepkg) и поставь"
+        else:
+            pacman_s = "-Syu" if way == "newer" else "-S"
+            cmd = f"sudo pacman -Sdd --dbonly {what} && sudo pacman {pacman_s} {what}" if dbonly else \
+                f"sudo pacman {pacman_s} {what}"
+        out.append((pkgs, pre + cmd))
+    return out
+
+
+# pacman -Qk / -Qkk (pacman 7.1, English: child_env): a total per package, a warning per file that is not as packaged
+CHECK_TOTAL = re.compile(r"^(?P<pkg>\S+): (?P<total>\d+) total files?, \d+ (?:missing|altered) files?$", re.M)
+CHECK_FILE = re.compile(r"^warning: (?P<pkg>\S+): (?P<path>/[^\n]*) \((?P<why>[^()\n]*)\)$", re.M)
+CONTENT_WRONG = ("Size mismatch", "MD5 checksum mismatch", "SHA256 checksum mismatch")
+
+
+def package_state(pkg, as_root=False):
+    """How a package pacman could not finish is now, by pacman's own look (it only reads): None when it is not
+    installed any more, else {"whole": bool, "entry": bool (pacman can read its database entry: else it is taken out
+    before a reinstall, see reinstall_commands)}; not whole either when pacman did not answer. Not whole:
+      its file list lost from pacman's database: pacman -Qk counts 0 files where the package's own list of them (its
+          mtree, pacman -Qkk) has some, or has none to tell
+      a file missing: pacman -Qk's "No such file or directory" (it leaves out what NoExtract keeps out)
+      a file not as packaged: pacman -Qkk's size or checksum mismatch (a full disk leaves files cut short, or zeros
+          at their full size, which only the checksum tells; also where another file system ran full, with pacman's
+          database whole)
+    Not counted, as on a machine where nothing went wrong (pacman 7.1 on a stock Arch said these of 179 packages):
+    what this user may not read (a closed /boot, /etc/shadow: "Permission denied", "failed to calculate SHA256
+    checksum"), a configuration file changed since ("backup file: …"), permissions, owners and times (a mount point,
+    a folder made by hand), and -Qkk's own "No such file or directory" (it does not leave out folders NoExtract
+    emptied). as_root: through sudo -n (when it asks nothing): then there is nothing it may not read."""
+    def look(*opts):
+        cmd = ["pacman", *opts, "--", pkg]
+        out = run(["sudo", "-n", *cmd], timeout=900, env=child_env(), merge=True) if as_root else ""
+        if not CHECK_TOTAL.search(out):         # no sudo after all (it asks, or may not run pacman): as this user
+            out = run(cmd, timeout=900, env=child_env(), merge=True)
+        return out
+    quick = look("-Qk")
+    total = next((int(m.group("total")) for m in CHECK_TOTAL.finditer(quick) if m.group("pkg") == pkg), None)
+    if total is None and re.search(r"package '" + re.escape(pkg) + r"' was not found", quick):
+        return None                             # removed meanwhile: nothing left to mend
+    entry = not re.search(r"could not open file \S*/" + re.escape(pkg) + r"-[^/\s]+/(?:desc|files)\b", quick)
+    if total is None or any(m.group("pkg") == pkg and m.group("why") == "No such file or directory"
+                            for m in CHECK_FILE.finditer(quick)):
+        return {"whole": False, "entry": entry}     # (no answer at all: as it was)
+    full = look("-Qkk")
+    listed = next((int(m.group("total")) for m in CHECK_TOTAL.finditer(full) if m.group("pkg") == pkg), None)
+    if listed is None or (total == 0 and listed != 0):
+        return {"whole": False, "entry": entry}     # no file list where the package has files, or nothing to tell
+    wrong = [m for m in CHECK_FILE.finditer(full) if m.group("pkg") == pkg and m.group("why") in CONTENT_WRONG]
+    return {"whole": entry and not wrong, "entry": entry}
+
+
+def reinstall_text(names, dbonly=True, broken=(), installed=None):
+    """reinstall_commands as one line (each way after the one before: "; "), "" when nothing is installed."""
+    return "; ".join(cmd for _, cmd in reinstall_commands(names, dbonly, broken, installed))
+
+
+def unfinished_lines(names, dbonly=True, broken=(), full=False, since=None, installed=None):
+    """The problems that name half-written packages, one for each way of mending them (reinstall_commands):
+    "пакет X записан не целиком — [когда освободишь место, ]поставь заново: …", an earlier update's (since: when it
+    began, "" unknown) as "не исправлено после обновления в …: пакет X записан не целиком — поставь заново: …"."""
+    lines = []
+    for pkgs, cmd in reinstall_commands(names, dbonly, broken, installed):
+        one = len(pkgs) == 1
+        said = f"{'пакет' if one else 'пакеты'} {', '.join(pkgs)} {'записан' if one else 'записаны'} не целиком — " \
+            + ("когда освободишь место, " if full else "") + REINSTALL + cmd
+        if since is not None:
+            said = (f"не исправлено после обновления в {since}: " if since else
+                    "не исправлено после прошлого обновления: ") + said
+        lines.append(said)
+    return lines
 
 
 def last_lines(text, n):
@@ -1441,6 +1649,10 @@ class Responder:
         self.failures = set()
         self.unwritten = {}       # UNWRITTEN marker -> the first files it was said of (system_checks names one)
         self.unfinished = []      # the packages pacman could not finish putting in place (UNFINISHED)
+        self.unwritten_entries = []   # the packages whose database entry pacman could not write (UNWRITTEN_ENTRY)
+        self.sizes = None         # pacman's totals at its last "Proceed with installation?" (pacman_sizes)
+        self.refused = None       # pacman's own space check refused: {"mount", "needed", "free" (blocks), "installing"}
+        self._checking = False    # pacman checks the transaction's room now (after the download)
         self.hinted = False
         self.forced = False       # Ctrl+] pressed: Ctrl+C reaches the program even mid-transaction
         self.safe_only = False    # window closed during a manual run: never confirm anything for the user
@@ -1476,10 +1688,24 @@ class Responder:
             for m in UNFINISHED.finditer(recent):
                 if m.group(1) not in self.unfinished and len(self.unfinished) < 20:
                     self.unfinished.append(m.group(1))
+        if "could not update database entry" in recent:
+            for m in UNWRITTEN_ENTRY.finditer(recent):
+                if m.group(1) not in self.unwritten_entries and len(self.unwritten_entries) < 20:
+                    self.unwritten_entries.append(m.group(1))
         if "restart" in recent:
             self.watch_services(recent)
-        if self.mode == "manual" and self.space is None and "Proceed with" in recent and self.waiting() \
-                and PACMAN_PROCEED.search(self.current_line()):
+        question = "Proceed with" in recent and self.waiting() and PACMAN_PROCEED.search(self.current_line())
+        if question:                            # a transaction's totals, before its downloads scroll them away
+            self.sizes = pacman_sizes(self.tail) or self.sizes
+            self._checking = False
+        if "checking available disk space" in recent:
+            self._checking = True
+        if "too full:" in recent:
+            for m in PARTITION_FULL.finditer(recent):
+                if self.refused is None or m.group(1) == "/":       # / first: the space fix makes room there
+                    self.refused = {"mount": m.group(1), "needed": int(m.group(2)), "free": int(m.group(3)),
+                                    "installing": self._checking}
+        if self.mode == "manual" and self.space is None and question:
             short = self.space_short()
             if short:                           # the user answers in a manual run: tell them before they do
                 self.space = dict(short, stopped=False)
@@ -1715,9 +1941,11 @@ def detached_answer(line):
 #   mode ("auto" | "manual"), began, ended (ISO, local time), boot_id (the boot it ran in),
 #   services {listed, restarted, skipped, waiting, later, failed}, fixes [{key, label, argv}],
 #   boot [{kind, text, …}] (the problems with booting, see fix_commands), reboot (a reboot would apply the update),
+#   space (too little room: Responder.space_short, pacman_refusal), unfinished [package] (left half written, by this
+#   update or an earlier one, and not whole yet: every later update looks at them again, see unfinished_before),
 #   later on: rechecked (recheck_boot), resolved (mark_resolved).
 SUMMARY_KEYS = ("verdict", "changed", "added", "removed", "problems", "warnings", "notes", "ok", "exitstatus",
-                "started", "head", "services", "fixes", "boot", "reboot", "space")
+                "started", "head", "services", "fixes", "boot", "reboot", "space", "unfinished")
 
 
 def now_iso():
@@ -1741,10 +1969,26 @@ def save_summary(res, responder=None):
     except ValueError:
         began = now_iso()
     data.update(mode="manual" if manual else "auto", began=began, ended=now_iso(), boot_id=boot_id())
-    try:
-        write_json(summary_path(log), data)
-    except OSError:
-        pass
+    UNSAVED[summary_path(log)] = data
+    save_pending()
+
+
+# Summaries a full disk did not let be written (the Chromebook: the state folder on the same disk): kept, and written at
+# the first chance there is room (save_pending), so that what they say (a disk that ran full, packages left half
+# written) reaches the menu's warning and the next update's look. Only while this program runs.
+UNSAVED = {}
+
+
+def save_pending():
+    """Write the summaries kept in UNSAVED, those there is room for now. Never raises."""
+    for path, data in list(UNSAVED.items()):
+        try:
+            write_json(path, data)
+        except OSError:
+            continue                            # still no room: at the next chance
+        except Exception:
+            pass                                # it never would be written: not tried again
+        UNSAVED.pop(path, None)
 
 
 def last_update(logdir=None):
@@ -1791,6 +2035,10 @@ def normal_summary(d):
         if isinstance(space, dict) else None
     if not d["space"]:
         d.pop("space")
+    if isinstance(d.get("unfinished"), list):   # package names only (they go into commands for the user)
+        d["unfinished"] = [n for n in dict.fromkeys(plain(d["unfinished"])) if PKG_NAME.fullmatch(n)]
+    else:
+        d.pop("unfinished", None)
     return d
 
 
@@ -1871,6 +2119,7 @@ def unresolved(logdir=None, exclude=None):
     did not let be written) from its journal's own lines. A run that did not start changed nothing: the update
     before it counts (unless that run is red itself, an unmounted /boot); one without a result (cut off, or still
     running) says nothing either way. exclude: a journal to pass over (the run being checked now). None otherwise."""
+    save_pending()
     this_boot, boot_began = boot_id(), boot_started()
     skip = os.path.realpath(exclude) if exclude else None
     for log in sorted(glob.glob(os.path.join(logdir or logs_dir(), "20*.log")), reverse=True):
@@ -1897,21 +2146,52 @@ def unresolved(logdir=None, exclude=None):
     return None
 
 
+def unfinished_before(logdir=None, exclude=None):
+    """The packages earlier updates left half written and the newest summary that keeps that list still names, from
+    whatever boot (a reboot mends nothing there): {package: when the update that first named it began (ISO, "" when
+    unknown)}, {} when there are none. A summary without the list (an update that did not start, another version's)
+    is passed over. exclude: a journal to pass over (the run being checked now)."""
+    skip = os.path.realpath(exclude) if exclude else None
+    found, open_ = None, set()
+    for data in summaries(logdir):
+        if (skip and os.path.realpath(data["log"]) == skip) or "unfinished" not in data:
+            continue
+        began = data.get("began") if isinstance(data.get("began"), str) else ""
+        if found is None:
+            found = {n: began for n in data["unfinished"]}
+            open_ = set(found)
+        else:                                   # named there too: it began there (or earlier still)
+            open_ &= set(data["unfinished"])
+            found.update({n: began for n in open_})
+        if not open_:
+            break
+    return found or {}
+
+
 def journal_event(log, kind, msg):
-    """An event line in the journal of that update, also after it has ended."""
-    if not getattr(getattr(LOG, "txt", None), "closed", True) and os.path.realpath(LOG.path) == os.path.realpath(log):
+    """An event line in the journal of that update, also after it has ended, and also when the update's own writes to
+    it failed (a full disk: the run's log stops writing; once there is room again, this line gets there)."""
+    save_pending()
+    if not getattr(getattr(LOG, "txt", None), "closed", True) and os.path.realpath(LOG.path) == os.path.realpath(log) \
+            and not LOG.broken:
         LOG.event(kind, msg)
         return
     try:
-        with open(log, "a", encoding="utf-8") as f:
-            f.write(f"[{datetime.datetime.now():%H:%M:%S} {kind}] {msg}\n")
-    except (OSError, TypeError):
+        with open(log, "ab+") as f:
+            f.seek(0, os.SEEK_END)
+            fresh = f.tell() == 0
+            if not fresh:
+                f.seek(-1, os.SEEK_END)
+                fresh = f.read(1) == b"\n"
+            f.write((("" if fresh else "\n") + f"[{datetime.datetime.now():%H:%M:%S} {kind}] {msg}\n").encode())
+    except (OSError, TypeError, ValueError):
         pass
 
 
 def _update_summary(log, change):
     """Read that update's summary, let change(data) alter it, recompute the verdict, write it back.
     Returns the summary, None if there is none or it cannot be written."""
+    save_pending()
     path = summary_path(log)
     data = read_json(path)
     if not data:
@@ -1936,6 +2216,7 @@ def mark_resolved(log):
     lock left behind, a failed hook) keeps it red, and the warning stays (False). For an update without a summary
     (a full disk did not let it be written) the caller has looked: its journal says it, which unresolved() reads.
     False also when nothing could be written."""
+    save_pending()
     data = read_json(summary_path(log))
     if data:
         if data.get("problems"):
@@ -1998,10 +2279,19 @@ def boot_state(probe=None, pacman_log=None, changed=(), earlier=(), since=None, 
     earlier update of this boot, or by this one's own check); those this look can neither confirm nor rule out
     stay, as found then (since: when that was, None for this update's own). found: issues this update has
     found already (in its output), so that an earlier one of the same kind is not said twice. keep: a fix of
-    them has just failed: what this look does not find again stays all the same (a look that finds nothing
-    wrong after a failed mkinitcpio may have missed what it left out), but for what this look has just seen
-    exactly: a boot partition mounted, a DKMS module built, a kernel's module list or its file there again."""
+    them has just failed (True), or the fixes of these kernels (a set of their packages) were not done while the
+    others' were: what this look does not find again stays all the same (a look that finds nothing wrong after a
+    failed mkinitcpio may have missed what it left out), but for what this look has just seen exactly: a boot
+    partition mounted, a DKMS module built, a kernel's module list there again, its kernel file there again and
+    whole, and with a set, the images of every kernel not in it (their fixes were done and checked: what the look
+    sees of them counts; mkinitcpio's own errors say no kernel, they stay). An empty set is False.
+    A kernel file is whole when it is not smaller than the one its package installed (/usr/lib/modules/<version>/
+    vmlinuz, which every user may read; the mkinitcpio hook copies it to /boot): a /boot that ran full leaves it cut
+    short (GNU install keeps what it wrote), and the machine does not boot with it. sbctl signs a copy: larger."""
     issues, warnings, ok, unverified, looked_into = [], [], [], set(), set()
+    whole_size = {}                             # kernel file -> the size of its package's own copy
+    if isinstance(keep, (list, tuple)):
+        keep = set(keep)
     for t in unmounted_boot():
         issues.append({"kind": "unmounted", "target": t,
                        "text": f"{t} не смонтирован — ядро могло записаться не туда, НЕ перезагружайся"})
@@ -2056,6 +2346,15 @@ def boot_state(probe=None, pacman_log=None, changed=(), earlier=(), since=None, 
         elif size == 0:
             issues.append(_file_issue(kind, f, pkg, "empty", f"{f} пустой — НЕ перезагружайся (сначала: "
                                       + (f"sudo pacman -S {pkg})" if kind == "kernel" else "sudo mkinitcpio -P)")))
+        elif kind == "kernel":
+            try:
+                whole_size[f] = os.path.getsize(os.path.join(MODULES_DIR, kver, "vmlinuz"))
+            except OSError:
+                continue                        # a kernel package that puts its file into /boot itself: as it is
+            looked_into.add(f)
+            if size < whole_size[f]:
+                issues.append(_file_issue(kind, f, pkg, "short", f"{f} обрезан — НЕ перезагружайся, система с ним "
+                                                                  f"не загрузится (сначала: sudo pacman -S {pkg})"))
         elif kind == "image":
             # Built for this kernel, and with its modules: mkinitcpio makes the kernel's folder in every image,
             # and its module list (modules.dep.bin) only when it put modules in (none: the image cannot boot).
@@ -2129,7 +2428,7 @@ def boot_state(probe=None, pacman_log=None, changed=(), earlier=(), since=None, 
             at = i.get("at") if isinstance(i.get("at"), (int, float)) else time.time()
             return bool(kernels) and all(_mtime(module_index(k)) > at for k in kernels.values())
         if kind in ("kernel", "image"):
-            return path in looked_into if i.get("how") == "broken" else path in known
+            return path in looked_into if i.get("how") in ("broken", "short") else path in known
         if kind == "initcpio":                  # mkinitcpio failed then: a new image built since, or all looked into
             return rebuilt or not ({"files", "images"} & unverified)
         if kind == "unsigned":
@@ -2138,11 +2437,16 @@ def boot_state(probe=None, pacman_log=None, changed=(), earlier=(), since=None, 
 
     def settled(i):
         """What this look sees exactly, and has just looked at: it counts even after a fix that failed. Not an
-        image, mkinitcpio's errors or a signature: a look that finds nothing wrong there may miss what is."""
-        kind = i.get("kind")
-        if kind in ("unmounted", "dkms") or (kind == "depmod" and i.get("path")):
+        image (unless its kernel's fixes were all done: keep a set without its package), mkinitcpio's errors or a
+        signature: a look that finds nothing wrong there may miss what is."""
+        kind, path = i.get("kind"), i.get("path")
+        if kind in ("unmounted", "dkms") or (kind == "depmod" and path):
             return True
-        return kind == "kernel" and i.get("how") in ("missing", "empty") and bool(known.get(i.get("path")))
+        if kind == "image":
+            return isinstance(keep, (set, frozenset)) and isinstance(i.get("pkg"), str) and i["pkg"] not in keep
+        size = known.get(path)
+        return kind == "kernel" and i.get("how") in ("missing", "empty", "short") and bool(size) \
+            and size >= whole_size.get(path, 0)
     now = {(i["kind"], i.get("path")) for i in list(issues) + list(found)}
     for i in earlier:
         if not isinstance(i, dict) or not isinstance(i.get("text"), str) \
@@ -2261,7 +2565,7 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
         problems.append("остался замок pacman /var/lib/pacman/db.lck — pacman мог прерваться")
     else:
         ok.append("pacman завершился штатно")
-    depmod_failed = False
+    depmod_failed, refused_space = False, None
     for f in sorted(responder.failures):
         flash = KERNEL_FLASH.search(f)
         initcpio = initcpio_issue(f)
@@ -2278,16 +2582,26 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
         elif f.lower() == "no space left on device":
             problems.append(DISK_FULL)
         elif f.lower() == "not enough free disk space":
-            problems.append("pacman не стал ставить часть пакетов: мало места на диске («not enough free disk "
-                            "space») — освободи место и обнови ещё раз")
+            # A later step's pacman refused (the AUR step's): its own count, for the space fix, when / was too full
+            _, refused_space = pacman_refusal(responder) or ("", None)
+            problems.append("pacman не стал ставить часть пакетов: "
+                            + (space_facts(refused_space) if refused_space else
+                               "мало места на диске («not enough free disk space»)")
+                            + " — освободи место и обнови ещё раз")
         elif f not in UNWRITTEN.values():       # files pacman could not write: below
             problems.append(f"в выводе: «{f}»")
     # Files pacman could not write. "could not extract" is a full file system: / when it has (next to) no room left
     # now, or the output said so; else another one (a full /boot: pacman puts the microcode there). "warning given"
     # is a write that failed otherwise (an I/O error, a quota): the file was cut short, pacman went on. Either way
-    # the packages stay registered as installed: updating again does not mend them, a reinstall does.
+    # the packages stay registered as installed: updating again does not mend them, a reinstall does (one line for
+    # each way of doing it, see unfinished_lines). The packages pacman could not finish are named whatever pacman
+    # said of their files (a full disk can fail it at a file it could not create, "Can't create", or at its
+    # database entry, which then has to be taken out first).
     unwritten = getattr(responder, "unwritten", None) or {}
     unfinished = [n for n in getattr(responder, "unfinished", None) or [] if isinstance(n, str)]
+    no_entry = [n for n in getattr(responder, "unwritten_entries", None) or [] if isinstance(n, str)]
+    unfinished += [n for n in no_entry if n not in unfinished]
+    cut = []                                    # packages a write error cut short, pacman going on
     left = free_mib("/")
     full = left is not None and left < FULL_LEFT
     for marker in (m for m in UNWRITTEN.values() if m in responder.failures):
@@ -2296,22 +2610,40 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
         if marker == UNWRITTEN["could not extract"] and (full or DISK_FULL in problems):
             if DISK_FULL not in problems:       # (in it already: "No space left on device" in the output)
                 problems.append(DISK_FULL)
-            if unfinished:
-                problems.append(("пакет " if len(unfinished) == 1 else "пакеты ") + ", ".join(unfinished)
-                                + (" записан" if len(unfinished) == 1 else " записаны") + " не целиком — когда "
-                                "освободишь место, поставь заново: " + reinstall_text(unfinished, True))
         elif marker == UNWRITTEN["could not extract"]:
             problems.append(f"pacman не смог записать часть файлов{example}: там кончилось место — освободи его "
-                            "(df -h покажет, где его мало), "
-                            + (f"потом поставь заново: {reinstall_text(unfinished, True)}" if unfinished else
-                               "потом обнови ещё раз"))
+                            "(df -h покажет, где его мало)" + ("" if unfinished else ", потом обнови ещё раз"))
         else:
-            cut = owners(files)
-            problems.append(f"pacman записал часть файлов не целиком{example}: ошибка записи на диск — проверь диск, "
-                            + (f"потом поставь заново: {reinstall_text(cut, False)}" if cut else
-                               "потом поставь эти пакеты заново"))
+            cut = [n for n in owners(files) if n not in unfinished]
+            problems.append(f"pacman записал часть файлов не целиком{example}: ошибка записи на диск — проверь диск"
+                            + ("" if cut or unfinished else ", потом поставь эти пакеты заново"))
     if exitstatus not in (0, None, 11) and full and DISK_FULL not in problems:
         problems.append(DISK_FULL)              # it failed, and / is full: whatever it said, room is the first thing
+    room = DISK_FULL in problems or UNWRITTEN["could not extract"] in responder.failures
+    problems += unfinished_lines(unfinished, True, no_entry, full=room, installed=after)
+    problems += unfinished_lines(cut, False, installed=after)
+    # Those an earlier update left half written (from whatever boot): looked at again, as pacman sees them now.
+    still, whole_again = {}, []
+    earlier_unfinished = unfinished_before(LOG.dir, exclude=LOG.path) if carry else {}
+    if earlier_unfinished:
+        as_root = elevation_command() == "sudo" and not sudo_asks_password()
+        for name, began in earlier_unfinished.items():
+            if name in unfinished or name in cut:
+                continue                        # named again just now
+            state = package_state(name, as_root)
+            if state is None:
+                LOG.event("ПАКЕТЫ", f"{name} больше не установлен — проверять нечего")
+            elif state["whole"]:
+                whole_again.append(name)
+            else:
+                still[name] = (_when(began), state["entry"])
+    for since in dict.fromkeys(s for s, _ in still.values()):
+        names = [n for n, (s, _) in still.items() if s == since]
+        problems += unfinished_lines(names, True, [n for n in names if not still[n][1]], since=since,
+                                     installed=after)
+    if whole_again:
+        ok.append(("пакет " if len(whole_again) == 1 else "пакеты ") + ", ".join(whole_again)
+                  + (" снова цел" if len(whole_again) == 1 else " снова целы"))
     if any(KEYRING_TROUBLE.search(f) for f in responder.failures):
         keyring = "archlinuxarm-keyring" if before.get("archlinuxarm-keyring") else "archlinux-keyring"
         problems.append(f"похоже, устарел keyring: sudo pacman -Sy {keyring} && sudo pacman -Su, потом обнови снова")
@@ -2429,9 +2761,12 @@ def system_checks(before, exitstatus, responder, pacman_log_offset, failed_befor
     res = {"changed": changed, "added": added, "removed": removed, "problems": problems,
            "warnings": warnings, "notes": notes, "ok": ok, "verdict": 2 if problems else (1 if warnings else 0),
            "log": LOG.path, "exitstatus": exitstatus, "started": True, "services": services, "boot": boot,
-           "reboot": reboot}
+           "reboot": reboot,
+           "unfinished": [n for n in dict.fromkeys(unfinished + cut + list(still)) if PKG_NAME.fullmatch(n)]}
     if getattr(responder, "space", None):
         res["space"] = responder.space          # too little room for a part of it (an AUR package, or a manual run)
+    elif refused_space:
+        res["space"] = dict(refused_space, stopped=True)    # pacman refused a part of it: what it said it needs
     res["fixes"] = fix_commands(res)
     save_summary(res, responder)
     return res
@@ -2542,12 +2877,16 @@ def recheck_boot(log, probe=None, failed=False, markers=()):
     """The problems with booting of that update as they are now (after a fix): the same look as after the update
     (boot partitions, the kernels' module lists and boot files, DKMS, Secure Boot). What cannot be looked at now
     (a /boot closed to the user while sudo asks for a password) stays as it was found; after a fix that failed
-    (failed: its exit status was not 0, or its output said an error) so does everything found before that this
-    look does not find again, but what it has just seen exactly (boot_state's keep). The update's summary
-    follows: its problems, verdict and fixes. probe: the file boot_probe_command wrote (or parse_probe's dict).
+    (failed: True when its exit status was not 0, or its output said an error) so does everything found before
+    that this look does not find again, but what it has just seen exactly (boot_state's keep). failed may also be
+    the set of kernel packages whose fixes were not done, when every fix for the whole machine was: then the images
+    of the other kernels count as the look sees them (their fixes were done and checked), those of these kernels and
+    mkinitcpio's errors stay as found (an empty set: nothing failed). The update's summary follows: its problems,
+    verdict and fixes. probe: the file boot_probe_command wrote (or parse_probe's dict).
     markers: what FAILURE_MARKERS found in the output of the fixes whose changes stayed (a kernel reinstalled, and
     its mkinitcpio hook said an error): mkinitcpio's (INITCPIO_SAYS) are problems with booting, as after the
     update, each once. Returns the problems with booting, [] when there are none."""
+    save_pending()
     data = normal_summary(read_json(summary_path(log)))
     old = [i for i in data["boot"] if isinstance(i.get("text"), str)]
     if isinstance(probe, str):
@@ -2733,6 +3072,7 @@ def run_update(view, manual=False, stop_on_news=True, cmd=None, summary=True, di
         return None, None, None
     cmd = cmd or os.environ.get("ARCH_UPDATE_CMD", "arch-update")
     RUN_MODE = "manual" if manual else "auto"
+    save_pending()                              # a summary the last one's full disk kept back: before this one
     LOG = RunLog()
     # The user's standing choice: restart the services safe to restart when arch-update asks (auto mode only:
     # in a manual run the user answers that question too).
@@ -2830,9 +3170,12 @@ def run_update(view, manual=False, stop_on_news=True, cmd=None, summary=True, di
     full = "not enough free disk space" in {f.lower() for f in responder.failures}
     if (responder.space or full) and installed_versions() == before:
         # stopped at pacman's question for want of room (or pacman found too little itself): nothing changed
-        space = responder.space or {"need": catalogue.space.AFTER_FULL, "free": shutil.disk_usage("/").free}
-        return status, not_started(space_text(responder.space) if responder.space else FULL_BEFORE, 1,
-                                   space=space), responder
+        if responder.space:
+            why, space = space_text(responder.space), responder.space
+        else:                                   # pacman's own count when it said it, else the space fix's own
+            why, space = pacman_refusal(responder) or \
+                (FULL_BEFORE, {"need": catalogue.space.AFTER_FULL, "free": shutil.disk_usage("/").free})
+        return status, not_started(why, 1, space=space), responder
     result = system_checks(before, status, responder, pacman_log_offset, failed_before, orphans_before=orphans_before,
                            probe=probe, carry=not demo) if summary else None
     return status, result, responder

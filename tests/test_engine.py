@@ -261,6 +261,9 @@ class Machine(Patching):
         self.owners = {}
         self.after = {}                 # pacman -Q after the update
         self.newer = {}                 # pacman -Qu: what the repository has newer
+        self.sync = {}                  # pacman -Si: the version the repositories have
+        self.foreign = []               # pacman -Qqm: packages from no repository (the AUR's)
+        self.looks = {}                 # pacman -Qk / -Qkk <package>: what it prints (stdout and stderr)
         self.runs = 0
         real_run = engine.run
 
@@ -273,6 +276,13 @@ class Machine(Patching):
                 return "".join(f"{p}\n" for p in self.orphans)
             if cmd[:2] == ["pacman", "-Qu"]:
                 return "".join(f"{p} {self.after.get(p, '1')} -> {self.newer[p]}\n" for p in cmd[2:] if p in self.newer)
+            if cmd[:2] == ["pacman", "-Qqm"]:
+                return "".join(f"{p}\n" for p in self.foreign)
+            if cmd[:3] == ["pacman", "-Si", "--"]:
+                return "".join(f"Repository      : extra\nName            : {p}\nVersion         : {self.sync[p]}\n"
+                               for p in cmd[3:] if p in self.sync)
+            if cmd[:2] in (["pacman", "-Qk"], ["pacman", "-Qkk"]) and cmd[2:3] == ["--"]:
+                return self.looks.get((cmd[1], cmd[3]), f"error: package '{cmd[3]}' was not found\n")
             if cmd[:4] == ["sudo", "-n", "bash", "-c"] and cmd[5:6] == ["probe"]:
                 self.probed.append(cmd[6:])
                 return self.probe
@@ -292,6 +302,12 @@ class Machine(Patching):
         self.patch(engine, "running_kernel", lambda: KVER)
         self.patch(engine, "is_chromebook", lambda: False)
         self.patch(engine, "PACMAN_CACHE", os.path.join(self.tmp, "pkg"))
+        # an AUR helper's build cache and arch-update's settings of this test's own (AURHelper=yay); this machine's
+        # sudo never asked (packages are looked at as this user)
+        self.env(XDG_CACHE_HOME=os.path.join(self.tmp, "cache"), XDG_CONFIG_HOME=os.path.join(self.tmp, "config"))
+        os.makedirs(os.path.join(self.tmp, "config", "arch-update"))
+        write(os.path.join(self.tmp, "config", "arch-update", "arch-update.conf"), "AURHelper=yay\n", 0o644)
+        self.patch(engine, "sudo_asks_password", lambda: True)
         self.patch(engine, "free_mib", lambda path="/": 50 * 1024)     # room on /, whatever this machine has
         self.patch(fixes.space, "free", lambda path="/": 50 * 2 ** 30)
         # lsinitcpio for the images the user may read: the kernel version written next to the image; as mkinitcpio
@@ -309,6 +325,7 @@ class Machine(Patching):
         engine.MODULES_DIR, engine.PRESET_DIR, engine.DKMS_SRC, engine.POWER_DIR, engine.run = self.saved
         engine.LOG.txt.close()
         engine.LOG.raw.close()
+        getattr(engine, "UNSAVED", {}).clear()  # what a full disk kept back here is no later test's
 
     def new_run(self):
         """The journal of a later update (journals are named after the second they start in)."""
@@ -345,6 +362,11 @@ class Machine(Patching):
         for k, v in files.items():
             with open(os.path.join(d, k), "w") as f:
                 f.write(f"{v}\n")
+
+    def vmlinuz(self, size, kver=KVER):
+        """The kernel file the kernel package installs (/usr/lib/modules/<version>/vmlinuz): mkinitcpio's hook copies
+        it to /boot."""
+        write(os.path.join(engine.MODULES_DIR, kver, "vmlinuz"), "k" * size, 0o644)
 
     def boot_file(self, name, data=b"x" * 64, mode=0o644, kver=KVER, modules=True):
         path = os.path.join(self.tmp, name)
@@ -649,13 +671,16 @@ class Machine(Patching):
         files = r.unwritten[could_not]
         self.assertEqual((files[0], len(files)), ("/usr/share/bigpkg/data-101.bin", 20))
         # / left with next to no room: the disk ran full, F frees room first; the package it was putting in place
-        # stays registered, half written: updating again leaves it so, the reinstall mends it (pacman 7.1)
+        # stays registered (as the new version), half written: updating again leaves it so, the reinstall mends it
+        # (pacman 7.1; the repository has that version, no file of it is left: from the repository)
+        self.after, self.sync = {"bigpkg": "2-1"}, {"bigpkg": "2-1"}
         self.patch(engine, "free_mib", lambda path="/": 3)
         self.patch(fixes.space, "free", lambda path="/": 3 * 2 ** 20)
         res = engine.system_checks({}, 1, r, 0, carry=False)
-        mend = ("пакет bigpkg записан не целиком — когда освободишь место, поставь заново: sudo pacman -S --dbonly "
+        mend = ("пакет bigpkg записан не целиком — когда освободишь место, поставь заново: sudo pacman -Sdd --dbonly "
                 "bigpkg && sudo pacman -S bigpkg")
         self.assertEqual(res["problems"], ["arch-update завершился с кодом 1", engine.DISK_FULL, mend])
+        self.assertEqual(res["unfinished"], ["bigpkg"])
         self.assertEqual(self.fix_keys(res), ["space"])
         self.assertNotIn("No space left on device", engine.DISK_FULL)   # it may come from either now
         # the output said "No space left on device" too (a hook): the same, once
@@ -667,10 +692,9 @@ class Machine(Patching):
         self.patch(fixes.space, "free", lambda path="/": 50 * 2 ** 30)
         res = engine.system_checks({}, 1, self.fed(self.NOSPACE), 0, carry=False)
         self.assertNotIn(engine.DISK_FULL, res["problems"])
-        self.assertEqual(res["problems"][1], "pacman не смог записать часть файлов (например, "
-                                             "/usr/share/bigpkg/data-101.bin): там кончилось место — освободи его "
-                                             "(df -h покажет, где его мало), потом поставь заново: sudo pacman -S "
-                                             "--dbonly bigpkg && sudo pacman -S bigpkg")
+        self.assertEqual(res["problems"][1:], ["pacman не смог записать часть файлов (например, "
+                                               "/usr/share/bigpkg/data-101.bin): там кончилось место — освободи его "
+                                               "(df -h покажет, где его мало)", mend])
         self.assertEqual(res["fixes"], [])
         self.assertFalse(any("Write failed" in p for p in res["problems"][2:]), res["problems"])
         # no word of which package: what to do all the same
@@ -688,9 +712,194 @@ class Machine(Patching):
                                            "/usr/share/bigpkg/data-080.bin): ошибка записи на диск — проверь диск, "
                                            "потом поставь эти пакеты заново"])
         self.owners["/usr/share/bigpkg/data-080.bin"] = self.owners["/usr/share/bigpkg/data-098.bin"] = "bigpkg"
+        self.after, self.sync = {"bigpkg": "2-1"}, {"bigpkg": "2-1"}
         res = engine.system_checks({}, 0, r, 0, carry=False)           # its files are its own: a plain reinstall
-        self.assertTrue(res["problems"][0].endswith("проверь диск, потом поставь заново: sudo pacman -S bigpkg"),
-                        res["problems"])
+        self.assertEqual(res["problems"], ["pacman записал часть файлов не целиком (например, "
+                                           "/usr/share/bigpkg/data-080.bin): ошибка записи на диск — проверь диск",
+                                           "пакет bigpkg записан не целиком — поставь заново: sudo pacman -S bigpkg"])
+        self.assertEqual(res["unfinished"], ["bigpkg"])                # looked at again by every later update
+
+    # What pacman 7.1 printed when / ran out of inodes (or btrfs out of metadata) while it put growpkg in place: it
+    # could not create files, then not write the package's database entry (the end of the real output, shortened).
+    CANT_CREATE = ("upgrading growpkg...\r\n"
+                   + "".join(f"error: could not extract /usr/share/growpkg/f-{n:04d}.bin (Can't create "
+                             f"'/usr/share/growpkg/f-{n:04d}.bin')\r\n" for n in range(1201, 1260))
+                   + "error: problem occurred while upgrading growpkg\r\nerror: could not open file "
+                   "/var/lib/pacman/local/growpkg-2-1/desc: No space left on device\r\nerror: could not update "
+                   "database entry growpkg-2-1\r\nerror: could not commit transaction\r\nerror: failed to commit "
+                   "transaction (transaction aborted)\r\nErrors occurred, no packages were upgraded.\r\n")
+
+    def test_a_package_whose_files_a_full_disk_did_not_let_be_created(self):
+        """rvE-2: no "Write failed" here, so no package was named, and the reinstall the engine gave fails on an entry
+        pacman cannot read ("invalid or corrupted package"): it is taken out first (pacman -Rdd --dbonly), then the
+        two steps (verified on pacman 7.1, ext4 out of inodes)."""
+        self.after, self.sync = {"growpkg": "2-1"}, {"growpkg": "2-1"}
+        res = engine.system_checks({}, 1, self.fed(self.CANT_CREATE), 0, carry=False)
+        mend = ("пакет growpkg записан не целиком — когда освободишь место, поставь заново: sudo pacman -Rdd --dbonly "
+                "growpkg && sudo pacman -Sdd --dbonly growpkg && sudo pacman -S growpkg")
+        self.assertEqual(res["problems"], ["arch-update завершился с кодом 1", engine.DISK_FULL, mend])
+        self.assertEqual((res["unfinished"], self.summary(res)["unfinished"]), (["growpkg"], ["growpkg"]))
+        for chunk in (4096, 61, 7):                     # the names whole, however the reads cut the lines
+            r = self.fed(self.CANT_CREATE, chunk)
+            self.assertEqual((r.unfinished, r.unwritten_entries), (["growpkg"], ["growpkg"]), chunk)
+        # a database entry pacman could not write is a package it did not finish, whatever it said before
+        r = self.fed("error: could not update database entry lib32-foo-bar-1:2.3-4\r\n")
+        self.assertEqual(r.unwritten_entries, ["lib32-foo-bar"])
+        self.after = {"lib32-foo-bar": "1:2.3-4"}
+        self.assertEqual(engine.system_checks({}, 1, r, 0, carry=False)["unfinished"], ["lib32-foo-bar"])
+
+    def test_the_reinstall_is_made_of_the_installed_versions_package_files(self):
+        """rvE-4: the reinstall took the packages from the repositories: an AUR package (yay builds them, sudo pacman
+        -U puts them in place) is not there ("target not found"), a list with one fails as a whole, and a repository
+        a version further makes a partial upgrade of it. Now: the installed version's file (pacman's cache keeps it,
+        yay and paru keep what they built), else the repository at that version, else that version with the whole
+        update, else the AUR helper (it passes --dbonly on to pacman), one command for each way (all verified on
+        pacman 7.1, yay 13, paru 2); -dd, so that the --dbonly step writes no dependency without its files."""
+        home = os.path.expanduser("~")
+        self.env(XDG_CACHE_HOME=os.path.join(home, f"c-{os.path.basename(self.tmp)}"))
+        self.addCleanup(shutil.rmtree, os.environ["XDG_CACHE_HOME"], True)
+        self.after = {"wine": "11.2-1", "yay-bin": "13.1.0-1", "foo": "1-1", "linux-firmware": "20261101-1",
+                      "brave-bin": "1.2-1"}
+        self.sync = {"wine": "11.3-1", "foo": "1-1", "linux-firmware": "20261201-1"}
+        self.foreign = ["yay-bin", "brave-bin"]
+        os.makedirs(engine.PACMAN_CACHE)
+        wine = os.path.join(engine.PACMAN_CACHE, "wine-11.2-1-x86_64.pkg.tar.zst")
+        for name in ("wine-11.2-1-x86_64.pkg.tar.zst", "wine-11.2-1-x86_64.pkg.tar.zst.sig",
+                     "wine-11.1-1-x86_64.pkg.tar.zst"):
+            write(os.path.join(engine.PACMAN_CACHE, name), "", 0o644)
+        built = os.path.join(os.environ["XDG_CACHE_HOME"], "yay", "yay-bin")
+        os.makedirs(built)
+        for name in ("yay-bin-13.1.0-1-x86_64.pkg.tar.zst", "yay-bin-debug-13.1.0-1-x86_64.pkg.tar.zst",
+                     "yay_13.1.0_x86_64.tar.gz"):
+            write(os.path.join(built, name), "", 0o644)
+        r = self.fed("".join(f"error: problem occurred while upgrading {p}\n" for p in
+                             ("wine", "yay-bin", "foo", "linux-firmware", "brave-bin"))
+                     + "error: could not update database entry foo-1-1\n")
+        res = engine.system_checks({}, 1, r, 0, carry=False)
+        c = f"~/c-{os.path.basename(self.tmp)}/yay/yay-bin/yay-bin-13.1.0-1-x86_64.pkg.tar.zst"
+        self.assertEqual(res["problems"][1:], [
+            f"пакеты wine, yay-bin записаны не целиком — поставь заново: sudo pacman -Udd --dbonly {wine} {c} && "
+            f"sudo pacman -U {wine} {c}",
+            "пакет foo записан не целиком — поставь заново: sudo pacman -Rdd --dbonly foo && sudo pacman -Sdd "
+            "--dbonly foo && sudo pacman -S foo",
+            "пакет linux-firmware записан не целиком — поставь заново: sudo pacman -Sdd --dbonly linux-firmware && "
+            "sudo pacman -Syu linux-firmware",
+            "пакет brave-bin записан не целиком — поставь заново: yay -Sdd --dbonly brave-bin && yay -S brave-bin"])
+        self.assertTrue(all(engine.REINSTALL in p for p in res["problems"][1:]))
+        self.assertEqual(res["unfinished"], ["wine", "yay-bin", "foo", "linux-firmware", "brave-bin"])
+        # a write error that cut files short (pacman went on, its database whole): the plain reinstall, paru's way
+        write(os.path.join(self.tmp, "config", "arch-update", "arch-update.conf"), "AURHelper=paru\n", 0o644)
+        self.sync["bar"] = self.after["bar"] = "3-1"
+        self.assertEqual(engine.reinstall_commands(["brave-bin", "foo", "bar", "not-installed"], dbonly=False),
+                         [(["foo", "bar"], "sudo pacman -S foo bar"), (["brave-bin"], "paru -S brave-bin")])
+        # one pacman could not even register (no entry made): the repository's, with the whole update
+        self.sync["fresh"] = "1-1"
+        self.assertEqual(engine.reinstall_commands(["fresh"]), [(["fresh"], "sudo pacman -Sdd --dbonly fresh && "
+                                                                            "sudo pacman -Syu fresh")])
+
+    def test_a_half_written_package_is_looked_at_again_until_it_is_whole(self):
+        """rvE-1, rvC-2: the package pacman left half written was named by that update only. Updating again (what the
+        full disk's text and F's said) leaves it so: pacman has nothing to do for it, the update was green, the menu
+        stopped warning, the package stayed broken (the Chromebook's wine had 2410 files missing). Every later update
+        now looks at it again with pacman (it only reads), from whatever boot, past an update that did not start: red
+        with the reinstall, naming the update it came from, until pacman finds it whole."""
+        self.after, self.sync = {"bigpkg": "2-1", "other": "1-1"}, {"bigpkg": "2-1"}
+        os.makedirs(engine.PACMAN_CACHE)
+        cached = os.path.join(engine.PACMAN_CACHE, "bigpkg-2-1-any.pkg.tar.zst")
+        write(cached, "", 0o644)
+        mend = f"поставь заново: sudo pacman -Udd --dbonly {cached} && sudo pacman -U {cached}"
+        self.patch(engine, "free_mib", lambda path="/": 3)
+        self.new_run()
+        first = engine.system_checks({}, 1, self.fed(self.NOSPACE), 0, carry=True)
+        self.assertIn(f"пакет bigpkg записан не целиком — когда освободишь место, {mend}", first["problems"])
+        self.assertEqual(self.summary(first)["unfinished"], ["bigpkg"])
+        when = engine._when(self.summary(first)["began"])
+        saved = engine.read_json(engine.summary_path(first["log"]))         # rebooted since
+        engine.write_json(engine.summary_path(first["log"]), dict(saved, boot_id="an-earlier-boot"))
+        self.new_run()
+        engine.not_started("обновление отменено — система не менялась", 1)    # one that did not start: passed over
+        # room made, then "update again": pacman has nothing to do for it, and its file list is still lost
+        self.patch(engine, "free_mib", lambda path="/": 50 * 1024)
+        self.looks = {("-Qk", "bigpkg"): "bigpkg: 0 total files, 0 missing files\n",
+                      ("-Qkk", "bigpkg"): "warning: bigpkg: /usr/share/bigpkg/data-101.bin (SHA256 checksum "
+                                          "mismatch)\nbigpkg: 103 total files, 17 altered files\n"}
+        again = f"не исправлено после обновления в {when}: пакет bigpkg записан не целиком — {mend}"
+        self.new_run()
+        second = self.checks(before={"other": "1-0"}, carry=True)
+        self.assertEqual((second["verdict"], second["problems"], second["unfinished"]), (2, [again], ["bigpkg"]))
+        self.assertEqual(engine.unresolved()["log"], second["log"])         # the menu goes on warning
+        # only the --dbonly step was done: the file list is back, the files are still zeros at their full size
+        self.looks[("-Qk", "bigpkg")] = "bigpkg: 103 total files, 0 missing files\n"
+        self.new_run()
+        third = self.checks(carry=True)
+        self.assertEqual((third["problems"], third["unfinished"]), ([again], ["bigpkg"]))   # when it came from
+        # put back whole
+        self.looks[("-Qkk", "bigpkg")] = "bigpkg: 103 total files, 0 altered files\n"
+        self.new_run()
+        fourth = self.checks(carry=True)
+        self.assertEqual((fourth["verdict"], fourth["problems"], fourth["unfinished"]), (0, [], []))
+        self.assertIn("пакет bigpkg снова цел", fourth["ok"])
+        self.assertIsNone(engine.unresolved())
+        self.looks.clear()
+        self.new_run()
+        fifth = self.checks(carry=True)                 # nothing left to look at: pacman is not asked
+        self.assertEqual((fifth["problems"], fifth["unfinished"]), ([], []))
+        self.assertNotIn("пакет bigpkg снова цел", fifth["ok"])
+
+    def test_what_pacman_says_of_a_sound_machine_is_no_half_written_package(self):
+        """What pacman -Qk / -Qkk said of a stock Arch (179 packages, as a user) where nothing went wrong, and what a
+        full disk leaves (pacman 7.1): only a lost file list, a missing file, or a file of another size or checksum
+        counts; what a user may not read, a changed configuration file, permissions and times, and -Qkk's missing
+        folders that NoExtract emptied do not. A package without files has none to lose; one removed is let go."""
+        self.after = {"sudo": "1.9.17-1", "x": "2-1", "base": "3-3"}
+        sound = ("warning: sudo: /etc/sudoers (failed to calculate SHA256 checksum)\n"
+                 "backup file: sudo: /etc/pam.d/sudo (SHA256 checksum mismatch)\n"
+                 "backup file: sudo: /etc/pam.d/sudo (Size mismatch)\n"
+                 "warning: sudo: /usr/share/doc (No such file or directory)\n"
+                 "warning: sudo: /boot/x (Permission denied)\n"
+                 "warning: sudo: /var/db/sudo (Permissions mismatch)\nwarning: sudo: /usr/bin/sudo (GID mismatch)\n"
+                 "warning: sudo: /etc/mtab (Modification time mismatch)\nsudo: 244 total files, 6 altered files\n")
+        self.looks = {("-Qk", "sudo"): "warning: sudo: /boot/x (Permission denied)\nsudo: 244 total files, 1 missing "
+                                       "file\n", ("-Qkk", "sudo"): sound,
+                      ("-Qk", "base"): "base: 0 total files, 0 missing files\n",
+                      ("-Qkk", "base"): "base: 0 total files, 0 altered files\n"}
+        cases = {   # x: what -Qk said, what -Qkk said → whole, entry
+            "file list lost": ("x: 0 total files, 0 missing files\n", "x: 12 total files, 3 altered files\n",
+                               False, True),
+            "no mtree to tell": ("x: 0 total files, 0 missing files\n", "x: no mtree file\n", False, True),
+            "missing": ("warning: x: /usr/share/x/a (No such file or directory)\nx: 12 total files, 1 missing file\n",
+                        "x: 12 total files, 0 altered files\n", False, True),
+            "zeros": ("x: 12 total files, 0 missing files\n", "warning: x: /usr/share/x/a (SHA256 checksum mismatch)"
+                      "\nx: 12 total files, 1 altered file\n", False, True),
+            "cut": ("x: 12 total files, 0 missing files\n", "warning: x: /usr/share/x/a (Size mismatch)\nx: 12 total "
+                    "files, 1 altered file\n", False, True),
+            "entry": ("error: could not open file /var/lib/pacman/local/x-2-1/files: No such file or directory\n"
+                      "x: 0 total files, 0 missing files\n", "error: could not open file /var/lib/pacman/local/x-2-1/"
+                      "files: No such file or directory\nx: 203 total files, 131 altered files\n", False, False),
+            "no answer": ("", "", False, True),
+            "whole": ("x: 12 total files, 0 missing files\n", "x: 12 total files, 0 altered files\n", True, True)}
+        # the update after one that left them half written: green, said whole again; one removed is let go
+        self.new_run()
+        engine.save_summary({"log": engine.LOG.path, "problems": [], "unfinished": ["sudo", "base", "removed"]})
+        self.new_run()
+        res = self.checks(carry=True)
+        self.assertIn("пакеты sudo, base снова целы", res["ok"])
+        self.assertEqual((res["problems"], res["unfinished"]), ([], []))
+        for case, (quick, full, whole, entry) in cases.items():
+            self.looks[("-Qk", "x")], self.looks[("-Qkk", "x")] = quick, full
+            self.assertEqual(engine.package_state("x"), {"whole": whole, "entry": entry}, case)
+        self.assertEqual(engine.package_state("sudo"), {"whole": True, "entry": True})
+        self.assertEqual(engine.package_state("base"), {"whole": True, "entry": True})
+        self.assertIsNone(engine.package_state("removed"))             # "error: package 'removed' was not found"
+        # an entry pacman cannot read: taken out first in the reinstall
+        self.looks[("-Qk", "x")], self.looks[("-Qkk", "x")] = cases["entry"][:2]
+        self.sync = {"x": "2-1"}
+        self.new_run()
+        engine.save_summary({"log": engine.LOG.path, "problems": [], "unfinished": ["x"]})
+        self.new_run()
+        self.assertEqual(self.checks(carry=True)["problems"], [
+            "не исправлено после обновления в 01.01 00:00: пакет x записан не целиком — поставь заново: sudo pacman "
+            "-Rdd --dbonly x && sudo pacman -Sdd --dbonly x && sudo pacman -S x"])
 
     def test_a_failed_update_on_a_full_disk_says_so(self):
         self.patch(fixes.space, "free", lambda path="/": 3 * 2 ** 20)
@@ -718,6 +927,72 @@ class Machine(Patching):
         self.assertEqual(engine.read_json(path)["problems"], [engine.DISK_FULL])
         old = engine.normal_summary({"problems": [engine.DISK_FULL_OLD, "в выводе: «No space left on device»"]})
         self.assertEqual(old["problems"], [engine.DISK_FULL, "в выводе: «No space left on device»"])
+
+    def test_a_full_disk_is_said_as_it_is_true_wherever_it_is_said(self):
+        """rvE-5: a failed update on a / with next to no room got the full disk's text, "часть файлов не записалась",
+        where pacman wrote everything it began (a file conflict, a keyring). Said now as it is true there, after a
+        full disk during the update and after F made room; it still ends with what the UI knows it by, "обнови ещё
+        раз". Summaries of the version on the machines (8f4397c) say it in their words: read as this one's."""
+        self.patch(engine, "free_mib", lambda path="/": 40)
+        self.patch(fixes.space, "free", lambda path="/": 40 * 2 ** 20)
+        r = self.checks(exitstatus=5)
+        self.assertEqual((r["problems"], self.fix_keys(r)), (["arch-update завершился с кодом 5", engine.DISK_FULL],
+                                                             ["space"]))
+        self.assertNotIn("не записал", engine.DISK_FULL)
+        self.assertNotIn("кончилось", engine.DISK_FULL)
+        self.assertTrue(engine.DISK_FULL.endswith("обнови ещё раз"))
+        live = ("на диске кончилось место («No space left on device») — часть файлов не записалась: освободи место "
+                "(например: sudo pacman -Sc) и обнови ещё раз")
+        self.assertEqual(engine.normal_summary({"problems": [live]})["problems"], [engine.DISK_FULL])
+
+    def test_lines_after_the_update_reach_a_journal_a_full_disk_cut_off(self):
+        """rvC-2: on the Chromebook /home is on the full disk too: the update's journal stopped writing, and what F did
+        later (its lines, ИСПРАВЛЕНО for a journal without a summary) was lost with it. Once there is room, they go
+        into the file directly, each on a line of its own."""
+        self.new_run()
+        engine.LOG.event("СТАРТ", "arch-update")
+        engine.LOG.txt.write("upgrading bigpkg...")                     # cut off in the middle of a line
+        engine.LOG.txt.flush()
+        engine.LOG.broken = True                                        # a write failed: logging stopped
+        engine.LOG.event("ПАКЕТЫ", "lost: the disk was full then")
+        engine.journal_event(engine.LOG.path, "ИСПРАВЛЕНИЕ", "по клавише F: освободить место — исправлено")
+        self.assertTrue(engine.mark_resolved(engine.LOG.path))           # no summary: the journal says it
+        with open(engine.LOG.path, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("upgrading bigpkg...\n[", text)
+        self.assertIn("ИСПРАВЛЕНИЕ] по клавише F: освободить место — исправлено\n", text)
+        self.assertTrue(engine.RESOLVED_LINE.search(text))
+        self.assertNotIn("lost:", text)
+
+    def test_a_summary_a_full_disk_kept_back_is_written_once_there_is_room(self):
+        """rvC-2: with the state folder on the full disk (the Chromebook), the summary of the update that ran out of
+        room was never written: what it said (the packages left half written) reached no later update, and F's
+        space_freed found no summary to change. It is kept, and written at the first chance there is room."""
+        self.after, self.sync = {"bigpkg": "2-1"}, {"bigpkg": "2-1"}
+        self.patch(engine, "free_mib", lambda path="/": 3)
+        self.patch(fixes.space, "free", lambda path="/": 3 * 2 ** 20)
+        self.new_run()
+        real = engine.write_json
+
+        def full(path, data):
+            raise OSError(28, "No space left on device")
+        engine.write_json = full
+        try:
+            first = engine.system_checks({}, 1, self.fed(self.NOSPACE), 0, carry=True)
+            self.assertIsNone(engine.space_freed(first["log"]))       # still no room: nothing written
+        finally:
+            engine.write_json = real
+        self.assertFalse(os.path.exists(engine.summary_path(first["log"])))
+        self.patch(fixes.space, "free", lambda path="/": 50 * 2 ** 30)
+        data = engine.space_freed(first["log"])                         # F made room: written, then changed
+        self.assertTrue(os.path.exists(engine.summary_path(first["log"])))
+        self.assertEqual((data["unfinished"], self.summary(first)["unfinished"]), (["bigpkg"], ["bigpkg"]))
+        self.assertTrue(any(o.startswith("место освобождено") for o in data["ok"]))
+        self.looks = {("-Qk", "bigpkg"): "bigpkg: 0 total files, 0 missing files\n",
+                      ("-Qkk", "bigpkg"): "bigpkg: 103 total files, 9 altered files\n"}
+        self.patch(engine, "free_mib", lambda path="/": 50 * 1024)
+        self.new_run()
+        self.assertEqual(self.checks(carry=True)["unfinished"], ["bigpkg"])     # the next update looks at it again
 
     def test_a_summary_a_full_disk_did_not_let_be_written_still_warns(self):
         self.linux(self.boot_file("vmlinuz-linux"), self.boot_file("initramfs-linux.img", data=b""))
@@ -829,6 +1104,100 @@ class Machine(Patching):
         r = self.checks()                                               # empty now, and still empty after the fix
         write(out, self.probe_says(sizes=[(kernel, 0), (image, 64)], images=[(image, 0, [KVER])]), 0o600)
         self.assertEqual(len(engine.recheck_boot(r["log"], probe=out, failed=True)), 1)
+
+    def test_a_kernel_file_cut_short_is_no_kernel_file(self):
+        """rvE-3: a /boot that ran full while the kernel was copied there (install -Dm644 in mkinitcpio's hook, a
+        first install of linux-lts, F's reinstall) leaves the file cut short: GNU install keeps what it wrote. It was
+        counted as there; the machine does not boot with it. It is compared with the file its package installed
+        (/usr/lib/modules/<version>/vmlinuz, which every user may read); one sbctl signed is larger, and fine."""
+        kernel = self.boot_file("vmlinuz-linux", data=b"k" * 3000)
+        self.linux(kernel, self.boot_file("initramfs-linux.img"))
+        self.vmlinuz(8192)
+        r = self.checks()
+        self.assertEqual([(i["kind"], i["how"]) for i in r["boot"]], [("kernel", "short")])
+        self.assertEqual(r["problems"], [f"{kernel} обрезан — НЕ перезагружайся, система с ним не загрузится "
+                                         "(сначала: sudo pacman -S linux)"])
+        self.assertEqual(self.fix_keys(r), ["kernel"])                 # F puts that version of the kernel back
+        self.assertNotIn("ядро и initramfs на месте", r["ok"])
+        for size in (8192, 8192 + 2104):                                # whole; signed by sbctl
+            write(kernel, "k" * size, 0o644)
+            r = self.checks()
+            self.assertEqual((r["problems"], r["boot"]), ([], []), size)
+            self.assertIn("ядро и initramfs на месте", r["ok"])
+        # a kernel package that puts its file into /boot itself (no copy beside its modules): nothing to compare
+        os.remove(os.path.join(engine.MODULES_DIR, KVER, "vmlinuz"))
+        write(kernel, "k" * 10, 0o644)
+        self.assertEqual(self.checks()["problems"], [])
+
+    def test_a_root_only_kernel_file_cut_short_is_found_by_the_probe(self):
+        kernel, image = self.closed_boot("vmlinuz-linux", "initramfs-linux.img")
+        self.linux(kernel, image)
+        self.vmlinuz(17248768)
+        cut = self.probe_says(sizes=[(kernel, 8388608), (image, 64)], images=[(image, 0, [KVER])])
+        r = self.checks(probe=engine.parse_probe(cut))
+        self.assertEqual([(i["kind"], i["how"], i["path"]) for i in r["boot"]], [("kernel", "short", kernel)])
+        self.assertEqual(self.fix_keys(r), ["kernel"])
+        signed = self.probe_says(sizes=[(kernel, 17248768 + 2104), (image, 64)], images=[(image, 0, [KVER])])
+        r = self.checks(probe=engine.parse_probe(signed))
+        self.assertEqual(r["problems"], [])
+        self.assertIn("ядро и initramfs на месте", r["ok"])
+        # missing, then F (failed: "incomplete"): what its own probe saw as root decides, cut short or whole
+        r = self.checks(probe=engine.parse_probe(self.probe_says(sizes=[(kernel, None), (image, 64)],
+                                                                 images=[(image, 0, [KVER])])))
+        self.assertEqual([(i["kind"], i["how"]) for i in r["boot"]], [("kernel", "missing")])
+        out = os.path.join(self.tmp, "probe.out")
+        write(out, cut, 0o600)
+        self.assertEqual(len(engine.recheck_boot(r["log"], probe=out, failed=True)), 1)
+        self.assertEqual([i["how"] for i in self.summary(r)["boot"]], ["short"])
+        write(out, signed, 0o600)
+        self.assertEqual(engine.recheck_boot(r["log"], probe=out, failed=True), [])
+
+    def test_after_a_failed_fix_a_kernel_file_cut_short_is_not_back(self):
+        """rvE-3 (a): the kernel file was missing; F reinstalled it onto a /boot without room for it, the copy was cut
+        short and the fix ended "incomplete" (failed). The look right after it counted any size as back, the warning
+        went. Now it is back only when whole; then it counts even after a fix that failed."""
+        kernel = os.path.join(self.tmp, "vmlinuz-linux")
+        self.linux(kernel, self.boot_file("initramfs-linux.img"))
+        self.vmlinuz(4096)
+        r = self.checks()
+        self.assertEqual([(i["kind"], i["how"]) for i in r["boot"]], [("kernel", "missing")])
+        write(kernel, "k" * 1024, 0o644)                                # back, cut short
+        said = (f"{kernel} обрезан — НЕ перезагружайся, система с ним не загрузится (сначала: sudo pacman -S linux)")
+        self.assertEqual(engine.recheck_boot(r["log"], failed=True), [said])
+        self.assertEqual(([f["key"] for f in self.summary(r)["fixes"]], self.summary(r)["verdict"]), (["kernel"], 2))
+        self.assertEqual(engine.unresolved()["log"], r["log"])
+        write(kernel, "k" * 4096, 0o644)                                # whole: what the look sees exactly counts
+        self.assertEqual(engine.recheck_boot(r["log"], failed=True), [])
+
+    def test_after_a_mixed_fix_the_images_of_kernels_mended_count(self):
+        """rvU-2: two kernels, both images without modules. F rebuilt linux's (done and checked) and put back
+        linux-lts's (rolled back). The look right after it sees linux's whole: with the set of the kernels whose
+        fixes were not done, that counts; lts's stays. True (the whole run failed, or a fix for the whole machine):
+        both stay, as before."""
+        lts = "6.18.60-1-lts"
+        kernel, image, lts_kernel, lts_image = self.closed_boot("vmlinuz-linux", "initramfs-linux.img",
+                                                                "vmlinuz-linux-lts", "initramfs-linux-lts.img")
+        self.linux(kernel, image)
+        self.kernel("linux-lts", lts, f'ALL_kver="{lts_kernel}"\nPRESETS=(default)\ndefault_image="{lts_image}"\n')
+        sizes = [(kernel, 64), (image, 64), (lts_kernel, 64), (lts_image, 64)]
+        images = [(image, 0, [KVER]), (lts_image, 0, [lts])]
+        r = self.checks(probe=engine.parse_probe(self.probe_says(sizes=sizes, images=images,
+                                                                 without_modules=[image, lts_image])))
+        self.assertEqual(sorted(i["pkg"] for i in r["boot"]), ["linux", "linux-lts"])
+        self.assertEqual([f["id"] for f in r["fixes"]], ["initramfs@linux", "initramfs@linux-lts"])
+        out = os.path.join(self.tmp, "probe.out")                       # the fixes' own probe: linux's whole now
+        write(out, self.probe_says(sizes=sizes, images=images, without_modules=[lts_image]), 0o600)
+        lts_said = (f"в {lts_image} нет модулей ядра {lts} — НЕ перезагружайся, система с ним не загрузится "
+                    "(сначала: sudo mkinitcpio -P)")
+        self.assertEqual(len(engine.recheck_boot(r["log"], probe=out, failed=True)), 2)
+        self.assertEqual(engine.recheck_boot(r["log"], probe=out, failed={"linux-lts"}), [lts_said])
+        self.assertEqual([f["id"] for f in self.summary(r)["fixes"]], ["initramfs@linux-lts"])
+        # mkinitcpio's own error says no kernel: it stays with any set
+        r = self.checks(failures={"errors were encountered during the build"},
+                        probe=engine.parse_probe(self.probe_says(sizes=sizes, images=images)))
+        said = engine.initcpio_issue("errors were encountered during the build")["text"]
+        self.assertCountEqual(engine.recheck_boot(r["log"], probe=out, failed={"linux-lts"}), [said, lts_said])
+        self.assertEqual(engine.recheck_boot(r["log"], probe=out, failed=set()), [lts_said])   # nothing failed
 
     def test_a_kernel_partition_to_flash_has_no_fix_here(self):
         r = self.checks(failures={"You can do this later by running: # dd if=/boot/vmlinux.kpart of=/dev/mmcblk0p1"})
@@ -1698,13 +2067,78 @@ echo "installing"
               "[Action]\nWhen = PreTransaction\nExec = /usr/bin/timeshift-autosnap\nAbortOnFail\n", 0o644)
         self.assertEqual(self.REAL_HOOKS(), ["00-timeshift-autosnap.hook"])
 
+    # pacman's own check (CheckSpace) on a / without snapshots, as pacman 7.1 refused on ext4: after the download
+    # (DOWNLOADED: it checks the transaction then, its progress first), or the downloads themselves
+    REFUSED = r"""#!/bin/bash
+echo ":: Starting full system upgrade..."
+echo
+echo "Packages (1) bigpkg-2-1"
+echo
+echo "Total Download Size:   $DL"
+echo "Total Installed Size:  3072.00 MiB"
+echo "Net Upgrade Size:      3071.00 MiB"
+echo
+read -rp ":: Proceed with installation? [Y/n] " ans
+echo "answer=$ans"
+if [ -n "$DOWNLOADED" ]; then
+    echo ":: Retrieving packages..."
+    for i in $(seq 1 400); do printf ' bigpkg-2-1-any downloading...      %s%%\r' $((i / 4)); done
+    echo
+    echo "(0/1) checking available disk space                [----------------------]   0%"
+    echo "(1/1) checking available disk space                [######################] 100%"
+fi
+echo "error: Partition $MOUNT too full: $NEEDED blocks needed, $FREE blocks free"
+[ -n "$DOWNLOADED" ] && echo "error: not enough free disk space"
+echo "error: failed to commit transaction (not enough free disk space)"
+echo "==> ERROR: An error has occurred during the update process"
+exit 5
+"""
+
+    def refused(self, mount="/", downloaded=True, needed=791297, free=655328, dl="0.10 MiB"):
+        self.patch(engine, "root_snapshots", lambda: None)              # no snapshots: pacman's own count holds
+        self.env(MOUNT=mount, DOWNLOADED="1" if downloaded else "", NEEDED=str(needed), FREE=str(free), DL=dl)
+        self.stub("fake-update", self.REFUSED)
+        _, res, log = self.run_update()
+        self.assertIn("answer=y", log)
+        return res
+
     def test_a_pacman_that_found_too_little_room_itself(self):
-        self.stub("fake-update", "#!/bin/bash\necho 'error: Partition / too full: 12 blocks needed, 3 blocks free'\n"
-                                 "echo 'error: not enough free disk space'\n"
+        """rvC-5: pacman refused the transaction itself ("Partition / too full: N blocks needed, M blocks free"), and
+        the summary said the space fix needs 2 GiB whatever pacman said: with 2.5 GiB free and 3 GiB needed it said
+        too little room and offered no F; with less, F stopped at 2 GiB and the next update was refused again. Now
+        pacman's own count: its blocks (its cushion in them), the downloads again when it refused after them (F's
+        pacman -Sc removes them, the next update downloads them again), or the update's own growth after its
+        downloads when it refused those, and the hooks' margin. The text says the shortfall."""
+        bsize, mib = os.statvfs("/").f_bsize, 2 ** 20
+        res = self.refused()
+        need, free = 791297 * bsize + int(0.10 * mib) + engine.SPACE_MARGIN, 655328 * bsize
+        self.assertEqual((res["started"], res["verdict"], res["problems"]), (False, 1, []))
+        self.assertEqual(res["space"], {"need": need, "free": free})
+        self.assertEqual(res["warnings"], ["мало места на диске — pacman не начал обновление, система не менялась: "
+                                           + engine.space_facts({"need": need, "free": free})])
+        self.assertIn("не хватает", res["warnings"][0])
+        self.assertEqual([(f["key"], f["args"][0]) for f in res["fixes"]], [("space", str(need))])
+        self.assertTrue(engine.space_freed(res["log"])["warnings"] == [])   # F made room: the summary says so
+        # after the download (1.5 GiB, as big as what it installs): the downloads come again
+        res = self.refused(needed=398081, free=157170, dl="1536.04 MiB")
+        self.assertEqual(res["space"]["need"], 398081 * bsize + int(1536.04 * mib) + engine.SPACE_MARGIN)
+        # the downloads themselves did not fit: they, and what the update grows by after them
+        res = self.refused(downloaded=False, needed=398347, free=307197, dl="1536.04 MiB")
+        self.assertEqual(res["space"]["need"], 398347 * bsize + 3071 * mib + engine.SPACE_MARGIN)
+        self.assertEqual(res["space"]["free"], 307197 * bsize)
+        # another file system: said, and no space fix for / (it would not help)
+        res = self.refused(mount=self.tmp, needed=300, free=44)
+        self.assertEqual(res["warnings"], [f"мало места на диске на {self.tmp} — pacman не начал обновление, система "
+                                           f"не менялась: не хватает {engine.size_text(-(-256 * bsize // mib) * mib)}"])
+        self.assertNotIn("space", res)
+        self.assertEqual(res["fixes"], [])
+        # pacman said only that there was not enough room: the space fix's own amount
+        self.stub("fake-update", "#!/bin/bash\necho 'error: not enough free disk space'\n"
                                  "echo 'error: failed to commit transaction (not enough free disk space)'\nexit 5\n")
         _, res, _ = self.run_update()
         self.assertEqual((res["started"], res["verdict"], res["warnings"]), (False, 1, [engine.FULL_BEFORE]))
-        self.assertEqual([f["key"] for f in res["fixes"]], ["space"])
+        self.assertEqual((res["space"]["need"], [f["key"] for f in res["fixes"]]),
+                         (fixes.space.AFTER_FULL, ["space"]))
 
     def test_a_manual_run_is_warned_and_answers_itself(self):
         class View(engine.TerminalView):
