@@ -1443,6 +1443,12 @@ class Machine(Patching):
 
     def test_summaries_go_with_their_journals(self):
         logs = engine.LOG.dir
+        engine.LOG.txt.close()
+        engine.LOG.raw.close()
+        # only these journals and the new one: the run's own journal of setUp counts as one more when the clock has
+        # passed a second since (its name is that second), and a journal more takes one of these with it
+        for f in glob.glob(os.path.join(logs, "20*")):
+            os.remove(f)
         for i in range(engine.KEEP_LOGS + 2):
             for ext in (".log", ".raw", ".json"):
                 write(os.path.join(logs, f"2000-01-01_00-00-{i:02d}{ext}"), "{}", 0o644)
