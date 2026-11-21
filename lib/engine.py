@@ -16,6 +16,7 @@ import configparser
 import datetime
 import glob
 import json
+import mmap
 import os
 import re
 import select
@@ -1524,6 +1525,12 @@ class TerminalView:
     def fallback(self, tb):
         self.message("\n[автоответчик] внутренняя ошибка, дальше отвечай сам:\n" + tb, C_RED)
 
+    def held_ctrl_c(self):
+        """Ctrl+C was not passed on: pacman is in its transaction (Responder.user_input)."""
+        self.message("\n[автоответчик] pacman устанавливает пакеты: Ctrl+C сейчас оборвал бы его до хуков "
+                     "(initramfs, NVIDIA, подпись) — не передаю. Копировать: Ctrl+Shift+C. "
+                     "Прервать всё равно: Ctrl+], затем Ctrl+C.\n", C_YEL)
+
 
 VIEW = TerminalView()
 
@@ -1898,9 +1905,7 @@ class Responder:
         if b"\x03" in data and not self.forced and pacman_busy():
             data = data.replace(b"\x03", b"")
             LOG.event("CTRL+C", "не передан: pacman в процессе установки")
-            say("\n[автоответчик] pacman устанавливает пакеты: Ctrl+C сейчас оборвал бы его до хуков "
-                "(initramfs, NVIDIA, подпись) — не передаю. Копировать: Ctrl+Shift+C. "
-                "Прервать всё равно: Ctrl+], затем Ctrl+C.\n", C_YEL)
+            VIEW.held_ctrl_c()
         if self.mode == "manual" and not self.heard:
             data = b"\x03" if b"\x03" in data else b""      # typed before the program spoke: only Ctrl+C goes
         if self.mode in ("handover", "manual"):
@@ -2930,13 +2935,32 @@ def terminal_hung_up(view):
     return False
 
 
+SCREEN = None       # in the shield's child: one byte its parent reads, 1 while the window shows (on_screen)
+
+
+def on_screen(window):
+    """The window is on the screen (the terminal's alternate one) or the terminal's own screen is: for the shield's
+    parent, which puts the terminal back if this process is killed (shield_from_window_close)."""
+    if SCREEN is not None:
+        SCREEN[0] = 1 if window else 0
+
+
 def shield_from_window_close():
     """Konsole closes a window with SIGHUP and then SIGKILL to the process it started, and a pty
     hangup SIGHUPs that session. Do the work in a child in its own session so a closed window can
-    never hang up arch-update/pacman mid-transaction. The parent just relays and waits."""
+    never hang up arch-update/pacman mid-transaction. The parent just relays and waits; if the child is
+    killed (the OOM killer, a kill) with the terminal still there, the parent puts the terminal back as
+    the child found it: its own screen, the cursor, the settings (the child's own cleanup never ran)."""
+    global SCREEN
+    try:
+        saved = termios.tcgetattr(0)
+    except (termios.error, OSError, ValueError):
+        saved = None
+    shared = mmap.mmap(-1, 1)
     pid = os.fork()
     if pid == 0:
         os.setsid()
+        SCREEN = shared
         return
     for sig in (signal.SIGINT, signal.SIGQUIT, signal.SIGTSTP):
         signal.signal(sig, signal.SIG_IGN)
@@ -2947,6 +2971,13 @@ def shield_from_window_close():
             break
         except InterruptedError:
             continue
+    if os.WIFSIGNALED(status) and os.WTERMSIG(status) != signal.SIGHUP and saved is not None:
+        try:
+            termios.tcsetattr(0, termios.TCSADRAIN, saved)
+            os.write(1, ("\x1b[?2026l\x1b[0m\x1b[?7h\x1b[?25h" + ("\x1b[2J\x1b[?1049l" if shared[0] else "")
+                         + "\r\n").encode())
+        except (termios.error, OSError, ValueError):
+            pass
     code = os.waitstatus_to_exitcode(status)
     os._exit(code if code >= 0 else 128 - code)
 
@@ -2976,12 +3007,74 @@ class Feed:
         return next((x for x in reversed(segs) if self.TOTAL.search(x)), segs[-1] if segs else "")
 
 
+def program_over(child):
+    """True once the program in child has ended and nothing of its session runs any more, pacman holding no lock. Its
+    pty can stay open after that: a daemon it started in a session of its own keeps it (arch-update's tray applet kept
+    the stderr it was given), and then the EOF pump waits for never comes. Anything of the program's session still
+    running is waited for (pacman, when the program itself was killed under it), and so is everything when /proc
+    shows only this user's processes (hidepid): pacman, run through sudo, would not be seen there."""
+    try:
+        if child.isalive():
+            return False
+    except Exception:
+        return False
+    if os.path.exists(PACMAN_LOCK):
+        return False
+    try:
+        with open("/proc/1/stat", "rb"):
+            pass
+        names = os.listdir("/proc")
+    except OSError:
+        return False
+    sid = str(child.pid).encode()
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat", "rb") as f:
+                stat = f.read()
+        except OSError:
+            continue
+        fields = stat[stat.rfind(b")") + 2:].split()     # state, ppid, pgrp, session, ...
+        if len(fields) > 3 and fields[3] == sid and fields[0] != b"Z":
+            return False
+    return True
+
+
+def read_to_end(child, out):
+    """out(data) for each read of the output until the program is over, as pump (program_over included): the last
+    resort when pump itself failed, so that the program is never left running unwatched."""
+    over = None
+    while True:
+        try:
+            ready = select.select([child.child_fd], [], [], 0.25)[0]
+        except InterruptedError:
+            continue
+        except (OSError, ValueError):
+            return
+        if ready:
+            try:
+                data = os.read(child.child_fd, 65536)
+            except OSError:
+                data = b""
+            if not data:
+                return
+            out(data)
+        now = time.time()
+        if over is None and program_over(child):
+            over = now
+        if over is not None and (not ready and now - over > 0.3 or now - over > 3):
+            return
+
+
 def pump(child, responder, auto):
-    """Copy arch-update <-> view until arch-update closes its pty.
+    """Copy arch-update <-> view until arch-update closes its pty, or it is over while something it started in a
+    session of its own holds that open (program_over).
     auto=False is a plain pass-through that never touches the responder logic."""
     stdin_open = TERM_OK
     last_out, pending = time.time(), auto   # after a fallback a question may already be waiting
     forced = False
+    over, look = None, 0.0                  # when program_over was first true; when to look again
     while True:
         fds = [child.child_fd] + ([0] if stdin_open and TERM_OK else [])
         try:
@@ -3024,6 +3117,13 @@ def pump(child, responder, auto):
                             child.send(data.replace(b"\x1d", b""))
                         except OSError:
                             pass
+        now = time.time()
+        if over is None and now >= look:
+            look = now + 0.25
+            if program_over(child):
+                over = now
+        if over is not None and (child.child_fd not in ready and now - over > 0.3 or now - over > 3):
+            return                          # what it wrote before it ended is read by now
         if auto and not TERM_OK and responder.mode != "auto":
             responder.detach()
             pending, last_out = True, 0.0     # re-match the waiting question right now

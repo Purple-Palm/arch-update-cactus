@@ -35,7 +35,9 @@ MENU_NEW=0
 BANNER_SHOWN=${ARCH_UPDATE_BANNER_SHOWN-}     # the bootstrap showed it before starting this copy
 unset ARCH_UPDATE_BANNER_SHOWN
 EVENTS=${ARCH_UPDATE_INSTALL_EVENTS-}         # --steps: where the installer's window reads what happens (event)
-unset ARCH_UPDATE_INSTALL_EVENTS
+USER_ENV=${ARCH_UPDATE_USER_ENV-}             # --steps: what the window changed in the environment (user_env)
+unset ARCH_UPDATE_INSTALL_EVENTS ARCH_UPDATE_USER_ENV
+AGAIN="Исправь и запусти установщик снова: что уже стоит, второй раз не ставится."
 
 # ── output: the look of the UI on a terminal, plain text in a pipe or a log (sync.log, the tests) ──
 
@@ -177,6 +179,10 @@ die() {
 	mark '✗' "$BAD" "$@" >&2
 	exit 1
 }
+note() {                                    # a passing word (trying again): in the window, for a moment only
+	event note "$@"
+	mark '!' "$WARN" "$@" >&2
+}
 
 # "  ✓ <step> · <detail>": a step done, or a check that found everything in place.
 ok() {
@@ -242,8 +248,9 @@ row() {
 	done
 }
 
-# What the installer's window shows (--steps): each step, its result, a warning, why the install stopped, a row of
-# the final report. One line per event, its fields (the arguments) split by tabs; a newline in one goes as \x1f.
+# What the installer's window shows (--steps): each step, its result, a warning, a passing note, why the install
+# stopped, a row of the final report. One line per event, its fields (the arguments) split by tabs; a newline in one
+# goes as \x1f.
 event() {
 	[[ -n $EVENTS ]] || return 0
 	local IFS=$'\t' line
@@ -440,7 +447,7 @@ again() {
 		rc=0
 		aur_try "$@" || rc=$?
 		((rc == 1 && try < 3)) || return "$rc"
-		warn "$what: сервер не ответил — пробую ещё раз через $((PAUSE * try)) с"
+		note "$what: сервер не ответил — пробую ещё раз через $((PAUSE * try)) с"
 		sleep $((PAUSE * try))
 	done
 }
@@ -492,13 +499,12 @@ install_packages() {
 	if ! "$ROOT/bin/arch-update-launcher" --terminal >/dev/null; then
 		missing+=(kitty)
 	fi
-	local again="Исправь и запусти установщик снова: что уже стоит, второй раз не ставится."
 	if ((${#missing[@]})); then
 		step "ставлю пакеты: ${missing[*]}"
 		need_sudo
 		sudo pacman -S --needed "${missing[@]}" ||
 			die "пакеты не поставились." "Если не пустил sudo — проверь: sudo -v" \
-				"Если pacman не нашёл их на зеркале — сначала обнови систему:" "  sudo pacman -Syu" "$again"
+				"Если pacman не нашёл их на зеркале — сначала обнови систему:" "  sudo pacman -Syu" "$AGAIN"
 		ok "пакеты" "поставлены"
 	else
 		ok "пакеты" "всё нужное уже стоит"
@@ -511,8 +517,8 @@ install_packages() {
 	else
 		step "ставлю yay — помощник для пакетов из AUR"
 		need_sudo
-		sudo pacman -S --needed base-devel || die "не поставился base-devel (нужен, чтобы собрать yay)." "$again"
-		makepkg_aur yay-bin || die "yay не собрался: AUR недоступен или сборка упала (её вывод выше)." "$again"
+		sudo pacman -S --needed base-devel || die "не поставился base-devel (нужен, чтобы собрать yay)." "$AGAIN"
+		makepkg_aur yay-bin || die "yay не собрался: AUR недоступен или сборка упала (её вывод выше)." "$AGAIN"
 		helper=yay
 		ok "AUR" "yay поставлен"
 	fi
@@ -534,13 +540,26 @@ install_packages() {
 			die "$pkg не поставился: ни AUR, ни его зеркало на GitHub не ответили (вывод выше)." \
 				"Проверь интернет (например: ping -c3 archlinux.org) и запусти установщик снова."
 		elif ((rc)); then
-			die "$pkg с зеркала AUR не собрался или не поставился (вывод makepkg выше)." "$again"
+			die "$pkg с зеркала AUR не собрался или не поставился (вывод makepkg выше)." "$AGAIN"
 		fi
 	elif ((rc)); then
-		die "$pkg не поставился из AUR (вывод $helper выше)." "$again"
+		die "$pkg не поставился из AUR (вывод $helper выше)." "$AGAIN"
 	fi
 	command -v arch-update >/dev/null || die "arch-update не установился"
 	ok "arch-update" "поставлен"
+}
+
+# user_env <command…>: the command in the user's own environment. The installer's window gives --steps English
+# messages for the questions it answers (see arch-update-ui's run_install, which says what it changed: a line
+# "NAME=value", or "NAME" for one that was not set); the tray goes on running after the install, in the user's
+# language. Elsewhere the command as it is.
+user_env() {
+	local unset=() set=() line
+	while IFS= read -r line; do
+		[[ $line =~ ^[A-Za-z_][A-Za-z0-9_]*(=.*)?$ ]] || continue
+		if [[ $line == *=* ]]; then set+=("$line"); else unset+=(-u "$line"); fi
+	done <<<"$USER_ENV"
+	env "${unset[@]}" "${set[@]}" "$@"
 }
 
 setup_arch_update() {
@@ -559,7 +578,8 @@ setup_arch_update() {
 			"Закомментируй его"
 	fi
 	local autostart=$config/autostart/arch-update-tray.desktop
-	[[ -f $autostart ]] || arch-update --tray --enable >/dev/null || true
+	# --enable starts the applet too, keeping what it was given: never our terminal (the window's would stay open)
+	[[ -f $autostart ]] || user_env arch-update --tray --enable >/dev/null 2>&1 </dev/null || true
 	systemctl --user enable --now --quiet arch-update.timer 2>/dev/null || true
 	# The tray picks the menu entry's file once, when it starts: one that started before our
 	# entry existed keeps opening the plain arch-update until it is restarted.
@@ -571,11 +591,11 @@ setup_arch_update() {
 			else
 				pkill -xu "$USER" arch-update-tra || true
 				sleep 1
-				setsid -f arch-update --tray >/dev/null 2>&1 </dev/null || true
+				user_env setsid -f arch-update --tray >/dev/null 2>&1 </dev/null || true
 			fi
 		fi
 	else
-		setsid -f arch-update --tray >/dev/null 2>&1 </dev/null || true
+		user_env setsid -f arch-update --tray >/dev/null 2>&1 </dev/null || true
 	fi
 	# Claim only what is so. The icon is there when the applet runs in a graphical session (one just
 	# started gets two seconds to come up); from ssh or a console it has no screen to show on here,
@@ -726,21 +746,32 @@ install_all() {
 }
 
 # The install in the app's own window (arch-update-ui --install runs install_all through --steps and asks about
-# reports itself), on a terminal it fits: 80x24, as the app. The window needs python and pexpect, so they come
-# first, here. Returns only when the window could not start (it exits 3 then): the install goes on as text. Else
-# the script ends with the install's result, and what the window showed that matters later stays in the terminal:
-# the warnings of the steps, why the install stopped, the final report.
+# reports itself), on a terminal it fits: 80x24, as the app, one that shows colours (NO_COLOR: the text). The window
+# needs python and pexpect, so what of them is missing comes first, here. Returns only when the window could not
+# start (it exits 3 then): the install goes on as text. Else the script ends with the install's result, and what the
+# window showed that matters later stays in the terminal: the warnings of the steps, why the install stopped (the
+# window itself leaves the output there when it stopped, and exits 2 then), the final report.
 window() {
-	local size rows cols rc=0 events
-	((TTY)) && [[ -t 0 && ${ARCH_UPDATE_INSTALL_UI-1} != 0 && ${TERM-} != linux ]] || return 0
+	local size rows cols rc=0 events need=() p
+	((TTY)) && [[ -t 0 && ${ARCH_UPDATE_INSTALL_UI-1} != 0 && ${TERM-} != linux && -z ${NO_COLOR-} ]] || return 0
 	size=$(stty size 2>/dev/null </dev/tty) || return 0
 	read -r rows cols <<<"$size"
 	[[ $rows =~ ^[0-9]+$ && $cols =~ ^[0-9]+$ ]] && ((rows >= 24 && cols >= 80)) || return 0
 	if ! python3 -c 'import pexpect' 2>/dev/null; then
-		step "ставлю python и python-pexpect: на них работает окно установщика"
+		for p in python python-pexpect; do         # only what is missing: never a python other than the one installed
+			pacman -Q "$p" >/dev/null 2>&1 || need+=("$p")
+		done
+		((${#need[@]})) || return 0                 # both there and still no pexpect for this python: the text install
+		if ((${#need[@]} == 1)); then
+			step "ставлю ${need[0]} — на нём работает окно установщика"
+		else
+			step "ставлю ${need[0]} и ${need[1]} — на них работает окно установщика"
+		fi
 		need_sudo
-		sudo pacman -S --needed python python-pexpect || return 0     # the text install says what went wrong
-		ok "python" "поставлен"
+		sudo pacman -S --needed "${need[@]}" ||
+			die "пакеты не поставились." "Если не пустил sudo — проверь: sudo -v" \
+				"Если pacman не нашёл их на зеркале — сначала обнови систему:" "  sudo pacman -Syu" "$AGAIN"
+		if ((${#need[@]} == 1)); then ok "${need[0]}" "поставлен"; else ok "${need[0]} и ${need[1]}" "поставлены"; fi
 	fi
 	events=$(mktemp)
 	ARCH_UPDATE_INSTALL_EVENTS=$events python3 "$ROOT/bin/arch-update-ui" --install || rc=$?
@@ -748,7 +779,7 @@ window() {
 		rm -f "$events"
 		return 0
 	fi
-	replay "$events"
+	replay "$events" "$((rc == 2))"
 	rm -f "$events"
 	if ((rc)); then
 		((STOPPED)) ||
@@ -760,21 +791,22 @@ window() {
 	exit 0
 }
 
-# The events the window showed (see event), in the terminal once it closed: the warnings of the steps and why the
-# install stopped (STOPPED=1). The final report's own warnings come with summary: the replay ends where it begins.
+# replay <events> [quiet]: the events the window showed (see event), in the terminal once it closed: the warnings of
+# the steps and why the install stopped (STOPPED=1). The final report's own warnings come with summary: the replay
+# ends where it begins. quiet=1: the window left the output in the terminal itself, these with it; only STOPPED.
 STOPPED=0
 replay() {
 	local -a parts
-	local kind
+	local kind quiet=${2-0}
 	while IFS=$'\t' read -r -a parts; do
 		((${#parts[@]})) || continue
 		kind=${parts[0]}
 		parts=("${parts[@]:1}")
 		parts=("${parts[@]//$'\x1f'/ }")
 		case $kind in
-		warn) mark '!' "$WARN" "${parts[@]}" ;;
+		warn) ((quiet)) || mark '!' "$WARN" "${parts[@]}" ;;
 		fail)
-			mark '✗' "$BAD" "${parts[@]}" >&2
+			((quiet)) || mark '✗' "$BAD" "${parts[@]}" >&2
 			STOPPED=1
 			;;
 		finish) break ;;
@@ -803,7 +835,7 @@ main() {
 		[[ -n $EVENTS ]] || die "--steps — для окна установщика; установка: $DEST/install.sh"
 		[[ $EUID -ne 0 ]] || die "запусти от своего пользователя, не от root"
 		install_all
-		summary
+		summary >/dev/null 2>&1    # its events only: the window shows it, then install.sh prints it once it closed
 		;;
 	"")
 		[[ $EUID -ne 0 ]] || die "запусти от своего пользователя, не от root"

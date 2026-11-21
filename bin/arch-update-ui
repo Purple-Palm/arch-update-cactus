@@ -332,7 +332,7 @@ def bar(c, x, y, w, frac, color, alpha=1.0):
             c.put(x + i, y, " ", bg=TRACK, alpha=alpha)
 
 
-KEY_RE = re.compile(r"(?<!\S)(↑↓|←→|[↑↓←→]|Enter|Esc|Space|Ctrl\+\]|стрелки|[A-Za-z])(?=\s)")
+KEY_RE = re.compile(r"(?<!\S)(↑↓|←→|[↑↓←→]|Enter|Esc|Space|Ctrl\+\]|Ctrl\+C|стрелки|[A-Za-z])(?=\s)")
 
 
 def keyline(c, y, text, col=DIM, key=TEXT, alpha=1.0, x=None, bg=None):
@@ -389,10 +389,12 @@ class Screen:
         self.canvas = Canvas(*self.size)
 
     def enter(self):
+        engine.on_screen(True)                  # if this process is killed, the shield's parent leaves it
         self.write("\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[2J")
 
     def leave(self):
         self.write("\x1b[0m\x1b[2J\x1b[?7h\x1b[?25h\x1b[?1049l")
+        engine.on_screen(False)
 
     def write(self, s):
         if not engine.TERM_OK:
@@ -2661,14 +2663,7 @@ def pump_through(child, responder, view):
             return
         except Exception:
             note_ui_error(traceback.format_exc())
-    while True:
-        try:
-            data = os.read(child.child_fd, 65536)
-        except OSError:
-            data = b""
-        if not data:
-            return
-        view.out(data)
+    engine.read_to_end(child, view.out)
 
 
 def back_to_canvas(app, lines):
@@ -3734,6 +3729,11 @@ def self_test():
                    + "error: что-то не так\r\n\tс табуляцией").encode())
         iv.answered("pacman proceed", "Proceed with installation? [Y/n]", "y")
         shot(iv.draw)
+        iv.held_ctrl_c()                            # what the note says when Ctrl+C waits for pacman: whole
+        iv.draw()
+        if iv.note[1] not in "\n".join("".join(row) for row in c.ch):
+            raise RuntimeError(f"the installer's note about Ctrl+C is cut short at {w}x{h}")
+        c.clear()
         iv.event("warn", ["AUR недоступен — беру yay-bin из официального зеркала AUR на GitHub", "  ping -c3 archlinux.org"])
         iv.modal, iv.secret, iv.input = ("запрос пароля", "[sudo] password for tester:"), True, "secret"
         shot(iv.draw)
@@ -3744,6 +3744,8 @@ def self_test():
         for status in (1, 130):
             rows_, lines_ = install_lines(iv, status, None)
             shot(lambda: draw_install_end(app, iv, status, rows_, lines_, 2.0))
+        if "(её вывод — Ctrl+])." not in install_lines(iv, 1, None)[1][0][1][0]:
+            raise RuntimeError("the installer's end screen says the output is above it")     # it is a key away
         done = InstallView(app, None)
         done.t_start = time.time() - 5
         for key, _ in INSTALL_STAGES:
@@ -3775,10 +3777,31 @@ def self_test():
         for must in ("окружение", "отчёты", "включены", "«Расширениях»", "gnome-shell-extension-appindicator"):
             if must not in text:
                 raise RuntimeError(f"the installer's report leaves out {must!r} at {w}x{h}")
+        for n in (4, 12):                           # a flaky AUR day, and worse: what does not fit is said to be left
+            for i in range(n):
+                done.event("warn", [f"предупреждение {i}: что-то пошло не так, как хотелось бы", f"  команда-{i}"])
+            rows_, lines_ = install_lines(done, 0, True)
+            draw_install_end(app, done, 0, rows_, lines_, 2.0)
+            text = "\n".join("".join(row) for row in c.ch)
+            c.clear()
+            left = re.search(r"… и ещё (\d+) строк", text)
+            seen = sum(f"команда-{i}" in text for i in range(n)) + sum(f"предупреждение {i}:" in text for i in range(n))
+            if seen + (int(left.group(1)) if left else 0) < 2 * n:
+                raise RuntimeError(f"the installer's report leaves warnings out unsaid at {w}x{h}")
+            done.warns = done.warns[:2]
     tail = OutputTail()                         # the frame's terminal: redraws, erased lines, the cursor moved up
     tail.push(b"abc\rxy\x1b[K\r\none\r\ntwo\r\n\x1b[2A\rONE\r\n\x1b[1B\x1b[31mthree\x1b[0m\r\n")
     if tail.last(9) != ["xy", "ONE", "two", "three"]:
         raise RuntimeError(f"the installer's output frame shows {tail.last(9)}")
+    tail = OutputTail()                         # pacman's parallel downloads: up to a bar, back down to the total
+    tail.push(b" a.pkg   0%\r\n b.pkg   0%\r\n Total (0/2)   0%")
+    tail.push(b"\x1b[2F\x1b[K a.pkg 100%\x1b[2E\x1b[K Total (1/2)  50%"
+              b"\x1b[1F\x1b[K b.pkg 100%\x1b[1E\x1b[K Total (2/2) 100%")
+    if tail.last(9) != [" a.pkg 100%", " b.pkg 100%", " Total (2/2) 100%"]:
+        raise RuntimeError(f"the installer's output frame shows pacman's downloads as {tail.last(9)}")
+    if (output_colour("==> ERROR: A failure occurred in build().") != BAD or output_colour("==> WARNING: x") != WARN
+            or output_colour("==> Making package: yay-bin") in (BAD, WARN)):
+        raise RuntimeError("the installer's output frame does not show makepkg's errors as errors")
     gate.set()
     building.finish()
     print("arch-update-ui: self-test ok")
@@ -3788,6 +3811,7 @@ def self_test():
 
 INSTALL_SH = os.path.join(os.path.dirname(HERE), "install.sh")
 NO_WINDOW = 3                  # --install could not show its window: install.sh installs as text instead
+TOLD = 2                       # it stopped, and the terminal has its output, install.sh's own word on it included
 # install.sh's steps (its "stage" events), in their order.
 INSTALL_STAGES = (("packages", "Пакеты"), ("aur", "Помощник AUR"), ("arch-update", "arch-update"),
                   ("check", "Самопроверка"), ("files", "Программы и меню"), ("setup", "Значок и таймеры"))
@@ -3812,7 +3836,8 @@ MAKEPKG_PHASES = (("Making package", 0.08), ("Retrieving sources", 0.15), ("Vali
 
 class OutputTail:
     """The last lines of the output as a terminal shows them, without the colours: enough of a terminal for what
-    pacman, yay and makepkg write (\\r redraws, erasing a line, the cursor moved for parallel downloads)."""
+    pacman, yay and makepkg write (\\r redraws, erasing a line, the cursor moved between the bars of parallel
+    downloads: pacman goes up and down with ESC[nF and ESC[nE)."""
     TOKEN = re.compile(r"\x1b\[([0-?]*)[ -/]*([@-~])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]"
                        r"|\x1b[^\[\]]?|([\r\n\b\t])|([^\x00-\x1f\x7f\x1b]+)|[\x00-\x1f\x7f]")
 
@@ -3846,11 +3871,15 @@ class OutputTail:
     def csi(self, final, args):
         n = max(1, args[0])
         line = self.lines[self.row]
-        if final == "A":
+        if final in "AF":                       # up n lines (F: to the line's start)
             self.row = max(0, self.row - n)
-        elif final == "B":
+            if final == "F":
+                self.col = 0
+        elif final in "BE":                     # down n lines (E: to the line's start)
             self.row += n
             self.lines += [""] * (self.row + 1 - len(self.lines))
+            if final == "E":
+                self.col = 0
         elif final == "C":
             self.col += n
         elif final == "D":
@@ -3869,9 +3898,9 @@ class OutputTail:
 
 def output_colour(line):
     s = line.lstrip()
-    if re.match(r"(?i)(error|fatal|ошибка)\b|✗", s):
+    if re.match(r"(?i)(==>\s*)?(error|fatal|ошибка)\b|✗", s):     # makepkg: "==> ERROR: ..."
         return BAD
-    if re.match(r"(?i)warning\b|!\s", s):
+    if re.match(r"(?i)(==>\s*)?warning\b|!\s", s):
         return WARN
     if s.startswith("✓"):
         return GOOD
@@ -3887,6 +3916,7 @@ class InstallView(engine.TerminalView):
     comes as it is and the user answers everything (the responder's manual mode); back here the answers are automatic
     again. If drawing ever fails, the console stays: the install goes on."""
     animated = True
+    KEEP = 512 * 1024           # bytes of output kept at least: more than a whole first install writes
 
     def __init__(self, app, events):
         super().__init__()
@@ -3897,7 +3927,8 @@ class InstallView(engine.TerminalView):
         self.cur, self.sub, self.shown = None, 0.0, 0.0
         self.warns, self.failed, self.rows, self.version = [], None, [], None
         self.out_tail = OutputTail()
-        self.raw_tail, self.total, self.upto = b"", 0, 0    # bytes of output: kept, received, shown in the console
+        # bytes of output: the last ones kept, all received, all the terminal's own screen has had (the console)
+        self.raw, self.total, self.upto = bytearray(), 0, 0
         self.modal, self.input, self.secret = None, "", False
         self.console = self.broken = False
         self.responder, self.prior = None, None
@@ -3937,6 +3968,8 @@ class InstallView(engine.TerminalView):
             if st:
                 st["warned"] = True
             self.say(" ".join(" ".join(args).split()), WARN)
+        elif kind == "note" and args:                       # for a moment only (a retry): not a warning
+            self.say(" ".join(" ".join(args).split()), WARN)
         elif kind == "fail" and args:
             self.failed = args
             if st:
@@ -3951,7 +3984,9 @@ class InstallView(engine.TerminalView):
 
     # engine hooks
     def output(self, data, *_):
-        self.raw_tail = (self.raw_tail + data)[-120_000:]
+        self.raw += data
+        if len(self.raw) > 2 * self.KEEP:
+            del self.raw[:-self.KEEP]
         self.total += len(data)
         if self.console:
             self.out(data)
@@ -3984,6 +4019,15 @@ class InstallView(engine.TerminalView):
             text = " ".join(msg.replace("[автоответчик]", "").split())
             if text:
                 self.say(text, WARN)
+
+    def held_ctrl_c(self):
+        """Ctrl+C waits while pacman is in its transaction, here with no way round it (Ctrl+] is the console)."""
+        if self.console or self.broken:
+            super().message("\r\n[Arch-Update] pacman ставит пакеты: Ctrl+C сейчас оборвал бы его до хуков "
+                            "(initramfs, NVIDIA, подпись) — не передаю. Прервать установку можно, когда pacman "
+                            "закончит. Копировать: Ctrl+Shift+C.\r\n", engine.C_YEL)
+        else:
+            self.say("Ctrl+C не передан, пока pacman ставит пакеты", WARN)
 
     def answered(self, label, line, answer):
         if label in ("press enter to quit", "press enter to continue"):
@@ -4028,6 +4072,19 @@ class InstallView(engine.TerminalView):
                 pass
 
     # the console and back
+    def show_unseen(self):
+        """Into the terminal's own screen: the output it has not had yet (what came while the window showed). Returns
+        what was written."""
+        missing = self.total - self.upto
+        data = bytes(self.raw[-missing:]) if missing else b""
+        if missing > len(self.raw):
+            super().message("\r\n[Arch-Update] … начало вывода не сохранилось\r\n", engine.C_DIM)
+            data = data[data.find(b"\n") + 1:]             # from a line's start
+        if data:
+            self.out(data)
+        self.upto = self.total
+        return data
+
     def to_console(self, why=CONSOLE_SAYS):
         r = self.responder
         if r and r.mode != "manual":
@@ -4036,31 +4093,31 @@ class InstallView(engine.TerminalView):
         self.console = True
         self.fit_pty()
         self.s.leave()
-        missing = self.total - self.upto                    # what came while the window showed
-        if missing > len(self.raw_tail):
-            super().message("\r\n[Arch-Update] … начало вывода не сохранилось\r\n", engine.C_DIM)
-        if missing:
-            self.out(self.raw_tail[-missing:])
-        self.upto = self.total
+        self.show_unseen()
         super().message(f"\r\n[Arch-Update] {why}\r\n", engine.C_YEL)
         if self.app.child and r and r.waiting():         # a question waits: it again, under the note, for the answer
-            self.out(self.raw_tail[self.raw_tail.rfind(b"\n") + 1:])
+            self.out(bytes(self.raw[self.raw.rfind(b"\n") + 1:]))
 
     def to_window(self):
         if self.broken:
             return
         r = self.responder
         if r and r.mode == "manual":
-            if r.user_typed:                                # answered in the console (or began to)
-                partial = re.split(rb"[\r\n]", r.typed)[-1]
-                if partial:                                 # a half-typed answer goes, as when the window closes
-                    r.flush_child_input()
-                    echo = partial.decode("utf-8", "replace")
-                    if r.tail.endswith(echo):
-                        r.tail = r.tail[:-len(echo)]
-                r.mode, self.modal = "auto", None
+            answered = r.user_typed and re.search(rb"[\r\n]", r.typed)    # an answer went in the console
+            partial = re.split(rb"[\r\n]", r.typed)[-1] if r.user_typed else b""
+            if partial:                                     # a half-typed answer goes, as when the window closes
+                r.flush_child_input()
+                echo = partial.decode("utf-8", "replace")
+                if r.tail.endswith(echo):
+                    r.tail = r.tail[:-len(echo)]
+            if (self.prior == "handover" and not answered and r.handover_line and r.waiting()
+                    and r.current_line() == r.handover_line):
+                # The question handed over to the user still waits: its modal again. Nothing would ask it anew (a
+                # password prompt prints nothing more).
+                r.mode, self.input = "handover", ""
+                self.modal = self.modal or (r.handover_why, r.handover_line)
             else:
-                r.mode = self.prior or "auto"
+                r.mode, self.modal = "auto", None
             r.user_typed, r.typed = False, b""
         self.console = False
         self.fit_pty()
@@ -4225,9 +4282,25 @@ def install_splash(app, secs=1.8):
         time.sleep(PACE.interval)
 
 
+def user_env_changes(env):
+    """What env changes in this process's environment, for install.sh's user_env (the tray keeps running after the
+    install, in the user's own language): a line "NAME=value" for each value it had, "NAME" for one it did not have.
+    A value with a newline in it cannot go so and stays as env has it."""
+    lines = []
+    for name in sorted(set(env) | set(os.environ)):
+        old = os.environ.get(name)
+        if env.get(name) != old and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            if old is None:
+                lines.append(name)
+            elif "\n" not in old:
+                lines.append(f"{name}={old}")
+    return "\n".join(lines)
+
+
 def run_install(app, view, events):
     """install.sh --steps in a pty of its own, shown in view. Returns its exit status."""
-    env = dict(engine.child_env(), ARCH_UPDATE_INSTALL_EVENTS=events)
+    base = engine.child_env()
+    env = dict(base, ARCH_UPDATE_INSTALL_EVENTS=events, ARCH_UPDATE_USER_ENV=user_env_changes(base))
     drop_typeahead()                            # a password typed ahead never reaches it
     child = pexpect.spawn("bash", [INSTALL_SH, "--steps"], env=env, dimensions=view.pty_size(), echo=True)
     view.started = True
@@ -4244,26 +4317,23 @@ def run_install(app, view, events):
             except Exception:
                 view.fallback(traceback.format_exc())
         else:
-            while True:
-                try:
-                    data = os.read(child.child_fd, 65536)
-                except OSError:
-                    data = b""
-                if not data:
-                    break
-                view.out(data)
+            engine.read_to_end(child, view.out)
     finally:
         engine.VIEW, engine.LOG, engine.RESPONDER = saved
         app.child = None
-    child.wait()                                # its pty is at EOF: only reaped, never killed
+    child.wait()                                # it has ended (its pty at EOF, or over): only reaped, never killed
     child.close()
     view.read_events()
     return child.exitstatus if child.exitstatus is not None else 128 + (child.signalstatus or 0)
 
 
-def wait_keys(app, draw, keys, latin=True):
+def wait_keys(app, draw, keys, latin=True, calm=0.0):
     """draw() every frame until one of keys is pressed; returns it (None if the terminal went away). latin: a key
-    of the Russian layout counts as the Latin one in its place (q for й)."""
+    of the Russian layout counts as the Latin one in its place (q for й). calm: keys pressed in the first seconds
+    count for nothing (an Enter pressed while the install looked done is no answer to what comes after it)."""
+    if calm:
+        drop_typeahead()
+    calm_until = time.time() + calm
     while engine.TERM_OK:
         app.check_resize()
         draw()
@@ -4277,6 +4347,8 @@ def wait_keys(app, draw, keys, latin=True):
         if not data:
             engine.lost_terminal()
             return None
+        if time.time() < calm_until:
+            continue
         for k in parse_keys(data):
             k = LATIN.get(k, k) if latin else k
             if k in keys:
@@ -4326,10 +4398,11 @@ def consent_screen(app):
     """The question about update reports (install.sh asks it so in text): no until the user says yes. Only what is
     on the screen is chosen (the arrows): no letter, whose place on the Russian layout says something else ("н" is
     where y is)."""
-    yes = False
+    yes, calm = False, 1.0
     while True:
         k = wait_keys(app, lambda: draw_consent(app, yes, app.now()), ("left", "right", "tab", "enter", "esc"),
-                      latin=False)
+                      latin=False, calm=calm)
+        calm = 0.0
         if k is None:
             return None
         if k in ("left", "right", "tab"):
@@ -4348,9 +4421,13 @@ def consent_screen(app):
     return yes
 
 
+OUTPUT_ABOVE = re.compile(r"\(((?:её |его )?вывод(?: \S+)?) выше\)")    # install.sh's "(вывод yay выше)"
+
+
 def install_lines(view, status, reports_on):
     """What the final screen lists: the final report's rows [(label, [part])], then [(icon, [part], colour)]: why the
-    install stopped, the warnings. A part is a line of its own; one that starts with spaces is a command."""
+    install stopped, the warnings. A part is a line of its own; one that starts with spaces is a command. Where
+    install.sh says the output is above, here it is a key away."""
     rows, lines = [], []
     if status == 0:
         for label, parts in view.rows:
@@ -4358,8 +4435,9 @@ def install_lines(view, status, reports_on):
                 parts = [("включены" if reports_on else "выключены") + " — переключить: Arch-Update → Настройки"]
             rows.append((label, [p for p in parts if p.strip()]))
     else:
-        lines.append(("✗", view.failed or [f"установщик закончил с кодом {status}, не дойдя до конца.",
-                                           "Запусти его снова: что уже стоит, второй раз не ставится."], BAD))
+        failed = view.failed or [f"установщик закончил с кодом {status}, не дойдя до конца.",
+                                 "Запусти его снова: что уже стоит, второй раз не ставится."]
+        lines.append(("✗", [OUTPUT_ABOVE.sub(r"(\1 — Ctrl+])", p) for p in failed], BAD))
     for parts in view.warns:
         lines.append(("!", parts, WARN))
     return rows, lines
@@ -4407,25 +4485,25 @@ def draw_install_end(app, view, status, rows, lines, t):
         sub = f"на шаге «{st['label']}»" if st else ""
     c.cput(y + 1, fit(sub, c.w - 4), MUTED)
     y += 3
-    c.blank(x0, y, W, min(body, room - y), BG)     # no star between a label and its text
+    flat = []                                       # (x, text, colour, (mark, its colour) or None): line by line
     for label, wrapped in rw:
-        c.put(x0, y, label, DIM)
-        for line in wrapped:
-            if y >= room:
-                break
-            c.put(x0 + lw, y, line, TEXT)
-            y += 1
+        flat += [(x0 + lw, line, TEXT, (label, DIM) if i == 0 else None) for i, line in enumerate(wrapped)]
     if rw and lwr:
-        y += 1
+        flat.append((x0, "", TEXT, None))
     for icon, wrapped, col in lwr:
-        if y >= room:
-            break
-        c.put(x0, y, icon, col, bold=True)
-        for line in wrapped:
-            if y >= room:
-                break
-            c.put(x0 + 2, y, line, TEXT if col == BAD else DIM)
-            y += 1
+        flat += [(x0 + 2, line, TEXT if col == BAD else DIM, (icon, col) if i == 0 else None)
+                 for i, line in enumerate(wrapped)]
+    space = max(0, room - y)
+    if len(flat) > space:                           # never left out unsaid: they all stay in the terminal
+        left = len(flat) - max(0, space - 1)
+        flat = flat[:max(0, space - 1)] + [(x0, f"… и ещё {left} {plural(left, 'строка', 'строки', 'строк')} — "
+                                                "в терминале после Enter", MUTED, None)]
+    c.blank(x0, y, W, len(flat), BG)               # no star between a label and its text
+    for x, line, col, mark in flat:
+        if mark:
+            c.put(x0, y, mark[0], mark[1], bold=mark[1] != DIM)
+        c.put(x, y, line, col)
+        y += 1
     keyline(c, c.h - 2, "Enter — закрыть   ·   Ctrl+] — весь вывод")
     BACKDROP.draw(c, t, pal, 0.6)
     app.draw_toast()
@@ -4437,7 +4515,7 @@ def install_end(app, view, status, reports_on):
     t0 = time.time()
     while engine.TERM_OK:
         k = wait_keys(app, lambda: draw_install_end(app, view, status, rows, lines, time.time() - t0),
-                      ("enter", "esc", "q", "ctrl]"))
+                      ("enter", "esc", "q", "ctrl]"), calm=0.6)
         if k != "ctrl]":
             return
         view.to_console("весь вывод установки выше · Enter или Ctrl+] — обратно")
@@ -4465,9 +4543,25 @@ def wait_raw(keys):
     return None
 
 
+def terminal_gone():
+    """The terminal is gone: a read or a write failed (engine.lost_terminal), or it reports a hangup (it closed)."""
+    if not engine.TERM_OK:
+        return True
+    try:
+        pl = select.poll()
+        pl.register(0, select.POLLIN)
+        if any(ev & (select.POLLHUP | select.POLLERR | select.POLLNVAL) for _, ev in pl.poll(0)):
+            engine.lost_terminal()
+            return True
+    except (OSError, ValueError):
+        pass
+    return False
+
+
 def install_main():
     """arch-update-ui --install: install.sh hands its install over to this window (see its window()); exits with the
-    install's result (0 done, 1 not), or NO_WINDOW when it could not start, and install.sh then installs as text."""
+    install's result: 0 done; 1 not; TOLD not, and the terminal already has all its output with why it stopped
+    (install.sh adds nothing then); NO_WINDOW when it could not start, and install.sh then installs as text."""
     events = os.environ.pop("ARCH_UPDATE_INSTALL_EVENTS", "")
     if not events or not os.path.isfile(events) or not sys.stdin.isatty() or not sys.stdout.isatty():
         sys.exit(NO_WINDOW)
@@ -4502,6 +4596,8 @@ def install_main():
             app.s.leave()
         termios.tcsetattr(0, termios.TCSADRAIN, old)
         sys.exit(NO_WINDOW)                       # nothing ran yet: install.sh goes on as text
+    if terminal_gone():
+        sys.exit(1)                               # closed as it opened: nothing starts with nobody to see it
     try:
         view = holder["view"] = InstallView(app, events)
         status = run_install(app, view, events)
@@ -4520,23 +4616,24 @@ def install_main():
     except Exception:
         note_ui_error(traceback.format_exc())
     finally:
+        told = False
         if engine.TERM_OK:
             if not view.console:
                 app.s.leave()
-            if status and view.started and view.total > view.upto:
-                # It stopped: its last output stays in the terminal, above what install.sh says of it ("вывод выше")
-                missing = view.total - view.upto
-                tail = view.raw_tail[-min(missing, 12_000):]
-                if len(tail) < missing:
-                    tail = tail[tail.find(b"\n") + 1:]   # from a line's start
-                view.out(tail + b"\r\n")
+            if status and view.started:
+                # It stopped: all its output stays in the terminal as the text install leaves it, what went wrong
+                # with install.sh's own word on it last ("вывод выше"; the console may have shown it already)
+                shown = view.show_unseen()
+                if shown and not shown.endswith(b"\n"):
+                    view.out(b"\r\n")
+                told = engine.TERM_OK
             try:
                 termios.tcsetattr(0, termios.TCSADRAIN, old)
             except termios.error:
                 pass
     if status is None and not view.started:
         sys.exit(NO_WINDOW)                       # it never started: install.sh goes on as text
-    sys.exit(0 if status == 0 else 1)
+    sys.exit(0 if status == 0 else TOLD if told else 1)
 
 
 

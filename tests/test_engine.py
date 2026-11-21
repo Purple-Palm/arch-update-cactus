@@ -13,6 +13,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -2513,6 +2514,94 @@ class NothingDone(unittest.TestCase):
         self.assertEqual(status, 5)
         self.assertTrue(res.get("started", True))
         self.assertTrue(any("кодом 5" in p for p in res["problems"]), res["problems"])
+
+
+class CtrlC(Patching):
+    """While pacman is in its transaction a Ctrl+C is not passed on (it would cut pacman off before its hooks): the
+    view says so (held_ctrl_c: the installer's window has words of its own for it); after Ctrl+] it goes through."""
+
+    def test_ctrl_c_waits_for_pacman(self):
+        sent, held = [], []
+
+        class View(engine.TerminalView):
+            def out(self, data):
+                pass
+
+            def held_ctrl_c(self):
+                held.append(True)
+        self.patch(engine, "VIEW", View())
+        self.patch(engine, "LOG", types.SimpleNamespace(event=lambda *a: None, text=lambda *a: None))
+        self.patch(engine, "pacman_busy", lambda: True)
+        r = engine.Responder(types.SimpleNamespace(send=sent.append, pid=0), stop_on_news=False, manual=False)
+        r.user_input(b"\x03")
+        self.assertEqual((sent, held), ([], [True]))
+        r.user_input(b"\x1d")                  # Ctrl+]: the user takes over, and Ctrl+C goes through from now on
+        r.user_input(b"\x03")
+        self.assertEqual(sent, [b"\x03"])
+
+
+class ProgramOver(Patching):
+    """pump (and read_to_end, its last resort) read a program's pty until it closes, or until the program is over while
+    a daemon it started in a session of its own holds the pty: arch-update's tray applet, started by
+    "arch-update --tray --enable", kept the installer's stderr, and the installer's window never closed. Something of
+    the program's own session still running is waited for (pacman, when the program was killed under it), and so is
+    everything while pacman holds its lock."""
+
+    def setUp(self):
+        self.patch(engine, "PACMAN_LOCK", os.path.join(tempfile.mkdtemp(), "db.lck"))
+        self.pids = []
+        self.addCleanup(self.kill_daemons)
+
+    def kill_daemons(self):
+        for pid in self.pids:
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+
+    def pump(self, script, with_pump=True):
+        """script in bash on a pty of its own, read by pump (or read_to_end); returns (seconds, output). A line
+        "pid=N" in the output names a daemon to kill afterwards."""
+        import pexpect
+        child = pexpect.spawn("bash", ["-c", script])
+        seen = []
+
+        class View(engine.TerminalView):
+            def output(self, data):
+                seen.append(data)
+        self.patch(engine, "VIEW", View())
+        self.patch(engine, "LOG", types.SimpleNamespace(output=lambda d: None, event=lambda *a: None))
+        self.patch(engine, "TERM_OK", False)               # no keyboard here
+        t = time.time()
+        if with_pump:
+            engine.pump(child, None, auto=False)
+        else:
+            engine.read_to_end(child, seen.append)
+        took = time.time() - t
+        out = b"".join(seen).decode("utf-8", "replace")
+        self.pids += [int(pid) for pid in re.findall(r"pid=(\d+)", out)]
+        child.close()
+        return took, out
+
+    def test_a_daemon_holding_the_pty_does_not_keep_the_reading_on(self):
+        for with_pump in (True, False):
+            with self.subTest(pump=with_pump):
+                took, out = self.pump('echo start; setsid sleep 60 & echo "pid=$!"; sleep 0.3; echo end', with_pump)
+                self.assertIn("end", out)                       # what it wrote before it ended: all of it
+                self.assertLess(took, 10)
+
+    def test_its_own_session_still_running_is_waited_for(self):
+        # pacman, when the program was killed under it: the pty must stay read (and open) until it ends
+        took, out = self.pump("trap '' HUP; (sleep 2; echo late) & echo early")
+        self.assertIn("late", out)
+        self.assertGreater(took, 1.5)
+
+    def test_nothing_ends_early_while_pacman_holds_its_lock(self):
+        with open(engine.PACMAN_LOCK, "w"):
+            pass
+        took, out = self.pump('setsid bash -c "sleep 3; echo done-late" & echo "pid=$!"; sleep 0.3')
+        self.assertIn("done-late", out)                      # the pty was read until the daemon closed it
+        self.assertGreater(took, 2.5)
 
 
 if __name__ == "__main__":
