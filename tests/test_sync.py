@@ -18,8 +18,11 @@ skipped as root, which install.sh refuses. Without a terminal its output is plai
 80 columns and the question about update reports is not asked; in a terminal (a pty) the question
 comes once, only a yes turns reports on, and --sync, --check and an install whose stdin is not the
 keyboard never ask. The tray icon is claimed only when it is there, and a narrow terminal gets
-lines that fit it, with commands left whole.
-Needs git; the UI self-test inside and the terminal runs need python-pexpect.
+lines that fit it, with commands left whole. On a terminal of 80x24 the install runs in the app's window
+(arch-update-ui --install, rendered with pyte): the question about reports is a switch there, a password goes
+through its modal unseen, Ctrl+] goes to the console and back, a failed step is told in the window and again in
+the terminal once it closes, and when the window cannot start (or the terminal is too small) the install is text.
+Needs git; the UI self-test inside and the terminal runs need python-pexpect, the window's runs python-pyte.
 """
 import fcntl
 import os
@@ -340,6 +343,10 @@ STUBS = {
                    'esac',
 }
 QUESTION = "Отправлять отчёты?"                  # the installer's question about update reports
+RIGHT, ENTER, CTRL_BRACKET = "\x1b[C", "\r", "\x1d"
+# sudo asks for the password (unseen, as the real one) and keeps what it was given
+SUDO_ASKS = ('read -r -s -p "[sudo] password for tester: " pw </dev/tty\necho >/dev/tty\n'
+             'echo "$pw" >"$HOME/sudo.typed"\n[[ $pw == secret ]] || exit 1\nexec "$@"')
 BANNER_ROW = "▄▀█ █▀█ █▀▀ █ █"                    # "ARCH" in the installer's banner
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
@@ -361,9 +368,11 @@ class Install(unittest.TestCase):
         with open(gitconfig, "w") as f:
             f.write(f'[url "{remote}"]\n\tinsteadOf = https://github.com/Purple-Palm/arch-update-cactus.git\n')
         # only the stand-in: a URL it does not cover fails instead of reaching the real GitHub
+        self.tmpdir = os.path.join(self.tmp, "tmp")                # what install.sh leaves behind shows up here
+        os.makedirs(self.tmpdir)
         self.env = {"HOME": self.home, "USER": "tester", "PATH": stubs + ":/usr/bin:/bin", "TERM": "dumb",
                     "LANG": "C.UTF-8", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": gitconfig,
-                    "GIT_ALLOW_PROTOCOL": "file"}
+                    "GIT_ALLOW_PROTOCOL": "file", "TMPDIR": self.tmpdir}
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -387,8 +396,9 @@ class Install(unittest.TestCase):
         (exit status, the output as the screen shows it: no colours, each line as its last carriage
         return left it, whether it asked)."""
         import pexpect
-        child = pexpect.spawn(cmd[0], list(cmd[1:]), env=dict(self.env, TERM="xterm-256color", **env),
-                              encoding="utf-8", dimensions=size, timeout=120)
+        # the text install (the window has tests of its own: in_the_window)
+        child = pexpect.spawn(cmd[0], list(cmd[1:]), encoding="utf-8", dimensions=size, timeout=120,
+                              env={**self.env, "TERM": "xterm-256color", "ARCH_UPDATE_INSTALL_UI": "0", **env})
         child.send(typed_ahead)
         out, asked = "", False
         while child.expect_exact([QUESTION, pexpect.EOF]) == 0:
@@ -401,6 +411,36 @@ class Install(unittest.TestCase):
         child.close()
         screen = [line.rstrip("\r").rsplit("\r", 1)[-1] for line in ANSI.sub("", out).split("\n")]
         return child.exitstatus, "\n".join(screen), asked
+
+    def in_the_window(self, *steps, size=(24, 80), **env):
+        """The README one-liner in a terminal of size rows x columns where the installer's window opens. steps:
+        (text, keys): once the screen shows text, keys are typed. Returns (exit status, the screen at the end, all
+        that was written without colours)."""
+        import pexpect
+        import pyte
+        rows, cols = size
+        screen = pyte.Screen(cols, rows)
+        stream = pyte.ByteStream(screen)
+        child = pexpect.spawn("bash", ["-c", 'cat "$0" | bash', os.path.join(ROOT, "install.sh")],
+                              env={**self.env, "TERM": "xterm-256color", "COLORTERM": "truecolor", **env},
+                              dimensions=size, timeout=120)
+        raw, steps = b"", list(steps)
+        deadline = time.time() + 180
+        while time.time() < deadline:
+            try:
+                data = child.read_nonblocking(65536, timeout=0.2)
+            except pexpect.TIMEOUT:
+                data = b""
+            except pexpect.EOF:
+                break
+            raw += data
+            stream.feed(data)
+            if steps and steps[0][0] in "\n".join(screen.display):
+                child.send(steps.pop(0)[1])
+        child.close()
+        self.assertEqual(steps, [], "the screen never showed this:\n" + "\n".join(screen.display))
+        text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", raw.decode("utf-8", "replace"))
+        return child.exitstatus, "\n".join(screen.display), text
 
     def one_liner_in_a_terminal(self, **kw):
         return self.in_a_terminal("bash", "-c", 'cat "$0" | bash', os.path.join(ROOT, "install.sh"), **kw)
@@ -690,6 +730,106 @@ class Install(unittest.TestCase):
         status, out, asked = self.one_liner_in_a_terminal(size=(0, 0))
         self.assertEqual(status, 0, out)
         self.assertEqual(out.count(BANNER_ROW), 1, out)
+
+    def test_a_session_without_user_set_installs(self):
+        # docker exec, some su and cron sessions have no USER: the name comes from id then
+        env = {k: v for k, v in self.env.items() if k != "USER"}
+        with open(os.path.join(ROOT, "install.sh"), "rb") as f:
+            r = subprocess.run(["bash"], stdin=f, env=env, capture_output=True, timeout=300, start_new_session=True)
+        out = (r.stdout + r.stderr).decode("utf-8", "replace")
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn("Готово", out)
+
+    # ── the window (arch-update-ui --install)
+
+    def test_on_a_terminal_the_install_runs_in_the_window(self):
+        status, screen, out = self.in_the_window(("Отправлять отчёты?", RIGHT), ("▌ да", ENTER),
+                                                 ("Установлено", ENTER))
+        self.assertEqual(status, 0, out)
+        self.assertEqual(self.reports(), "включены")              # the switch moved to "да", then Enter
+        self.assertNotIn("[y/N]", out)                            # not asked a second time, as text
+        for step in ("Пакеты", "Помощник AUR", "Самопроверка", "Значок и таймеры"):
+            self.assertIn(step, out)
+        # what the window showed stays in the terminal once it closed: the final report, as text
+        self.assertIn("Готово — Arch Update by Cactus", screen)
+        self.assertRegex(screen, r"отчёты +включены")
+        state = os.path.join(self.home, ".local/state/arch-update-auto")
+        with open(os.path.join(state, "sync.ok")) as f:
+            self.assertEqual(f.read().strip(), self.tag)
+        self.assertEqual(os.listdir(self.tmpdir), [])                # its events file is gone
+        # a second run: the choice is kept, the window does not ask again
+        status, screen, out = self.in_the_window(("Установлено", ENTER))
+        self.assertEqual(status, 0, out)
+        self.assertNotIn("Отправлять отчёты?", out)
+        self.assertEqual(self.reports(), "включены")
+
+    def test_a_password_goes_through_the_window_unseen(self):
+        self.stub("pacman", '[[ "$*" == "-Q libnotify" ]] && exit 1\nexit 0')     # one package to install
+        self.stub("sudo", SUDO_ASKS)
+        status, screen, out = self.in_the_window(("Нужен твой ответ", "sec"), ("•••", "ret\r"),
+                                                 ("Отправлять отчёты?", ENTER), ("Установлено", ENTER))
+        self.assertEqual(status, 0, out)
+        with open(os.path.join(self.home, "sudo.typed")) as f:
+            self.assertEqual(f.read().strip(), "secret")
+        self.assertIn("Нужен твой ответ", out)
+        self.assertNotIn("secret", out)
+        self.assertEqual(self.reports(), "выключены")             # Enter on the switch as it came: no
+
+    def test_ctrl_bracket_goes_to_the_console_and_back(self):
+        self.stub("pacman", '[[ "$*" == "-Q libnotify" ]] && exit 1\nexit 0')
+        self.stub("sudo", SUDO_ASKS)
+        status, screen, out = self.in_the_window(
+            ("Нужен твой ответ", CTRL_BRACKET), ("[Arch-Update] консоль", "secret\r"),
+            ("установка закончилась", ENTER), ("Отправлять отчёты?", ENTER), ("Установлено", CTRL_BRACKET),
+            ("весь вывод установки выше", CTRL_BRACKET), ("Установлено", ENTER))
+        self.assertEqual(status, 0, out)
+        with open(os.path.join(self.home, "sudo.typed")) as f:
+            self.assertEqual(f.read().strip(), "secret")              # answered in the console, by the user
+        self.assertNotIn("secret", out)
+        self.assertIn("✓ пакеты · поставлены", out)                    # the console shows the text install
+        self.assertEqual(self.reports(), "выключены")
+
+    def test_a_failed_step_is_told_in_the_window_and_after_it(self):
+        self.stub("pacman", '[[ "$*" == "-Q libnotify" ]] && exit 1\nexit 0')
+        self.stub("sudo", 'echo "tester is not in the sudoers file." >&2\nexit 1')
+        status, screen, out = self.in_the_window(("Установка остановлена", ENTER))
+        self.assertEqual(status, 1, out)
+        self.assertIn("на шаге «Пакеты»", out)
+        self.assertIn("✗ пакеты не поставились.", screen)              # in the terminal once the window closed
+        self.assertIn("sudo -v", screen)
+        said = screen.index("tester is not in the sudoers file.")         # what failed: its output, above
+        self.assertLess(said, screen.index("✗ пакеты не поставились."))
+        self.assertNotIn("Готово", screen)
+        self.assertIsNone(self.reports())
+
+    def test_when_the_window_cannot_start_the_install_is_text(self):
+        real = shutil.which("python3")
+        self.stub("python3", f'[[ "$*" == *"arch-update-ui --install" ]] && exit 3\nexec {real} "$@"')
+        status, out, asked = self.one_liner_in_a_terminal(answer="y", ARCH_UPDATE_INSTALL_UI="1")
+        self.assertEqual(status, 0, out)
+        self.assertTrue(asked, out)                                    # the question in text
+        self.assertIn("Готово", out)
+        self.assertEqual(self.reports(), "включены")
+
+    def test_a_terminal_smaller_than_80x24_gets_the_text_install(self):
+        settings = os.path.join(self.home, ".local/state/arch-update-auto/settings.json")
+        for size in ((23, 80), (24, 79)):
+            with self.subTest(size=size):
+                if os.path.exists(settings):
+                    os.remove(settings)                                         # not chosen yet: it asks
+                status, out, asked = self.one_liner_in_a_terminal(answer="n", size=size, ARCH_UPDATE_INSTALL_UI="1")
+                self.assertEqual(status, 0, out)
+                self.assertTrue(asked, out)
+                self.assertNotIn("\x1b[?1049h", out)
+
+    def test_the_window_needs_install_sh(self):
+        # started by hand, without install.sh's events file: it cannot show anything, and says so with its code
+        r = subprocess.run([sys.executable, os.path.join(ROOT, "bin", "arch-update-ui"), "--install"],
+                           env=self.env, capture_output=True, timeout=60)
+        self.assertEqual(r.returncode, 3, r)
+        r = subprocess.run(["bash", os.path.join(ROOT, "install.sh"), "--steps"], env=self.env, capture_output=True,
+                           timeout=60)
+        self.assertEqual(r.returncode, 1, r)
 
     def test_arch_update_config_is_found_under_xdg_config_home(self):
         config = os.path.join(self.tmp, "xdg-config")

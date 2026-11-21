@@ -9,6 +9,11 @@
 #   install.sh --sync      refresh the installed files after a self-update (no packages, no questions)
 #   install.sh --check     self-test of this checkout (used before a self-update is accepted)
 #   install.sh --uninstall remove the links, menu entry and timer (logs and settings stay)
+#   install.sh --steps     the install as the installer's window runs it (bin/arch-update-ui --install)
+#
+# On a terminal of 80x24 or more the install runs in the app's own window (arch-update-ui --install, once python
+# and pexpect are there): the same steps, run by this script's --steps inside it. Elsewhere, and whenever the window
+# cannot start (ARCH_UPDATE_INSTALL_UI=0 asks for it), it is the text below.
 #
 # Everything lives in one git checkout, ~/.local/share/arch-update-cactus, of the tag "stable"
 # (CI moves it to each tested commit of main); ~/.local/bin entries are symlinks into it, so a
@@ -25,9 +30,12 @@ UNITS=$HOME/.config/systemd/user
 STATE=$HOME/.local/state/arch-update-auto
 BACKUP=$STATE/backup-$(date +%F_%H-%M-%S)
 PROGRAMS=(arch-update-launcher arch-update-ui arch-update-auto arch-update-cactus-sync)
+USER=${USER:-$(id -un)}                      # not every session sets it (docker exec, some su and cron)
 MENU_NEW=0
 BANNER_SHOWN=${ARCH_UPDATE_BANNER_SHOWN-}     # the bootstrap showed it before starting this copy
 unset ARCH_UPDATE_BANNER_SHOWN
+EVENTS=${ARCH_UPDATE_INSTALL_EVENTS-}         # --steps: where the installer's window reads what happens (event)
+unset ARCH_UPDATE_INSTALL_EVENTS
 
 # ── output: the look of the UI on a terminal, plain text in a pipe or a log (sync.log, the tests) ──
 
@@ -156,9 +164,16 @@ mark() {
 	done
 }
 
-step() { mark '●' "$ACCENT" "$@"; }        # a step whose own output (pacman, makepkg, yay) follows
-warn() { mark '!' "$WARN" "$@" >&2; }
+step() {                                    # a step whose own output (pacman, makepkg, yay) follows
+	event step "$@"
+	mark '●' "$ACCENT" "$@"
+}
+warn() {
+	event warn "$@"
+	mark '!' "$WARN" "$@" >&2
+}
 die() {
+	event fail "$@"
 	mark '✗' "$BAD" "$@" >&2
 	exit 1
 }
@@ -166,6 +181,7 @@ die() {
 # "  ✓ <step> · <detail>": a step done, or a check that found everything in place.
 ok() {
 	local i
+	event ok "$1" "${2-}"
 	settle
 	wrap 4 "$1${2:+ · $2}"
 	for i in "${!WRAPPED[@]}"; do
@@ -180,6 +196,7 @@ ok() {
 # A step that takes a moment and writes nothing itself: "  ● <step>…" until its result takes the
 # line (only on a terminal; elsewhere the result is enough).
 pending() {
+	event pending "$1"
 	((TTY)) || return 0
 	settle
 	printf '  %s●%s %s…' "$ACCENT" "$OFF" "$1"
@@ -196,6 +213,7 @@ BLOCK=()
 row() {
 	local label=$1 part line under
 	shift
+	event row "$label" "$@"
 	for part in "$@"; do
 		wrap 16 "$part"
 		under=0
@@ -222,6 +240,15 @@ row() {
 			fi
 		done
 	done
+}
+
+# What the installer's window shows (--steps): each step, its result, a warning, why the install stopped, a row of
+# the final report. One line per event, its fields (the arguments) split by tabs; a newline in one goes as \x1f.
+event() {
+	[[ -n $EVENTS ]] || return 0
+	local IFS=$'\t' line
+	line="$*"
+	printf '%s\n' "${line//$'\n'/$'\x1f'}" >>"$EVENTS" 2>/dev/null || true
 }
 
 # Print BLOCK and empty it: indented four columns, or as a card, the gradient down its left edge.
@@ -451,6 +478,7 @@ makepkg_aur_mirror() {
 
 install_packages() {
 	local want=(git python python-pexpect pacman-contrib libnotify ttf-hack) missing=() p cp
+	event stage packages
 	for p in "${want[@]}"; do
 		pacman -Q "$p" >/dev/null 2>&1 || missing+=("$p")
 	done
@@ -477,6 +505,7 @@ install_packages() {
 	fi
 	# AUR packages: yay, as on the main machine (the auto-answers know its questions best)
 	local helper
+	event stage aur
 	if helper=$(aur_helper); then
 		ok "AUR" "через $helper"
 	else
@@ -487,6 +516,7 @@ install_packages() {
 		helper=yay
 		ok "AUR" "yay поставлен"
 	fi
+	event stage arch-update
 	if command -v arch-update >/dev/null; then
 		ok "arch-update" "уже стоит"
 		return 0
@@ -617,6 +647,7 @@ summary() {
 	version=$(git -C "$ROOT" log -1 --format='%h от %cd' --date=format:%d.%m.%Y)
 	shown=$de
 	[[ $de != "?" ]] || shown="не определено"
+	event finish "$version"
 	settle
 	echo
 	wrap 4 "Готово — Arch Update by Cactus $version"         # the version wraps on a narrow terminal
@@ -672,6 +703,85 @@ uninstall() {
 		"Её можно убрать вручную:" "  rm -rf $dest"
 }
 
+# The install itself: packages, the self-test, files, arch-update's own setup. The question about reports and the
+# final report are the caller's (the text install asks here, the window in its own way).
+install_all() {
+	install_packages
+	event stage check
+	pending "самопроверка"
+	local out
+	if ! out=$(self_check 2>&1); then
+		settle
+		printf '%s\n' "$out" >&2
+		die "самопроверка не прошла — установка остановлена"
+	fi
+	ok "самопроверка" "пройдена"
+	event stage files
+	install_files
+	ok "файлы" "программы в ~/.local/bin, пункт в меню приложений"
+	mkdir -p "$STATE"                                   # a clean machine has no state yet
+	git -C "$ROOT" rev-parse HEAD >"$STATE/sync.ok"     # this version passed here
+	event stage setup
+	setup_arch_update
+}
+
+# The install in the app's own window (arch-update-ui --install runs install_all through --steps and asks about
+# reports itself), on a terminal it fits: 80x24, as the app. The window needs python and pexpect, so they come
+# first, here. Returns only when the window could not start (it exits 3 then): the install goes on as text. Else
+# the script ends with the install's result, and what the window showed that matters later stays in the terminal:
+# the warnings of the steps, why the install stopped, the final report.
+window() {
+	local size rows cols rc=0 events
+	((TTY)) && [[ -t 0 && ${ARCH_UPDATE_INSTALL_UI-1} != 0 && ${TERM-} != linux ]] || return 0
+	size=$(stty size 2>/dev/null </dev/tty) || return 0
+	read -r rows cols <<<"$size"
+	[[ $rows =~ ^[0-9]+$ && $cols =~ ^[0-9]+$ ]] && ((rows >= 24 && cols >= 80)) || return 0
+	if ! python3 -c 'import pexpect' 2>/dev/null; then
+		step "ставлю python и python-pexpect: на них работает окно установщика"
+		need_sudo
+		sudo pacman -S --needed python python-pexpect || return 0     # the text install says what went wrong
+		ok "python" "поставлен"
+	fi
+	events=$(mktemp)
+	ARCH_UPDATE_INSTALL_EVENTS=$events python3 "$ROOT/bin/arch-update-ui" --install || rc=$?
+	if ((rc == 3)); then
+		rm -f "$events"
+		return 0
+	fi
+	replay "$events"
+	rm -f "$events"
+	if ((rc)); then
+		((STOPPED)) ||
+			mark '✗' "$BAD" "установка не закончена." "Запусти установщик снова: что уже стоит, второй раз не ставится." >&2
+		exit 1
+	fi
+	ask_reports                 # the window asked; if it could not, here (once decided, this asks nothing)
+	summary
+	exit 0
+}
+
+# The events the window showed (see event), in the terminal once it closed: the warnings of the steps and why the
+# install stopped (STOPPED=1). The final report's own warnings come with summary: the replay ends where it begins.
+STOPPED=0
+replay() {
+	local -a parts
+	local kind
+	while IFS=$'\t' read -r -a parts; do
+		((${#parts[@]})) || continue
+		kind=${parts[0]}
+		parts=("${parts[@]:1}")
+		parts=("${parts[@]//$'\x1f'/ }")
+		case $kind in
+		warn) mark '!' "$WARN" "${parts[@]}" ;;
+		fail)
+			mark '✗' "$BAD" "${parts[@]}" >&2
+			STOPPED=1
+			;;
+		finish) break ;;
+		esac
+	done <"$1"
+}
+
 main() {
 	[[ -n $SRC && -f $SRC ]] && ROOT=$(cd "$(dirname "$(realpath "$SRC")")" && pwd)
 	if [[ -z ${1-} && -z $BANNER_SHOWN ]]; then
@@ -689,22 +799,16 @@ main() {
 		;;
 	--check) self_check ;;
 	--uninstall) uninstall ;;
+	--steps)
+		[[ -n $EVENTS ]] || die "--steps — для окна установщика; установка: $DEST/install.sh"
+		[[ $EUID -ne 0 ]] || die "запусти от своего пользователя, не от root"
+		install_all
+		summary
+		;;
 	"")
 		[[ $EUID -ne 0 ]] || die "запусти от своего пользователя, не от root"
-		install_packages
-		pending "самопроверка"
-		local out
-		if ! out=$(self_check 2>&1); then
-			settle
-			printf '%s\n' "$out" >&2
-			die "самопроверка не прошла — установка остановлена"
-		fi
-		ok "самопроверка" "пройдена"
-		install_files
-		ok "файлы" "программы в ~/.local/bin, пункт в меню приложений"
-		mkdir -p "$STATE"                                   # a clean machine has no state yet
-		git -C "$ROOT" rev-parse HEAD >"$STATE/sync.ok"     # this version passed here
-		setup_arch_update
+		window
+		install_all
 		ask_reports
 		summary
 		;;
