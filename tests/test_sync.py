@@ -24,6 +24,7 @@ Needs git; the UI self-test inside and the terminal runs need python-pexpect.
 import fcntl
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -473,6 +474,133 @@ class Install(unittest.TestCase):
         self.assertIn("  ✓ arch-update · настроен, значок в трее\n", out)
         self.assertNotIn("не запустился", out)
         self.assertNotIn("автозапуск значка", out)
+
+    # ── the AUR not answering (2026-11-21: "fatal: unable to access 'https://aur.archlinux.org/arch-update-bin.git/':
+    # Recv failure: Connection reset by peer" on the Chromebook, and the install stopped)
+
+    RESET = ("echo \":: (0/1) Failed to download PKGBUILD: arch-update-bin\"\n"
+             "echo \" -> error fetching arch-update-bin: Cloning into 'arch-update-bin'...\"\n"
+             "echo \"fatal: unable to access 'https://aur.archlinux.org/arch-update-bin.git/': Recv failure: "
+             "Connection reset by peer\" >&2\nexit 1")
+
+    def installs_arch_update(self):
+        """Shell lines that put the arch-update stand-in in place, as a package install would."""
+        return (f"cat >{shlex.quote(os.path.join(self.stubs, 'arch-update'))} <<'EOF'\n#!/bin/bash\n"
+                f"{STUBS['arch-update']}\nEOF\nchmod +x {shlex.quote(os.path.join(self.stubs, 'arch-update'))}")
+
+    def no_arch_update(self):
+        os.remove(os.path.join(self.stubs, "arch-update"))
+        self.calls = os.path.join(self.tmp, "yay.calls")
+
+    def mirror(self, *branches):
+        """A stand-in for the AUR's mirror on GitHub (github.com/archlinux/aur): one branch per package."""
+        work, bare = os.path.join(self.tmp, "mirror-work"), os.path.join(self.tmp, "aur-mirror.git")
+        os.makedirs(work)
+        git(work, "init", "-q")
+        for b in branches:
+            git(work, "checkout", "-q", "--orphan", b)
+            with open(os.path.join(work, "PKGBUILD"), "w") as f:
+                f.write(f"pkgname={b}\n")
+            git(work, "add", "PKGBUILD")
+            git(work, "commit", "-qm", b)
+        git(self.tmp, "clone", "-q", "--bare", work, bare)
+        with open(self.env["GIT_CONFIG_GLOBAL"], "a") as f:
+            f.write(f'[url "{bare}"]\n\tinsteadOf = https://github.com/archlinux/aur.git\n')
+        # makepkg -si in a clone: installs what its PKGBUILD names
+        self.stub("makepkg", 'echo "makepkg $(sed -n s/^pkgname=//p PKGBUILD)" >>' + shlex.quote(self.calls) + "\n"
+                  'case $(sed -n s/^pkgname=//p PKGBUILD) in\n'
+                  f'arch-update*) {self.installs_arch_update()} ;;\n'
+                  f'yay-bin) printf "#!/bin/bash\\nexit 0\\n" >{shlex.quote(os.path.join(self.stubs, "yay"))}; '
+                  f'chmod +x {shlex.quote(os.path.join(self.stubs, "yay"))} ;;\n'
+                  'esac')
+
+    def calls_of(self):
+        with open(self.calls) as f:
+            return f.read().splitlines()
+
+    def assertOursPlainAndNarrow(self, out):
+        """assertPlainAndNarrow for the installer's own lines: what yay printed is passed through as it came."""
+        self.assertPlainAndNarrow("\n".join(line for line in out.splitlines()
+                                            if not line.startswith(("fatal:", " -> ", ":: "))))
+
+    def test_the_aur_not_answering_is_tried_again(self):
+        self.no_arch_update()
+        # the AUR resets the connection twice, then answers
+        self.stub("yay", f'echo "yay $*" >>{shlex.quote(self.calls)}\n'
+                         f'(( $(grep -c ^yay {shlex.quote(self.calls)}) < 3 )) && {{ {self.RESET}\n}}\n'
+                         f'{self.installs_arch_update()}')
+        status, out = self.install(ARCH_UPDATE_RETRY_PAUSE="0")
+        self.assertEqual(status, 0, out)
+        self.assertEqual(len([c for c in self.calls_of() if c.startswith("yay -S --needed arch-update")]), 3)
+        self.assertEqual(out.count("сервер не ответил — пробую ещё раз"), 2, out)
+        self.assertIn("✓ arch-update · поставлен", out)
+        self.assertIn("Готово", out)
+        self.assertOursPlainAndNarrow(out)
+
+    def test_the_aur_down_falls_back_to_its_mirror_on_github(self):
+        self.no_arch_update()
+        self.mirror("arch-update-bin", "arch-update")
+        self.stub("yay", f'echo "yay $*" >>{shlex.quote(self.calls)}\n{self.RESET}')
+        status, out = self.install(ARCH_UPDATE_RETRY_PAUSE="0")
+        self.assertEqual(status, 0, out)
+        self.assertEqual(len([c for c in self.calls_of() if c.startswith("yay ")]), 3)
+        self.assertRegex(self.calls_of()[-1], r"^makepkg arch-update(-bin)?$")
+        self.assertIn("AUR недоступен — беру arch-update", out)
+        self.assertIn("из официального зеркала AUR на GitHub", out)
+        self.assertIn("✓ arch-update · поставлен", out)
+        self.assertOursPlainAndNarrow(out)
+
+    def test_a_mirror_that_answered_and_a_build_that_failed_are_told_apart(self):
+        self.no_arch_update()
+        self.mirror("arch-update-bin", "arch-update")
+        self.stub("makepkg", "echo '==> ERROR: Failure while downloading https://github.com/x/archive/v1.tar.gz' >&2\n"
+                             "exit 1")
+        self.stub("yay", f'echo "yay $*" >>{shlex.quote(self.calls)}\n{self.RESET}')
+        status, out = self.install(ARCH_UPDATE_RETRY_PAUSE="0")
+        self.assertEqual(status, 1, out)
+        said = re.sub(r"\s+", " ", out)                                   # lines broken to fit 80 columns
+        self.assertIn("с зеркала AUR не собрался или не поставился (вывод makepkg выше)", said)
+        self.assertNotIn("не ответили", said)
+
+    def test_both_down_names_the_network(self):
+        self.no_arch_update()
+        self.stub("yay", f'echo "yay $*" >>{shlex.quote(self.calls)}\n{self.RESET}')
+        status, out = self.install(ARCH_UPDATE_RETRY_PAUSE="0")      # no mirror stand-in: GitHub's is not reached
+        self.assertEqual(status, 1, out)
+        self.assertIn("ни AUR, ни его зеркало на GitHub не ответили", out)
+        self.assertIn("Проверь интернет", out)
+        self.assertOursPlainAndNarrow(out)
+
+    def test_a_failure_not_of_the_network_is_not_tried_again(self):
+        self.no_arch_update()
+        self.stub("yay", f'echo "yay $*" >>{shlex.quote(self.calls)}\n'
+                         'echo "error: failed to commit transaction (conflicting files)" >&2\nexit 1')
+        status, out = self.install(ARCH_UPDATE_RETRY_PAUSE="0")
+        self.assertEqual(status, 1, out)
+        self.assertEqual(len(self.calls_of()), 1)
+        self.assertNotIn("пробую ещё раз", out)
+        self.assertNotIn("зеркала", out)
+        self.assertIn("не поставился из AUR (вывод yay выше)", out)
+
+    def test_yay_itself_comes_from_the_mirror_when_the_aur_is_down(self):
+        self.no_arch_update()
+        os.remove(os.path.join(self.stubs, "yay"))
+        self.mirror("yay-bin")
+        with open(self.env["GIT_CONFIG_GLOBAL"], "a") as f:        # the AUR: nobody listens there
+            f.write('[url "http://127.0.0.1:9/"]\n\tinsteadOf = https://aur.archlinux.org/\n')
+        self.stub("pacman", "exit 0")
+        # the yay that makepkg puts in place then installs arch-update
+        self.stub("makepkg", 'echo "makepkg $(sed -n s/^pkgname=//p PKGBUILD)" >>' + shlex.quote(self.calls) + "\n"
+                  f'printf "#!/bin/bash\\n%s\\n" {shlex.quote(self.installs_arch_update())} '
+                  f'>{shlex.quote(os.path.join(self.stubs, "yay"))}\n'
+                  f'chmod +x {shlex.quote(os.path.join(self.stubs, "yay"))}')
+        status, out = self.install(ARCH_UPDATE_RETRY_PAUSE="0", GIT_ALLOW_PROTOCOL="file:http")
+        self.assertEqual(status, 0, out)
+        self.assertEqual(self.calls_of(), ["makepkg yay-bin"])
+        self.assertEqual(out.count("yay-bin: сервер не ответил — пробую ещё раз"), 2, out)
+        self.assertIn("AUR недоступен — беру yay-bin из официального зеркала AUR на GitHub", out)
+        self.assertIn("✓ AUR · yay поставлен", out)
+        self.assertIn("✓ arch-update · поставлен", out)
 
     def test_a_refused_sudo_is_named_and_a_rerun_finishes(self):
         self.stub("pacman", '[[ "$*" == "-Q libnotify" ]] && exit 1\nexit 0')    # one package to install

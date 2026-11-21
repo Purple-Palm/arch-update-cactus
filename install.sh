@@ -378,13 +378,75 @@ self_check() {
 	python3 "$ROOT/bin/arch-update-ui" --self-test || return 1
 }
 
-# Build and install one AUR package with plain makepkg (asks for sudo itself).
+# The AUR does not always answer at once (a connection reset, its protection against floods, a slow day): what
+# failed for the network is tried again, and then the package is taken from the AUR's official mirror on GitHub
+# (Arch Linux's own: one branch per package, the very commits of the AUR). What failed otherwise (a build, a "no"
+# to pacman's question) is not tried again.
+AUR=https://aur.archlinux.org
+AUR_MIRROR=https://github.com/archlinux/aur.git
+PAUSE=${ARCH_UPDATE_RETRY_PAUSE:-10}            # seconds before the second try; twice that before the third
+NET_TROUBLE='unable to access|Failed to download PKGBUILD|error fetching|Connection (reset|refused|timed out)'
+NET_TROUBLE+='|Recv failure|Could not resolve|Temporary failure in name resolution|Failed to connect|timed out'
+NET_TROUBLE+='|SSL|TLS|rpc request failed|50[234] '
+
+# aur_try <command…>: runs it, its output shown as it comes. 0 when it worked; 1 when it failed for the network
+# (worth another try); 2 when it failed otherwise.
+aur_try() {
+	local log rc=0
+	log=$(mktemp)
+	"$@" 2>&1 | tee "$log" || rc=$?
+	if ((rc == 0)); then
+		rm -f "$log"
+		return 0
+	fi
+	if grep -qiE "$NET_TROUBLE" "$log"; then rc=1; else rc=2; fi
+	rm -f "$log"
+	return "$rc"
+}
+
+# again <what> <command…>: the command, and twice more while it fails for the network. 0 done, 1 the network,
+# 2 another failure.
+again() {
+	local what=$1 try rc
+	shift
+	for try in 1 2 3; do
+		rc=0
+		aur_try "$@" || rc=$?
+		((rc == 1 && try < 3)) || return "$rc"
+		warn "$what: сервер не ответил — пробую ещё раз через $((PAUSE * try)) с"
+		sleep $((PAUSE * try))
+	done
+}
+
+# Build and install one AUR package with plain makepkg (asks for sudo itself): its PKGBUILD from the AUR, or, when
+# the AUR does not answer, from its mirror on GitHub.
 makepkg_aur() {
-	local tmp ok=0
+	local tmp ok=0 rc=0
 	tmp=$(mktemp -d)
-	git clone --quiet "https://aur.archlinux.org/$1.git" "$tmp/$1" && (cd "$tmp/$1" && makepkg -si --needed) && ok=1
+	again "$1" git clone --quiet "$AUR/$1.git" "$tmp/$1" || rc=$?
+	if ((rc == 0)); then
+		(cd "$tmp/$1" && makepkg -si --needed) && ok=1
+	fi
 	rm -rf "$tmp"
+	if ((rc == 1)); then
+		warn "AUR недоступен — беру $1 из официального зеркала AUR на GitHub"
+		if makepkg_aur_mirror "$1"; then ok=1; fi
+	fi
 	((ok))
+}
+
+# makepkg_aur_mirror <package>: the package's PKGBUILD from the AUR's mirror on GitHub straight away (the AUR itself
+# has just not answered), built and installed with makepkg. 0 done; 1 the mirror did not answer either; 3 the build
+# or its install did not go through (makepkg's output says why).
+makepkg_aur_mirror() {
+	local tmp rc=0
+	tmp=$(mktemp -d)
+	again "$1" git clone --quiet --depth 1 --single-branch --branch "$1" "$AUR_MIRROR" "$tmp/$1" || rc=1
+	if ((rc == 0)); then
+		(cd "$tmp/$1" && makepkg -si --needed) || rc=3
+	fi
+	rm -rf "$tmp"
+	return "$rc"
 }
 
 install_packages() {
@@ -429,11 +491,24 @@ install_packages() {
 		ok "arch-update" "уже стоит"
 		return 0
 	fi
-	local pkg=arch-update
+	local pkg=arch-update rc=0
 	[[ $(uname -m) == x86_64 ]] && pkg=arch-update-bin      # prebuilt; elsewhere it is built from source
 	step "ставлю $pkg из AUR через $helper"
 	need_sudo
-	"$helper" -S --needed "$pkg" || die "$pkg не поставился из AUR (вывод $helper выше)." "$again"
+	again "$pkg" "$helper" -S --needed "$pkg" || rc=$?
+	if ((rc == 1)); then
+		warn "AUR недоступен — беру $pkg из официального зеркала AUR на GitHub"
+		rc=0
+		makepkg_aur_mirror "$pkg" || rc=$?
+		if ((rc == 1)); then
+			die "$pkg не поставился: ни AUR, ни его зеркало на GitHub не ответили (вывод выше)." \
+				"Проверь интернет (например: ping -c3 archlinux.org) и запусти установщик снова."
+		elif ((rc)); then
+			die "$pkg с зеркала AUR не собрался или не поставился (вывод makepkg выше)." "$again"
+		fi
+	elif ((rc)); then
+		die "$pkg не поставился из AUR (вывод $helper выше)." "$again"
+	fi
 	command -v arch-update >/dev/null || die "arch-update не установился"
 	ok "arch-update" "поставлен"
 }
