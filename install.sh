@@ -794,24 +794,36 @@ window() {
 # replay <events> [quiet]: the events the window showed (see event), in the terminal once it closed: the warnings of
 # the steps and why the install stopped (STOPPED=1). The final report's own warnings come with summary: the replay
 # ends where it begins. quiet=1: the window left the output in the terminal itself, these with it; only STOPPED.
+# The window's own line "shown<tab>N" (it writes it last): its console showed the first N warnings already.
 STOPPED=0
 replay() {
-	local -a parts
-	local kind quiet=${2-0}
-	while IFS=$'\t' read -r -a parts; do
+	local -a lines parts
+	local line kind quiet=${2-0} skip=0 shown=$'^shown\t([0-9]+)$'
+	mapfile -t lines <"$1"
+	for line in "${lines[@]}"; do
+		if [[ $line =~ $shown ]]; then skip=${BASH_REMATCH[1]}; fi
+	done
+	for line in "${lines[@]}"; do
+		IFS=$'\t' read -r -a parts <<<"$line"
 		((${#parts[@]})) || continue
 		kind=${parts[0]}
 		parts=("${parts[@]:1}")
 		parts=("${parts[@]//$'\x1f'/ }")
 		case $kind in
-		warn) ((quiet)) || mark '!' "$WARN" "${parts[@]}" ;;
+		warn)
+			if ((skip > 0)); then
+				skip=$((skip - 1))
+			elif ((!quiet)); then
+				mark '!' "$WARN" "${parts[@]}"
+			fi
+			;;
 		fail)
 			((quiet)) || mark '✗' "$BAD" "${parts[@]}" >&2
 			STOPPED=1
 			;;
 		finish) break ;;
 		esac
-	done <"$1"
+	done
 }
 
 main() {

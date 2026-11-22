@@ -434,8 +434,9 @@ def normal_screen(raw, cols):
     return "\n".join(lines)
 
 
-def window_processes():
-    """The pids of arch-update-ui --install that work in their own session (the shield's child), from /proc."""
+def window_processes(home):
+    """The pids of the arch-update-ui --install of the install into home (its checkout's path is in the command line)
+    that work in a session of their own (the shield's child), from /proc. Another run's windows are not these."""
     def cmdline(pid):
         try:
             with open(f"/proc/{pid}/cmdline", "rb") as f:
@@ -444,7 +445,8 @@ def window_processes():
             return b""
     found = []
     for pid in filter(str.isdigit, os.listdir("/proc")):
-        if b"arch-update-ui\x00--install" in cmdline(pid):
+        mine = cmdline(pid)
+        if b"arch-update-ui\x00--install" in mine and os.fsencode(home + "/") in mine:
             try:
                 with open(f"/proc/{pid}/stat", "rb") as f:
                     ppid = f.read().rsplit(b")", 1)[1].split()[1].decode()
@@ -569,13 +571,15 @@ class Install(unittest.TestCase):
         w = Window({**self.env, "TERM": "xterm-256color", "COLORTERM": "truecolor", **env}, size, after)
         steps, self.shots = list(steps), {}
         end = time.time() + deadline
-        while time.time() < end and not w.done:
-            text = w.read(0.1)
-            if steps and steps[0][0] in text:
-                what, keys = steps.pop(0)
-                self.shots[what] = text
-                keys(w) if callable(keys) else w.send(keys)
-        w.child.close(force=True)
+        try:
+            while time.time() < end and not w.done:
+                text = w.read(0.1)
+                if steps and steps[0][0] in text:
+                    what, keys = steps.pop(0)
+                    self.shots[what] = text
+                    keys(w) if callable(keys) else w.send(keys)
+        finally:
+            w.child.close(force=True)                   # never left running, whatever a step did
         self.raw = w.raw
         self.assertEqual(steps, [], "the screen never showed this:\n" + "\n".join(w.screen.display))
         text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", w.raw.decode("utf-8", "replace"))
@@ -945,6 +949,7 @@ class Install(unittest.TestCase):
         self.assertLess(said, left.index("✗ пакеты не поставились."))
         self.assertNotIn("Готово", left)
         self.assertNotIn("установка не закончена", left)
+        self.assertNotIn("[Arch-Update]", left)                       # the window's own output ends it: no note
         self.assertIsNone(self.reports())
 
     def test_a_failure_seen_in_the_console_is_told_once_too(self):
@@ -956,6 +961,72 @@ class Install(unittest.TestCase):
         left = normal_screen(self.raw, 80)
         self.assertEqual(left.count("✗ пакеты не поставились."), 1, left)
         self.assertLess(left.index("tester is not in the sudoers file."), left.index("✗ пакеты не поставились."))
+        # the console's own note came after it: the terminal's last word is the stop again, not "Enter — …"
+        self.assertEqual(left.splitlines()[-1],
+                         "[Arch-Update] установка остановлена на шаге «Пакеты» — почему, написано выше")
+
+    def test_after_the_whole_output_at_the_end_the_last_word_is_the_stop(self):
+        # Ctrl+] on the end screen to read it all, then back and Enter: no "Enter или Ctrl+] — обратно" left last
+        self.stub("pacman", '[[ "$*" == "-Q libnotify" ]] && exit 1\nexit 0')
+        self.stub("sudo", 'echo "tester is not in the sudoers file." >&2\nexit 1')
+        status, screen, out = self.in_the_window(("Установка остановлена", calm(CTRL_BRACKET)),
+                                                 ("весь вывод установки выше", ENTER),
+                                                 ("Установка остановлена", calm(ENTER)))
+        self.assertEqual(status, 1, out)
+        left = normal_screen(self.raw, 80)
+        self.assertEqual(left.count("✗ пакеты не поставились."), 1, left)
+        self.assertEqual(left.splitlines()[-1],
+                         "[Arch-Update] установка остановлена на шаге «Пакеты» — почему, написано выше")
+
+    def test_a_warning_the_console_showed_stays_once(self):
+        # DISPLAY set, the tray not coming up: "значок в трее не запустился"
+        for steps, how in (((("Пакеты", CTRL_BRACKET), ("установка закончилась", ENTER)), "seen in the console"),
+                           ((("Пакеты", CTRL_BRACKET), ("[Arch-Update] консоль", CTRL_BRACKET)), "said after it")):
+            with self.subTest(how):
+                settings = os.path.join(self.home, ".local/state/arch-update-auto/settings.json")
+                asks = [] if os.path.exists(settings) else [(QUESTION, calm(ENTER))]
+                status, screen, out = self.in_the_window(*steps, *asks, ("Установлено", calm(ENTER)), DISPLAY=":0")
+                self.assertEqual(status, 0, out)
+                left = normal_screen(self.raw, 80)
+                self.assertEqual(left.count("значок в трее не запустился:"), 1, left)
+                self.assertLess(left.index("значок в трее не запустился:"), left.index("Готово — Arch Update"))
+
+    def test_half_an_answer_to_a_question_under_sudo_never_leads_the_next(self):
+        # sudo runs pacman in a pty of its own (use_pty, Arch's default; script stands in for it): a "y" typed in the
+        # console and left there must not become the answer to the conflict question the modal gives back
+        self.stub("sudo", 'exec script -qec "$(printf "%q " "$@")" /dev/null')
+        self.stub("pacman", '[[ "$*" == "-Q libnotify" ]] && exit 1\n'
+                            '[[ $1 == -S ]] && { read -r -p ":: libnotify-0.8.9-1 and fake-notify-1-1 are in conflict. '
+                            'Remove fake-notify? [y/N] " a; printf "%s" "$a" >"$HOME/answer"; exit 1; }\nexit 0')
+
+        def half(w):
+            w.send("y")
+            w.read(0.6)
+            w.send(CTRL_BRACKET)
+            w.read(0.6)
+        status, screen, out = self.in_the_window(("Нужен твой ответ", CTRL_BRACKET), ("[Arch-Update] консоль", half),
+                                                 ("Нужен твой ответ", ENTER), ("Установка остановлена", calm(ENTER)),
+                                                 deadline=90)
+        with open(os.path.join(self.home, "answer")) as f:
+            self.assertEqual(f.read(), "")                              # Enter: the default, N — nothing removed
+
+    def test_an_enter_as_a_rerun_ends_does_not_close_its_report(self):
+        # reports decided already: no question, the end screen comes first, and it stays
+        status, screen, out = self.in_the_window((QUESTION, calm(ENTER)), ("Установлено", calm(ENTER)))
+        self.assertEqual(status, 0, out)
+
+        def pester(w):
+            end = time.time() + 60
+            while "Установлено" not in w.read(0.02) and time.time() < end:
+                w.send(ENTER)
+            calm_end = time.time() + 0.3
+            while time.time() < calm_end:
+                w.send(ENTER)
+                w.read(0.02)
+            w.read(1.0)
+            self.assertFalse(w.done, "an Enter pressed as the install ended closed its report")
+        status, screen, out = self.in_the_window(("настроен", pester), ("Установлено", calm(ENTER)))
+        self.assertEqual(status, 0, out)
 
     def test_a_killed_window_leaves_the_terminal_as_it_was(self):
         # the OOM killer on a Chromebook, a kill: the window's own cleanup never runs, its parent's does
@@ -963,8 +1034,11 @@ class Install(unittest.TestCase):
         self.stub("sudo", 'exec "$@"')
 
         def kill(w):
-            for pid in window_processes():
-                os.kill(pid, 9)
+            for pid in window_processes(self.home):
+                try:
+                    os.kill(pid, 9)
+                except ProcessLookupError:
+                    pass
         status, screen, out = self.in_the_window(("ставлю пакеты", kill), ("установка не закончена", ""),
                                                  after="stty -a")
         killed = self.raw[self.raw.rindex(WINDOW_OPENS.encode()):]
@@ -985,7 +1059,7 @@ class Install(unittest.TestCase):
         time.sleep(8)
         self.assertFalse(os.path.exists(os.path.join(self.home, "arch-update.calls")))
         self.assertFalse(os.path.exists(os.path.join(self.home, ".local/state/arch-update-auto/sync.ok")))
-        self.assertEqual(window_processes(), [])
+        self.assertEqual(window_processes(self.home), [])
 
     def test_half_an_answer_in_the_console_gives_the_question_back_to_the_window(self):
         self.stub("pacman", '[[ "$*" == "-Q libnotify" ]] && exit 1\nexit 0')
@@ -1105,14 +1179,14 @@ class Install(unittest.TestCase):
         child.expect_exact("Proceed with installation? [Y/n]")
         before = child.before
         child.sendline("n")
-        child.expect(pexpect.EOF)
-        child.close()
+        again = child.expect([pexpect.EOF, "Proceed with installation"])
+        child.close(force=True)
+        self.assertEqual(again, 0, "asked a second time")             # not again by the text install
         after = ANSI.sub("", child.before)
         out = ANSI.sub("", before) + after
         self.assertEqual(child.exitstatus, 1, out)
         self.assertIn("ставлю python и python-pexpect — на них работает окно установщика", out)
         self.assertIn("✗ пакеты не поставились.", after)
-        self.assertNotIn("Proceed with installation", after)          # asked once: not again by the text install
 
     def test_when_the_window_cannot_start_the_install_is_text(self):
         real = shutil.which("python3")
@@ -1132,14 +1206,12 @@ class Install(unittest.TestCase):
                 status, out, asked = self.one_liner_in_a_terminal(answer="n", size=size, ARCH_UPDATE_INSTALL_UI="1")
                 self.assertEqual(status, 0, out)
                 self.assertTrue(asked, out)
-                self.assertNotIn(WINDOW_OPENS, self.raw)                        # as written, not as shown
 
     def test_no_color_gets_the_text_install(self):
         # https://no-color.org: the window is colour through and through, the text install has none
         status, out, asked = self.one_liner_in_a_terminal(answer="n", ARCH_UPDATE_INSTALL_UI="1", NO_COLOR="1")
         self.assertEqual(status, 0, out)
-        self.assertTrue(asked, out)
-        self.assertNotIn(WINDOW_OPENS, self.raw)
+        self.assertTrue(asked, out)                     # a window would have failed it already (in_a_terminal)
         self.assertNotIn("\x1b[38;2;", self.raw)
 
     def test_the_window_needs_install_sh(self):

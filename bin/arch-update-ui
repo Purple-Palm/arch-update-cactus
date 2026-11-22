@@ -3916,7 +3916,7 @@ class InstallView(engine.TerminalView):
     comes as it is and the user answers everything (the responder's manual mode); back here the answers are automatic
     again. If drawing ever fails, the console stays: the install goes on."""
     animated = True
-    KEEP = 512 * 1024           # bytes of output kept at least: more than a whole first install writes
+    KEEP = 512 * 1024           # bytes of output kept at least: more than a first install usually writes
 
     def __init__(self, app, events):
         super().__init__()
@@ -3931,6 +3931,7 @@ class InstallView(engine.TerminalView):
         self.raw, self.total, self.upto = bytearray(), 0, 0
         self.modal, self.input, self.secret = None, "", False
         self.console = self.broken = False
+        self.visited = False                                # the console has been on (the terminal has its notes)
         self.responder, self.prior = None, None
         self.note = None                                    # (when, text, colour): what the responder last did
         self.started = False                                # install.sh runs (or ran): no text install after this
@@ -4085,12 +4086,26 @@ class InstallView(engine.TerminalView):
         self.upto = self.total
         return data
 
+    def shown_warnings(self):
+        """How many of the warnings, from the first, the terminal's own screen already has (the console showed the
+        output they were said in): install.sh's replay leaves those out."""
+        had = len(self.raw) - (self.total - self.upto)       # of the bytes kept, the ones the screen has had
+        if not self.upto or had <= 0:
+            return 0
+        text = " ".join(engine.ANSI.sub("", bytes(self.raw[:had]).decode("utf-8", "replace")).split())
+        n = 0
+        for parts in self.warns:
+            if " ".join(parts[0].split()) not in text:
+                break
+            n += 1
+        return n
+
     def to_console(self, why=CONSOLE_SAYS):
         r = self.responder
         if r and r.mode != "manual":
             self.prior = r.mode
             r.mode, r.user_typed, r.typed = "manual", False, b""
-        self.console = True
+        self.console = self.visited = True
         self.fit_pty()
         self.s.leave()
         self.show_unseen()
@@ -4107,6 +4122,7 @@ class InstallView(engine.TerminalView):
             partial = re.split(rb"[\r\n]", r.typed)[-1] if r.user_typed else b""
             if partial:                                     # a half-typed answer goes, as when the window closes
                 r.flush_child_input()
+                r.stale_input = True                        # where the flush cannot reach: the next answer kills it
                 echo = partial.decode("utf-8", "replace")
                 if r.tail.endswith(echo):
                     r.tail = r.tail[:-len(echo)]
@@ -4139,7 +4155,11 @@ class InstallView(engine.TerminalView):
             for k in keys:
                 if k == "enter":
                     text, self.input = self.input, ""
-                    return text.encode() + b"\r"
+                    r = self.responder
+                    kill = engine.KILL_LINE.encode() if r and r.stale_input else b""
+                    if r:
+                        r.stale_input = False
+                    return kill + text.encode() + b"\r"
                 if k == "bs":
                     self.input = self.input[:-1]
                 elif k == "ctrl-c":
@@ -4622,15 +4642,29 @@ def install_main():
                 app.s.leave()
             if status and view.started:
                 # It stopped: all its output stays in the terminal as the text install leaves it, what went wrong
-                # with install.sh's own word on it last ("вывод выше"; the console may have shown it already)
+                # with install.sh's own word on it last ("вывод выше"); when the console showed it, a note of the
+                # console came after it: the last word is said again, briefly
                 shown = view.show_unseen()
                 if shown and not shown.endswith(b"\n"):
                     view.out(b"\r\n")
+                elif not shown and view.visited:
+                    st = view.stages.get(view.cur)
+                    where = f" на шаге «{st['label']}»" if st else ""
+                    super(InstallView, view).message(f"\r\n[Arch-Update] установка остановлена{where} — почему, "
+                                                     "написано выше\r\n", engine.C_RED)
                 told = engine.TERM_OK
             try:
                 termios.tcsetattr(0, termios.TCSADRAIN, old)
             except termios.error:
                 pass
+        if view.started and view.ev:
+            try:
+                n = view.shown_warnings()
+                if n:                                     # the console showed them: install.sh's replay leaves them out
+                    with open(events, "a") as f:
+                        f.write(f"shown\t{n}\n")
+            except Exception:
+                note_ui_error(traceback.format_exc())
     if status is None and not view.started:
         sys.exit(NO_WINDOW)                       # it never started: install.sh goes on as text
     sys.exit(0 if status == 0 else TOLD if told else 1)

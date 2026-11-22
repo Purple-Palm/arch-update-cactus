@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import sys
 import tempfile
 import time
@@ -2387,7 +2388,32 @@ class Probe(Stubs):
 
 class SudoOnce(unittest.TestCase):
     """A machine whose sudo asks for a password (the laptops): asked once, at the start, through
-    the handover; the run then continues with a fresh ticket and its exit status comes through."""
+    the handover; the run then continues with a fresh ticket and its exit status comes through,
+    and the loop that kept the ticket fresh ends with it."""
+
+    @staticmethod
+    def running_with(tmp):
+        """(pid, command name) of the live processes whose environment has T=tmp: what this test started."""
+        found = []
+        for pid in filter(str.isdigit, os.listdir("/proc")):
+            try:
+                with open(f"/proc/{pid}/environ", "rb") as f:
+                    env = f.read().split(b"\0")
+                with open(f"/proc/{pid}/stat", "rb") as f:
+                    stat = f.read()
+            except OSError:
+                continue
+            if os.fsencode("T=" + tmp) in env and stat[stat.rfind(b")") + 2:][:1] != b"Z":
+                found.append((int(pid), stat[stat.find(b"(") + 1:stat.rfind(b")")].decode()))
+        return found
+
+    def tearDown(self):
+        for pid, _ in self.running_with(getattr(self, "tmp", "/nonexistent")):
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+        shutil.rmtree(getattr(self, "tmp", "/nonexistent"), ignore_errors=True)
 
     def test_password_once_then_the_update_runs(self):
         tmp = self.tmp = tempfile.mkdtemp()
@@ -2436,12 +2462,19 @@ class SudoOnce(unittest.TestCase):
         self.addCleanup(lambda: setattr(engine, "unmounted_boot", real_unmounted))
         engine.unmounted_boot = lambda: []    # whatever this test machine's fstab says
         view = View()
+        # as in a second run in one process (the F fixes after an update): the work ignores SIGHUP (run_update does
+        # once it started), so the end of the run's session does not end the loop that keeps the ticket fresh
+        self.addCleanup(signal.signal, signal.SIGHUP, signal.signal(signal.SIGHUP, signal.SIG_IGN))
         status, _, _ = engine.run_update(view, cmd="fake-update", summary=False)
         engine.LOG.txt.close()
         engine.LOG.raw.close()
         with open(engine.LOG.path) as f:
             log = f.read()
         self.assertEqual(status, 3)
+        # the loop that kept the ticket fresh is gone with the run: nothing renews it any more (with sudo's global
+        # time stamp it would have kept sudo open without a password); a sleep of its may still end by itself
+        time.sleep(0.5)
+        self.assertEqual([comm for _, comm in self.running_with(tmp) if comm != "sleep"], [])
         self.assertEqual(len(View.asked), 1, View.asked)
         self.assertTrue(View.asked[0][2], "the password must be masked")
         self.assertIn("ticket ok", log)
@@ -2540,6 +2573,42 @@ class CtrlC(Patching):
         self.assertEqual(sent, [b"\x03"])
 
 
+class HalfAnswer(Patching):
+    """Half an answer the user left in the installer's console: flushing our pty cannot drop it when sudo relays the
+    keys through a pty of its own (use_pty), so the next answer kills that line first (^U), once. Never after the
+    update's window closed on half an answer (detach): arch-update's "press enter" prompts read one key, ^U would
+    be that key and the Enter after it would answer the next question; pacman asks again after "yn" instead."""
+
+    def responder(self, sent):
+        class View(engine.TerminalView):
+            def out(self, data):
+                pass
+        self.patch(engine, "VIEW", View())
+        self.patch(engine, "LOG", types.SimpleNamespace(event=lambda *a: None, text=lambda *a: None))
+        self.patch(engine, "notify", lambda *a, **k: None)
+        r = engine.Responder(types.SimpleNamespace(send=sent.append, pid=0), stop_on_news=False, manual=False)
+        r.tail = ":: a-1-1 and b-1-1 are in conflict. Remove b? [y/N] "
+        r.hand_over("конфликт пакетов")
+        r.heard = True
+        r.user_input(b"y")                      # typed, no Enter
+        return r
+
+    def test_the_next_answer_kills_the_line_first(self):
+        sent = []
+        r = self.responder(sent)
+        r.stale_input = True                    # as the installer's window does, back from its console
+        r.answer("конфликт пакетов", engine.NO, None)
+        r.answer("pacman proceed", engine.YES, None)
+        self.assertEqual(sent, [b"y", engine.KILL_LINE + engine.NO, engine.YES])
+
+    def test_not_after_the_update_window_closed(self):
+        sent = []
+        r = self.responder(sent)
+        r.detach()                              # the window closed on it
+        r.answer("press enter to continue", engine.ENTER, None)
+        self.assertEqual(sent, [b"y", engine.ENTER])
+
+
 class ProgramOver(Patching):
     """pump (and read_to_end, its last resort) read a program's pty until it closes, or until the program is over while
     a daemon it started in a session of its own holds the pty: arch-update's tray applet, started by
@@ -2548,7 +2617,9 @@ class ProgramOver(Patching):
     everything while pacman holds its lock."""
 
     def setUp(self):
-        self.patch(engine, "PACMAN_LOCK", os.path.join(tempfile.mkdtemp(), "db.lck"))
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.patch(engine, "PACMAN_LOCK", os.path.join(tmp, "db.lck"))
         self.pids = []
         self.addCleanup(self.kill_daemons)
 
@@ -2589,6 +2660,19 @@ class ProgramOver(Patching):
                 took, out = self.pump('echo start; setsid sleep 60 & echo "pid=$!"; sleep 0.3; echo end', with_pump)
                 self.assertIn("end", out)                       # what it wrote before it ended: all of it
                 self.assertLess(took, 10)
+
+    def test_the_reading_looks_at_the_processes_four_times_a_second_at_most(self):
+        # a session-mate writing on after the program ended: /proc is not scanned for every line it writes
+        looks = []
+        real = engine.program_over
+        self.patch(engine, "program_over", lambda child: looks.append(1) or real(child))
+        for with_pump in (True, False):
+            with self.subTest(pump=with_pump):
+                looks.clear()
+                took, out = self.pump("trap '' HUP; (for i in $(seq 1 400); do echo line $i; sleep 0.005; done) & "
+                                      "exit 0", with_pump)
+                self.assertIn("line 400", out)
+                self.assertLess(len(looks), 4 * took + 4, (len(looks), took))
 
     def test_its_own_session_still_running_is_waited_for(self):
         # pacman, when the program was killed under it: the pty must stay read (and open) until it ends

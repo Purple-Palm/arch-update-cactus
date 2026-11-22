@@ -630,10 +630,13 @@ if [ "$sb" = 1 ]; then
 fi
 """
 # sudo asks for the password once, at the start, while the user is watching: it forgets it after 5 minutes,
-# and a long run asks again for the AUR step, the cache cleanup… The loop keeps the session's ticket fresh and
-# dies with the run (same session, SIGHUP). 125: the password was refused (or the question cancelled).
+# and a long run asks again for the AUR step, the cache cleanup… The loop keeps the session's ticket fresh while the
+# run goes on, and no longer: the wrapper stops it as soon as the run is over, and it stops by itself once the
+# wrapper is gone (a SIGHUP need not come: the work may ignore it). 125: the password was refused (or the question
+# cancelled).
 ASK_SUDO_FIRST = """sudo -v || exit 125
-(while sleep 50; do sudo -n -v || exit; done) </dev/null >/dev/null 2>&1 &
+(w=$$; while sleep 50 && kill -0 "$w" 2>/dev/null; do sudo -n -v || exit; done) </dev/null >/dev/null 2>&1 &
+keep=$!
 """
 
 
@@ -657,6 +660,7 @@ shift "$ni"
 """ + (ASK_SUDO_FIRST if ask_first else "") + r""""$@"
 s=$?
 trap '' INT QUIT TSTP
+[ -z "${keep-}" ] || kill "$keep" 2>/dev/null   # the ticket is fresh enough for the look below
 # into the file as the user (no root-owned file left behind); a key pressed meanwhile changes nothing
 sudo -n bash -c "$probe" probe "$sb" "${#files[@]}" "${files[@]}" "${#images[@]}" "${images[@]}" \
     2>/dev/null </dev/null >"$out"
@@ -1665,6 +1669,11 @@ class Responder:
         self.safe_only = False    # window closed during a manual run: never confirm anything for the user
         self.handover_why = ""
         self.secret = False       # the question handed over asks for a password: never show or log the answer
+        # the user left half an answer where flushing our pty cannot reach it (sudo relays keys through a pty of its
+        # own, use_pty): the next answer kills that line first (KILL_LINE), or the half answer would lead it. Set by
+        # the installer's window only, whose programs all read lines; never after the update's window closed
+        # (detach): arch-update's "press enter" prompts read one key, and ^U would be that key
+        self.stale_input = False
         self.heard = False        # the program has said something: in manual mode keys reach it from then on
 
     def feed(self, data):
@@ -1879,6 +1888,8 @@ class Responder:
         shown = {"\x03": "Ctrl+C"}.get(action, action.strip() or "Enter")
         LOG.event("АВТО", f"«{line}» → {shown}   ({label})")
         VIEW.answered(label, line, action.strip() or "Enter")
+        if self.stale_input:
+            action, self.stale_input = KILL_LINE + action, False
         self.child.send(action)
         self.tail = ""
 
@@ -1928,6 +1939,9 @@ class Responder:
             self.hinted = True
             say("\n[автоответчик] сейчас отвечаю я, твой ввод не передаётся. "
                 "Если программа ждёт ответа — Ctrl+], дальше отвечай сам.\n", C_YEL)
+
+
+KILL_LINE = "\x15"       # ^U, the kill character: a line half typed is gone (for a program that reads lines)
 
 
 def detached_answer(line):
@@ -3044,7 +3058,7 @@ def program_over(child):
 def read_to_end(child, out):
     """out(data) for each read of the output until the program is over, as pump (program_over included): the last
     resort when pump itself failed, so that the program is never left running unwatched."""
-    over = None
+    over, look = None, 0.0
     while True:
         try:
             ready = select.select([child.child_fd], [], [], 0.25)[0]
@@ -3060,9 +3074,11 @@ def read_to_end(child, out):
             if not data:
                 return
             out(data)
-        now = time.time()
-        if over is None and program_over(child):
-            over = now
+        now = time.monotonic()
+        if over is None and now >= look:
+            look = now + 0.25
+            if program_over(child):
+                over = now
         if over is not None and (not ready and now - over > 0.3 or now - over > 3):
             return
 
@@ -3117,7 +3133,7 @@ def pump(child, responder, auto):
                             child.send(data.replace(b"\x1d", b""))
                         except OSError:
                             pass
-        now = time.time()
+        now = time.monotonic()
         if over is None and now >= look:
             look = now + 0.25
             if program_over(child):
